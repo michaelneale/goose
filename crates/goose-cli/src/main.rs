@@ -10,6 +10,7 @@ mod session;
 use commands::agent_version::AgentCommand;
 use commands::configure::handle_configure;
 use commands::mcp::run_server;
+use commands::quote::QuoteCommand;
 use commands::session::build_session;
 use commands::version::print_version;
 use console::style;
@@ -35,6 +36,10 @@ enum Command {
     /// Configure Goose settings
     #[command(about = "Configure Goose settings")]
     Configure {},
+
+    /// Display quote of the day
+    #[command(about = "Display an inspirational quote")]
+    Quote(QuoteCommand),
 
     /// Manage system prompts and behaviors
     #[command(about = "Run one of the mcp servers bundled with goose")]
@@ -167,6 +172,10 @@ async fn main() -> Result<()> {
     match cli.command {
         Some(Command::Configure {}) => {
             let _ = handle_configure().await;
+            return Ok(());
+        }
+        Some(Command::Quote(cmd)) => {
+            cmd.run()?;
             return Ok(());
         }
         Some(Command::Mcp { name }) => {
