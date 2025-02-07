@@ -54,7 +54,7 @@ fn setup_profile(temp_dir_path: &Path, profile_string: Option<&str>) {
     let goose_dir = temp_dir_path.join(".config").join("goose");
     let profile_path = goose_dir.join("profiles.json");
     let logs_dir = goose_dir.join("logs");
-    
+
     fs::create_dir_all(&logs_dir).unwrap();
     let default_profile = r#"
 {
