@@ -50,11 +50,12 @@ use std::path::Path;
 fn setup_profile(temp_dir_path: &Path, profile_string: Option<&str>) {
     use std::fs;
 
-    let profile_path = temp_dir_path
-        .join(".config")
-        .join("goose")
-        .join("profiles.json");
-    fs::create_dir_all(profile_path.parent().unwrap()).unwrap();
+    // Create both profiles and logs directories
+    let goose_dir = temp_dir_path.join(".config").join("goose");
+    let profile_path = goose_dir.join("profiles.json");
+    let logs_dir = goose_dir.join("logs");
+
+    fs::create_dir_all(&logs_dir).unwrap();
     let default_profile = r#"
 {
     "profile_items": {
