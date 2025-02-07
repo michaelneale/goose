@@ -26,7 +26,8 @@ pub struct GenericOpenAiProvider {
 impl Default for GenericOpenAiProvider {
     fn default() -> Self {
         let model = ModelConfig::new(GenericOpenAiProvider::metadata().default_model);
-        GenericOpenAiProvider::from_env(model).expect("Failed to initialize Generic OpenAI provider")
+        GenericOpenAiProvider::from_env(model)
+            .expect("Failed to initialize Generic OpenAI provider")
     }
 }
 
@@ -36,7 +37,7 @@ impl GenericOpenAiProvider {
         let api_key: String = config.get_secret("OPENAI_API_KEY")?;
         let base_url: String = config.get("OPENAI_API_BASE")?;
         let model_override = config.get("OPENAI_API_MODEL").ok();
-        
+
         let model = if let Some(model_name) = model_override {
             ModelConfig::new(model_name)
         } else {
