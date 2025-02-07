@@ -19,6 +19,7 @@ impl Parse for MacroArgs {
         let mut description = None;
         let mut param_descriptions = HashMap::new();
 
+        println!("hello");
         let meta_list: Punctuated<Meta, Token![,]> = Punctuated::parse_terminated(input)?;
 
         for meta in meta_list {
