@@ -6,6 +6,7 @@ pub mod databricks;
 pub mod errors;
 mod factory;
 pub mod formats;
+pub mod generic_openai;
 pub mod google;
 pub mod groq;
 pub mod oauth;
