@@ -31,9 +31,12 @@
     },
     "ollama": {
         "name": "Ollama",
-        "description": "Lorem ipsum",
+        "description": "Local model runner supporting Qwen, Llama, DeepSeek, and other open-source models",
         "models": ["qwen2.5"],
-        "required_keys": ["OLLAMA_HOST"]
+        "required_keys": ["OLLAMA_HOST"],
+        "default_values": {
+            "OLLAMA_HOST": "localhost"
+        }
     },
     "openrouter": {
         "name": "OpenRouter",
