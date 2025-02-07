@@ -16,9 +16,10 @@ struct MacroArgs {
 impl Parse for MacroArgs {
     fn parse(input: ParseStream) -> syn::Result<Self> {
         let mut name = None;
-        let mut description = None;
+        let mut description  = None;
         let mut param_descriptions = HashMap::new();
 
+        pinrtln("heloo")
         let meta_list: Punctuated<Meta, Token![,]> = Punctuated::parse_terminated(input)?;
 
         for meta in meta_list {
