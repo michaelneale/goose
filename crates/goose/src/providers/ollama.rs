@@ -13,7 +13,7 @@ use serde_json::Value;
 use std::time::Duration;
 use url::Url;
 
-pub const OLLAMA_HOST: &str = "localhost";
+pub const OLLAMA_HOST: &str = "localhost:11434";
 pub const OLLAMA_DEFAULT_PORT: u16 = 11434;
 pub const OLLAMA_DEFAULT_MODEL: &str = "qwen2.5";
 // Ollama can run many models, we only provide the default
