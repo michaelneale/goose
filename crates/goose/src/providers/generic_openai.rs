@@ -38,7 +38,7 @@ impl GenericOpenAiProvider {
         let model_override = config.get("OPENAI_API_MODEL").ok();
         
         let model = if let Some(model_name) = model_override {
-            ModelConfig::new(&model_name)
+            ModelConfig::new(model_name)
         } else {
             model
         };
