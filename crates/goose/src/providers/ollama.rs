@@ -40,7 +40,16 @@ impl OllamaProvider {
         let config = crate::config::Config::global();
         let host: String = config
             .get("OLLAMA_HOST")
-            .unwrap_or_else(|_| OLLAMA_HOST.to_string());
+            .unwrap_or_else(|_| OLLAMA_HOST.to_string())
+            .trim()
+            .to_string();
+            
+        // If host is empty after trimming, use the default
+        let host = if host.is_empty() {
+            OLLAMA_HOST.to_string()
+        } else {
+            host
+        };
 
         let client = Client::builder()
             .timeout(Duration::from_secs(600))
