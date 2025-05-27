@@ -1,0 +1,133 @@
+name: Goose Auto-Fix from Issue
+
+on:
+  issues:
+    types: [labeled]
+
+jobs:
+  goose-fix:
+    name: Run Goose to fix issue
+    # Only run when the "goose-fix" label is added
+    if: github.event.label.name == 'goose-fix'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+      issues: write
+    
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # Fetch all history for branch creation
+      
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "lts/*"
+      
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+      
+      - name: Install Dependencies
+        run: |
+          sudo apt update -y
+          sudo apt install -y libdbus-1-dev gnome-keyring libxcb1-dev just
+      
+      - name: Install Goose CLI
+        run: |
+          curl -fsSL https://github.com/block/goose/releases/download/stable/download_cli.sh | CONFIGURE=false bash -
+      
+      - name: Create Branch
+        run: |
+          # Create a branch name based on the issue number
+          BRANCH_NAME="goose-fix/issue-${{ github.event.issue.number }}"
+          git config user.name "Goose Bot"
+          git config user.email "goose-bot@users.noreply.github.com"
+          git checkout -b $BRANCH_NAME
+          echo "BRANCH_NAME=$BRANCH_NAME" >> $GITHUB_ENV
+      
+      - name: Run Goose to Fix Issue
+        env:
+          GOOSE_API_KEY: ${{ secrets.GOOSE_API_KEY }}
+          # Add any other required environment variables here
+        run: |
+          # Extract issue title and body for context
+          ISSUE_TITLE="${{ github.event.issue.title }}"
+          ISSUE_BODY="${{ github.event.issue.body }}"
+          
+          # Run Goose with the issue information
+          goose run --no-session <<EOF
+          Fix the following issue in this repository:
+          
+          Title: $ISSUE_TITLE
+          
+          Description:
+          $ISSUE_BODY
+          
+          Please analyze the issue, make the necessary changes to fix it, and explain what you did.
+          EOF
+      
+      - name: Check for Changes
+        id: git-check
+        run: |
+          if [[ -n "$(git status --porcelain)" ]]; then
+            echo "changes=true" >> $GITHUB_OUTPUT
+          else
+            echo "changes=false" >> $GITHUB_OUTPUT
+          fi
+      
+      - name: Commit and Push Changes
+        if: steps.git-check.outputs.changes == 'true'
+        run: |
+          git add .
+          git commit -m "Fix issue #${{ github.event.issue.number }}: ${{ github.event.issue.title }}"
+          git push origin $BRANCH_NAME
+      
+      - name: Create Pull Request
+        if: steps.git-check.outputs.changes == 'true'
+        uses: peter-evans/create-pull-request@v5
+        with:
+          token: ${{ secrets.GOOSE_PAT }}
+          commit-message: "Fix issue #${{ github.event.issue.number }}"
+          branch: ${{ env.BRANCH_NAME }}
+          delete-branch: false
+          title: "Goose fix for issue #${{ github.event.issue.number }}: ${{ github.event.issue.title }}"
+          body: |
+            This PR was automatically created by Goose to fix issue #${{ github.event.issue.number }}.
+            
+            Original issue: ${{ github.event.issue.html_url }}
+            
+            ## Changes made:
+            
+            Goose analyzed the issue and made the following changes to address it.
+            
+            Please review these changes to ensure they correctly fix the issue.
+          labels: automated-pr, needs-review
+      
+      - name: Comment on Issue
+        if: steps.git-check.outputs.changes == 'true'
+        uses: peter-evans/create-or-update-comment@v3
+        with:
+          issue-number: ${{ github.event.issue.number }}
+          body: |
+            I've created a fix for this issue! 🤖
+            
+            The changes are available in PR #${{ steps.create-pr.outputs.pull-request-number }}
+      
+      - name: Comment on Issue (No Changes)
+        if: steps.git-check.outputs.changes == 'false'
+        uses: peter-evans/create-or-update-comment@v3
+        with:
+          issue-number: ${{ github.event.issue.number }}
+          body: |
+            I tried to fix this issue, but didn't make any changes to the codebase.
+            
+            This might be because:
+            1. The issue description wasn't clear enough
+            2. The issue requires more complex changes than I can handle automatically
+            3. The issue might be invalid or already fixed
+            
+            Please provide more details or assign this to a human developer.
