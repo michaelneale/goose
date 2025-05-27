@@ -110,16 +110,16 @@ jobs:
         run: |
           git add .
           git commit -m "Fix issue #${{ github.event.issue.number }}: ${{ github.event.issue.title }}"
-          # Use PAT for push to ensure proper authentication
-          git remote set-url origin https://x-access-token:${{ secrets.GOOSE_PAT }}@github.com/${{ github.repository }}.git
+          # Use built-in GITHUB_TOKEN for authentication
           git push origin $BRANCH_NAME
       
       - name: Create Pull Request
         if: steps.git-check.outputs.changes == 'true'
         uses: peter-evans/create-pull-request@v5
         with:
-          token: ${{ secrets.GOOSE_PAT }}
+          token: ${{ github.token }}
           commit-message: "Fix issue #${{ github.event.issue.number }}"
+          base: main
           branch: ${{ env.BRANCH_NAME }}
           delete-branch: false
           title: "Goose fix for issue #${{ github.event.issue.number }}: ${{ github.event.issue.title }}"
@@ -139,6 +139,7 @@ jobs:
         if: steps.git-check.outputs.changes == 'true'
         uses: peter-evans/create-or-update-comment@v3
         with:
+          token: ${{ github.token }}
           issue-number: ${{ github.event.issue.number }}
           body: |
             I've created a fix for this issue! 🤖
@@ -149,6 +150,7 @@ jobs:
         if: steps.git-check.outputs.changes == 'false'
         uses: peter-evans/create-or-update-comment@v3
         with:
+          token: ${{ github.token }}
           issue-number: ${{ github.event.issue.number }}
           body: |
             I tried to fix this issue, but didn't make any changes to the codebase.
