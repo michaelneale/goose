@@ -108,23 +108,21 @@ jobs:
             }
       
       - name: Run Goose to Fix PR Issues
-        if: fromJson(steps.check-runs.outputs.result).hasFailures
         env:
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           GOOSE_MODEL: gpt-4o
           GOOSE_PROVIDER: openai
         run: |
-          # Extract failed checks
-          FAILED_CHECKS='${{ toJson(fromJson(steps.check-runs.outputs.result).failedChecks) }}'
+          # Get the comment that triggered the workflow
+          COMMENT="${{ github.event.comment.body }}"
           
-          # Create a temporary context file with PR check information
+          # Create a temporary context file with the comment
           cat > /tmp/pr-context.txt <<EOF
-          This PR has failed CI checks: $FAILED_CHECKS
+          Please make the changes requested in this comment:
           
-          Please analyze the failing checks, examine the code in this branch, and make the necessary changes to fix the failing checks.
-          Focus on addressing code style issues, linting errors, test failures, or build errors that might be causing these checks to fail.
+          $COMMENT
           
-          After analyzing the issues, implement fixes and explain what changes you made.
+          Analyze the request, make the necessary changes, and explain what you did.
           EOF
           
           # Run Goose with input file
@@ -155,9 +153,6 @@ jobs:
           token: ${{ github.token }}
           issue-number: ${{ needs.check-comment.outputs.pr-number }}
           body: |
-            I've analyzed the failing checks and made changes to fix the issues! 🤖
+            I've made the requested changes! 🤖
             
-            ${{ steps.git-check.outputs.changes == 'true' && 'The changes have been pushed to this branch. Please check if the CI checks pass now.' || 'I analyzed the issues but didn\'t make any changes. This might require human intervention.' }}
-            
-            Failed checks I attempted to fix:
-            ${{ toJson(fromJson(steps.check-runs.outputs.result).failedChecks) }}
+            ${{ steps.git-check.outputs.changes == 'true' && 'The changes have been pushed to this branch.' || 'I analyzed the request but didn\'t make any changes. This might require human intervention.' }}
