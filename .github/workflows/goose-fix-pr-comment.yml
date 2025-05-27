@@ -42,7 +42,7 @@ jobs:
         with:
           script: |
             const { owner, repo } = context.repo;
-            const pr_number = ${{ needs.check-comment.outputs.pr-number }};
+            const pr_number = parseInt("${{ needs.check-comment.outputs.pr-number }}");
             
             const pr = await github.rest.pulls.get({
               owner,
