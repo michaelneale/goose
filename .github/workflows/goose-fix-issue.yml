@@ -114,17 +114,11 @@ jobs:
           git push origin $BRANCH_NAME
       
       - name: Create Pull Request
+        id: create-pr
         if: steps.git-check.outputs.changes == 'true'
-        uses: peter-evans/create-pull-request@v5
-        with:
-          token: ${{ github.token }}
-          commit-message: "Fix issue #${{ github.event.issue.number }}"
-          base: main
-          branch: ${{ env.BRANCH_NAME }}
-          delete-branch: false
-          title: "Goose fix for issue #${{ github.event.issue.number }}: ${{ github.event.issue.title }}"
-          body: |
-            This PR was automatically created by Goose to fix issue #${{ github.event.issue.number }}.
+        run: |
+          PR_URL=$(gh pr create --title "Goose fix for issue #${{ github.event.issue.number }}: ${{ github.event.issue.title }}" \
+            --body "This PR was automatically created by Goose to fix issue #${{ github.event.issue.number }}.
             
             Original issue: ${{ github.event.issue.html_url }}
             
@@ -132,8 +126,15 @@ jobs:
             
             Goose analyzed the issue and made the following changes to address it.
             
-            Please review these changes to ensure they correctly fix the issue.
-          labels: automated-pr, needs-review
+            Please review these changes to ensure they correctly fix the issue." \
+            --label "automated-pr,needs-review" \
+            --base main \
+            --head ${{ env.BRANCH_NAME }})
+          echo "PR created: $PR_URL"
+          PR_NUMBER=$(echo $PR_URL | sed -E 's|.*/([0-9]+)$|\1|')
+          echo "pull-request-number=$PR_NUMBER" >> $GITHUB_OUTPUT
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
       
       - name: Comment on Issue
         if: steps.git-check.outputs.changes == 'true'
