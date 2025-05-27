@@ -19,7 +19,8 @@ jobs:
         id: check-comment
         run: |
           COMMENT="${{ github.event.comment.body }}"
-          if [[ $COMMENT == *"goose-fix"* ]]; then
+          # Match "goose-fix" as a standalone word or command (with punctuation)
+          if [[ $COMMENT =~ (^|[[:space:]])goose-fix([[:space:]]|$|[[:punct:]]) ]]; then
             echo "should-fix=true" >> $GITHUB_OUTPUT
           else
             echo "should-fix=false" >> $GITHUB_OUTPUT
@@ -109,14 +110,15 @@ jobs:
       - name: Run Goose to Fix PR Issues
         if: fromJson(steps.check-runs.outputs.result).hasFailures
         env:
-          GOOSE_API_KEY: ${{ secrets.GOOSE_API_KEY }}
-          # Add any other required environment variables here
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          GOOSE_MODEL: gpt-4o
+          GOOSE_PROVIDER: openai
         run: |
           # Extract failed checks
           FAILED_CHECKS='${{ toJson(fromJson(steps.check-runs.outputs.result).failedChecks) }}'
           
-          # Run Goose with the PR and check information
-          goose --no-interactive <<EOF
+          # Create a temporary context file with PR check information
+          cat > /tmp/pr-context.txt <<EOF
           This PR has failed CI checks: $FAILED_CHECKS
           
           Please analyze the failing checks, examine the code in this branch, and make the necessary changes to fix the failing checks.
@@ -124,6 +126,9 @@ jobs:
           
           After analyzing the issues, implement fixes and explain what changes you made.
           EOF
+          
+          # Run Goose with input file
+          goose run -i /tmp/pr-context.txt
       
       - name: Check for Changes
         id: git-check
@@ -141,6 +146,8 @@ jobs:
           git config user.email "goose-bot@users.noreply.github.com"
           git add .
           git commit -m "Fix CI issues for PR #${{ needs.check-comment.outputs.pr-number }}"
+          # Use PAT for push to ensure proper authentication
+          git remote set-url origin https://x-access-token:${{ secrets.GOOSE_PAT }}@github.com/${{ github.repository }}.git
           git push
       
       - name: Comment on PR
