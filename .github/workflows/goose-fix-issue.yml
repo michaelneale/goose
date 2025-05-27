@@ -71,8 +71,21 @@ jobs:
           Please analyze the issue, make the necessary changes to fix it, and explain what you did.
           EOF
           
+          # Debug: Check if goose is installed and working
+          echo "Goose version:"
+          goose --version
+          
+          # Create a simple test file to verify Goose can make changes
+          echo "Creating test file for Goose to modify"
+          echo "This is a test file" > test-file.txt
+          
           # Run Goose with input file
+          echo "Running Goose with input file"
           goose run -i /tmp/issue-context.txt
+          
+          # Debug: Show git status
+          echo "Git status after running Goose:"
+          git status
       
       - name: Check for Changes
         id: git-check
