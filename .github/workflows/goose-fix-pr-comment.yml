@@ -74,7 +74,7 @@ jobs:
           cat > /tmp/pr-context.txt <<EOF
           Please make the changes requested in this comment:
           
-          $COMMENT
+          ${COMMENT}
           
           Analyze the request, make the necessary changes, and explain what you did.
           EOF
@@ -109,4 +109,4 @@ jobs:
           body: |
             I've made the requested changes! 🤖
             
-            ${{ steps.git-check.outputs.changes == 'true' && 'The changes have been pushed to this branch.' || 'I analyzed the request but didn\'t make any changes. This might require human intervention.' }}
+            ${{ steps.git-check.outputs.changes == 'true' && 'The changes have been pushed to this branch.' || 'I analyzed the request but didn''t make any changes. This might require human intervention.' }}
