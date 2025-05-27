@@ -120,6 +120,7 @@ jobs:
         with:
           token: ${{ secrets.GOOSE_PAT }}
           commit-message: "Fix issue #${{ github.event.issue.number }}"
+          base: main
           branch: ${{ env.BRANCH_NAME }}
           delete-branch: false
           title: "Goose fix for issue #${{ github.event.issue.number }}: ${{ github.event.issue.title }}"
