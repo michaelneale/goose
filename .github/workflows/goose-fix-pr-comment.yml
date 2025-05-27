@@ -6,17 +6,17 @@ on:
 
 jobs:
   goose-fix:
-    name: Run Goose to fix PR
+    name: Run Goose to fix PR from comment
     # Only run on PR comments that contain "goose-fix"
-    if: ${{ github.event.issue.pull_request && contains(github.event.comment.body, 'goose-fix') }}
+    if: github.event.issue.pull_request && contains(github.event.comment.body, 'goose-fix')
     runs-on: ubuntu-latest
     permissions:
       contents: write
       pull-requests: write
     
     steps:
-      - name: Get PR branch
-        id: get-pr
+      - name: Get PR details
+        id: pr-details
         uses: actions/github-script@v7
         with:
           script: |
@@ -37,8 +37,8 @@ jobs:
       - name: Checkout PR Branch
         uses: actions/checkout@v4
         with:
-          ref: ${{ fromJson(steps.get-pr.outputs.result).branch }}
-          repository: ${{ fromJson(steps.get-pr.outputs.result).repo }}
+          ref: ${{ fromJson(steps.pr-details.outputs.result).branch }}
+          repository: ${{ fromJson(steps.pr-details.outputs.result).repo }}
           fetch-depth: 0
           token: ${{ github.token }}
       
@@ -67,20 +67,29 @@ jobs:
           GOOSE_MODEL: gpt-4o
           GOOSE_PROVIDER: openai
         run: |
-          # Get the comment that triggered the workflow
-          COMMENT="${{ github.event.comment.body }}"
+          # Extract the comment that triggered the workflow
+          COMMENT_BODY="${{ github.event.comment.body }}"
           
           # Create a temporary context file with the comment
           cat > /tmp/pr-context.txt <<EOF
-          Please make the changes requested in this comment:
+          Please make the changes requested in this PR comment:
           
-          ${COMMENT}
+          ${COMMENT_BODY}
           
           Analyze the request, make the necessary changes, and explain what you did.
           EOF
           
+          # Debug: Check if goose is installed and working
+          echo "Goose version:"
+          goose --version
+          
           # Run Goose with input file
+          echo "Running Goose with input file"
           goose run -i /tmp/pr-context.txt
+          
+          # Debug: Show git status
+          echo "Git status after running Goose:"
+          git status
       
       - name: Check for Changes
         id: git-check
@@ -109,4 +118,4 @@ jobs:
           body: |
             I've made the requested changes! 🤖
             
-            ${{ steps.git-check.outputs.changes == 'true' && 'The changes have been pushed to this branch.' || 'I analyzed the request but didn''t make any changes. This might require human intervention.' }}
+            ${{ steps.git-check.outputs.changes == 'true' && 'The changes have been pushed to this branch.' || 'I analyzed the request but did not make any changes. This might require human intervention.' }}
