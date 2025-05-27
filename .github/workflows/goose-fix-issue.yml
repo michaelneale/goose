@@ -117,6 +117,11 @@ jobs:
         id: create-pr
         if: steps.git-check.outputs.changes == 'true'
         run: |
+          # Create labels if they don't exist
+          gh label list --repo ${{ github.repository }} | grep -q "automated-pr" || gh label create automated-pr -c "#0E8A16" -d "Pull request created automatically by a workflow" --repo ${{ github.repository }}
+          gh label list --repo ${{ github.repository }} | grep -q "needs-review" || gh label create needs-review -c "#FBCA04" -d "Pull request needs review" --repo ${{ github.repository }}
+          
+          # Create the PR
           PR_URL=$(gh pr create --title "Goose fix for issue #${{ github.event.issue.number }}: ${{ github.event.issue.title }}" \
             --body "This PR was automatically created by Goose to fix issue #${{ github.event.issue.number }}.
             
@@ -127,7 +132,7 @@ jobs:
             Goose analyzed the issue and made the following changes to address it.
             
             Please review these changes to ensure they correctly fix the issue." \
-            --label "automated-pr,needs-review" \
+            --label "automated-pr" --label "needs-review" \
             --base main \
             --head ${{ env.BRANCH_NAME }})
           echo "PR created: $PR_URL"
