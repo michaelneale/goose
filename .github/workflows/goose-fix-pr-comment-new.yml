@@ -1,0 +1,112 @@
+name: Goose Auto-Fix from PR Comment
+
+on:
+  issue_comment:
+    types: [created]
+
+jobs:
+  goose-fix:
+    name: Run Goose to fix PR
+    # Only run on PR comments that contain "goose-fix"
+    if: ${{ github.event.issue.pull_request && contains(github.event.comment.body, 'goose-fix') }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    
+    steps:
+      - name: Get PR branch
+        id: get-pr
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const { owner, repo } = context.repo;
+            const issue_number = context.issue.number;
+            
+            const { data: pull } = await github.rest.pulls.get({
+              owner,
+              repo,
+              pull_number: issue_number
+            });
+            
+            return {
+              branch: pull.head.ref,
+              repo: pull.head.repo.full_name
+            }
+      
+      - name: Checkout PR Branch
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ fromJson(steps.get-pr.outputs.result).branch }}
+          repository: ${{ fromJson(steps.get-pr.outputs.result).repo }}
+          fetch-depth: 0
+          token: ${{ github.token }}
+      
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "lts/*"
+      
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+      
+      - name: Install Dependencies
+        run: |
+          sudo apt update -y
+          sudo apt install -y libdbus-1-dev gnome-keyring libxcb1-dev just
+      
+      - name: Install Goose CLI
+        run: |
+          curl -fsSL https://github.com/block/goose/releases/download/stable/download_cli.sh | CONFIGURE=false bash -
+      
+      - name: Run Goose to Fix PR
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          GOOSE_MODEL: gpt-4o
+          GOOSE_PROVIDER: openai
+        run: |
+          # Get the comment that triggered the workflow
+          COMMENT="${{ github.event.comment.body }}"
+          
+          # Create a temporary context file with the comment
+          cat > /tmp/pr-context.txt <<EOF
+          Please make the changes requested in this comment:
+          
+          $COMMENT
+          
+          Analyze the request, make the necessary changes, and explain what you did.
+          EOF
+          
+          # Run Goose with input file
+          goose run -i /tmp/pr-context.txt
+      
+      - name: Check for Changes
+        id: git-check
+        run: |
+          if [[ -n "$(git status --porcelain)" ]]; then
+            echo "changes=true" >> $GITHUB_OUTPUT
+          else
+            echo "changes=false" >> $GITHUB_OUTPUT
+          fi
+      
+      - name: Commit and Push Changes
+        if: steps.git-check.outputs.changes == 'true'
+        run: |
+          git config user.name "Goose Bot"
+          git config user.email "goose-bot@users.noreply.github.com"
+          git add .
+          git commit -m "Apply changes requested in PR comment"
+          # Use built-in GITHUB_TOKEN for authentication
+          git push
+      
+      - name: Comment on PR
+        uses: peter-evans/create-or-update-comment@v3
+        with:
+          token: ${{ github.token }}
+          issue-number: ${{ github.event.issue.number }}
+          body: |
+            I've made the requested changes! 🤖
+            
+            ${{ steps.git-check.outputs.changes == 'true' && 'The changes have been pushed to this branch.' || 'I analyzed the request but didn\'t make any changes. This might require human intervention.' }}
