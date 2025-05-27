@@ -42,18 +42,11 @@ jobs:
       
       - name: Create Branch
         run: |
-          # Create a branch name based on the issue number
-          BRANCH_NAME="goose-fix/issue-${{ github.event.issue.number }}"
+          # Create a unique branch name based on the issue number and timestamp
+          TIMESTAMP=$(date +%Y%m%d%H%M%S)
+          BRANCH_NAME="goose-fix/issue-${{ github.event.issue.number }}-$TIMESTAMP"
           git config user.name "Goose Bot"
           git config user.email "goose-bot@users.noreply.github.com"
-          
-          # Check if branch exists remotely and delete it if it does
-          if git ls-remote --heads origin $BRANCH_NAME | grep -q $BRANCH_NAME; then
-            echo "Branch $BRANCH_NAME exists remotely, deleting it"
-            git push origin --delete $BRANCH_NAME || true
-          fi
-          
-          # Create new branch
           git checkout -b $BRANCH_NAME
           echo "BRANCH_NAME=$BRANCH_NAME" >> $GITHUB_ENV
       
@@ -119,7 +112,7 @@ jobs:
           git commit -m "Fix issue #${{ github.event.issue.number }}: ${{ github.event.issue.title }}"
           # Use PAT for push to ensure proper authentication
           git remote set-url origin https://x-access-token:${{ secrets.GOOSE_PAT }}@github.com/${{ github.repository }}.git
-          git push -f origin $BRANCH_NAME
+          git push origin $BRANCH_NAME
       
       - name: Create Pull Request
         if: steps.git-check.outputs.changes == 'true'
