@@ -146,13 +146,13 @@ jobs:
           git config user.email "goose-bot@users.noreply.github.com"
           git add .
           git commit -m "Fix CI issues for PR #${{ needs.check-comment.outputs.pr-number }}"
-          # Use PAT for push to ensure proper authentication
-          git remote set-url origin https://x-access-token:${{ secrets.GOOSE_PAT }}@github.com/${{ github.repository }}.git
+          # Use built-in GITHUB_TOKEN for authentication
           git push
       
       - name: Comment on PR
         uses: peter-evans/create-or-update-comment@v3
         with:
+          token: ${{ github.token }}
           issue-number: ${{ needs.check-comment.outputs.pr-number }}
           body: |
             I've analyzed the failing checks and made changes to fix the issues! 🤖
