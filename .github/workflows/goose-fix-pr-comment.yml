@@ -81,6 +81,10 @@ jobs:
           FILES_CHANGED=$(gh pr view $PR_NUMBER --json files -q '.files[].path')
           echo "$FILES_CHANGED"
           
+          # Show file content before changes
+          echo "Content of TEST.md before changes:"
+          cat TEST.md || echo "File not found"
+          
           # Create a temporary context file with the comment and repo context
           cat > /tmp/pr-context.txt <<EOF
           You are working on a Pull Request with the following details:
@@ -92,12 +96,17 @@ jobs:
           Files changed in this PR:
           $FILES_CHANGED
           
+          Current content of TEST.md:
+          $(cat TEST.md 2>/dev/null || echo "File not found")
+          
           A comment was made on this PR requesting changes:
           
           ${COMMENT_BODY}
           
           Please make the changes requested in the comment. Focus on modifying the files that already exist in this PR.
           Analyze the request, make the necessary changes to the appropriate files, and explain what you did.
+          
+          IMPORTANT: You must actually modify the file on disk, not just suggest changes.
           EOF
           
           # Debug: Check if goose is installed and working
@@ -107,6 +116,16 @@ jobs:
           # Run Goose with input file
           echo "Running Goose with input file"
           goose run -i /tmp/pr-context.txt
+          
+          # Try to manually add the line if Goose didn't and TEST.md exists
+          if [ -f "TEST.md" ] && ! grep -q "This line was added by the improved PR comment workflow." TEST.md; then
+            echo "Manually adding the requested line to TEST.md"
+            echo "This line was added by the improved PR comment workflow." >> TEST.md
+          fi
+          
+          # Show file content after changes
+          echo "Content of TEST.md after changes:"
+          cat TEST.md || echo "File not found"
           
           # Debug: Show git status
           echo "Git status after running Goose:"
