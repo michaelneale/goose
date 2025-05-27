@@ -5,63 +5,42 @@ on:
     types: [created]
 
 jobs:
-  check-comment:
-    name: Check for "goose-fix" comment
-    runs-on: ubuntu-latest
-    # Only run on PR comments, not issue comments
-    if: github.event.issue.pull_request
-    outputs:
-      should-fix: ${{ steps.check-comment.outputs.should-fix }}
-      pr-number: ${{ github.event.issue.number }}
-    
-    steps:
-      - name: Check if comment contains "goose-fix"
-        id: check-comment
-        run: |
-          COMMENT="${{ github.event.comment.body }}"
-          # Match "goose-fix" as a standalone word or command (with punctuation)
-          if [[ $COMMENT =~ (^|[[:space:]])goose-fix([[:space:]]|$|[[:punct:]]) ]]; then
-            echo "should-fix=true" >> $GITHUB_OUTPUT
-          else
-            echo "should-fix=false" >> $GITHUB_OUTPUT
-          fi
-
   goose-fix:
-    name: Run Goose to fix PR issues
-    needs: check-comment
-    if: needs.check-comment.outputs.should-fix == 'true'
+    name: Run Goose to fix PR
+    # Only run on PR comments that contain "goose-fix"
+    if: ${{ github.event.issue.pull_request && contains(github.event.comment.body, 'goose-fix') }}
     runs-on: ubuntu-latest
     permissions:
       contents: write
       pull-requests: write
     
     steps:
-      - name: Get PR details
-        id: pr-details
+      - name: Get PR branch
+        id: get-pr
         uses: actions/github-script@v7
         with:
           script: |
             const { owner, repo } = context.repo;
-            const pr_number = parseInt("${{ needs.check-comment.outputs.pr-number }}");
+            const issue_number = context.issue.number;
             
-            const pr = await github.rest.pulls.get({
+            const { data: pull } = await github.rest.pulls.get({
               owner,
               repo,
-              pull_number: pr_number
+              pull_number: issue_number
             });
             
             return {
-              branch: pr.data.head.ref,
-              repo: pr.data.head.repo.full_name,
-              sha: pr.data.head.sha
+              branch: pull.head.ref,
+              repo: pull.head.repo.full_name
             }
       
       - name: Checkout PR Branch
         uses: actions/checkout@v4
         with:
-          ref: ${{ fromJson(steps.pr-details.outputs.result).branch }}
-          repository: ${{ fromJson(steps.pr-details.outputs.result).repo }}
+          ref: ${{ fromJson(steps.get-pr.outputs.result).branch }}
+          repository: ${{ fromJson(steps.get-pr.outputs.result).repo }}
           fetch-depth: 0
+          token: ${{ github.token }}
       
       - name: Setup Node.js
         uses: actions/setup-node@v4
@@ -82,32 +61,7 @@ jobs:
         run: |
           curl -fsSL https://github.com/block/goose/releases/download/stable/download_cli.sh | CONFIGURE=false bash -
       
-      - name: Get Check Runs
-        id: check-runs
-        uses: actions/github-script@v7
-        with:
-          script: |
-            const { owner, repo } = context.repo;
-            const sha = "${{ fromJson(steps.pr-details.outputs.result).sha }}";
-            
-            const checkRuns = await github.rest.checks.listForRef({
-              owner,
-              repo,
-              ref: sha
-            });
-            
-            const failedChecks = checkRuns.data.check_runs.filter(check => 
-              check.conclusion === 'failure' || check.conclusion === 'timed_out'
-            );
-            
-            const failedCheckNames = failedChecks.map(check => check.name);
-            
-            return {
-              hasFailures: failedChecks.length > 0,
-              failedChecks: failedCheckNames
-            }
-      
-      - name: Run Goose to Fix PR Issues
+      - name: Run Goose to Fix PR
         env:
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           GOOSE_MODEL: gpt-4o
@@ -143,7 +97,7 @@ jobs:
           git config user.name "Goose Bot"
           git config user.email "goose-bot@users.noreply.github.com"
           git add .
-          git commit -m "Fix CI issues for PR #${{ needs.check-comment.outputs.pr-number }}"
+          git commit -m "Apply changes requested in PR comment"
           # Use built-in GITHUB_TOKEN for authentication
           git push
       
@@ -151,7 +105,7 @@ jobs:
         uses: peter-evans/create-or-update-comment@v3
         with:
           token: ${{ github.token }}
-          issue-number: ${{ needs.check-comment.outputs.pr-number }}
+          issue-number: ${{ github.event.issue.number }}
           body: |
             I've made the requested changes! 🤖
             
