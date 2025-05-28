@@ -67,9 +67,10 @@ jobs:
           Title: $ISSUE_TITLE
           
           Description:
+          
           $ISSUE_BODY
           
-          Please analyze the issue, make the necessary changes to fix it, and explain what you did.
+          You will analyze the issue, and then apply a fix to the code in this directory, you must make changes, don't suggest
           EOF
           
           # Debug: Check if goose is installed and working
