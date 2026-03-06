@@ -648,6 +648,35 @@ export const SwitchModelModal = ({
                         </Button>
                       </div>
                     </div>
+                  ) : provider === 'mesh' &&
+                    !loadingModels &&
+                    filteredModelOptions.flatMap((g) => g.options).filter((o) => o.value !== 'custom')
+                      .length === 0 ? (
+                    /* Show special UI for mesh provider — configure via Mesh settings tab */
+                    <div className="rounded-md bg-blue-50 dark:bg-blue-900/20 border border-blue-200 dark:border-blue-800 p-4">
+                      <div className="flex flex-col gap-3">
+                        <div>
+                          <h3 className="text-sm font-medium text-blue-800 dark:text-blue-200">
+                            Configure Mesh inference in Settings
+                          </h3>
+                          <div className="mt-1 text-sm text-blue-700 dark:text-blue-300">
+                            Select a model and configure mesh-llm in Settings → Mesh.
+                            Models are automatically downloaded on first use.
+                          </div>
+                        </div>
+                        <Button
+                          variant="outline"
+                          size="sm"
+                          onClick={() => {
+                            setView('settings');
+                            onClose();
+                          }}
+                          className="self-start border-blue-300 dark:border-blue-700 text-blue-700 dark:text-blue-300 hover:bg-blue-100 dark:hover:bg-blue-900/40"
+                        >
+                          Go to Mesh Settings
+                        </Button>
+                      </div>
+                    </div>
                   ) : providerErrors[provider] ? (
                     /* Show error message when provider failed to connect */
                     <div className="rounded-md bg-red-50 dark:bg-red-900/20 border border-red-200 dark:border-red-800 p-3">

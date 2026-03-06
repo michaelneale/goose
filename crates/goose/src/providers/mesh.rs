@@ -61,10 +61,7 @@ pub struct MeshProvider {
 /// Find the mesh-llm binary: check PATH first, then ~/.mesh-llm/
 fn find_mesh_binary() -> Option<std::path::PathBuf> {
     // Check PATH
-    if let Ok(output) = std::process::Command::new("which")
-        .arg("mesh-llm")
-        .output()
-    {
+    if let Ok(output) = std::process::Command::new("which").arg("mesh-llm").output() {
         if output.status.success() {
             let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
             if !path.is_empty() {
@@ -182,10 +179,7 @@ async fn start_mesh(binary: &std::path::Path, port: u16) -> Result<()> {
         std::fs::create_dir_all(parent)?;
     }
 
-    tracing::info!(
-        "Starting mesh-llm: {}",
-        mesh_args.join(" ")
-    );
+    tracing::info!("Starting mesh-llm: {}", mesh_args.join(" "));
 
     // Write a launcher script and execute it. The script backgrounds mesh-llm
     // and exits, so the process is fully orphaned (reparented to launchd/PID 1).
@@ -263,7 +257,7 @@ async fn ensure_mesh_running(port: u16) -> Result<()> {
             );
         }
 
-        if start.elapsed().as_secs() % 30 == 0 {
+        if start.elapsed().as_secs().is_multiple_of(30) {
             tracing::info!(
                 "Waiting for mesh-llm to become ready... ({}s elapsed)",
                 start.elapsed().as_secs()
@@ -275,9 +269,7 @@ async fn ensure_mesh_running(port: u16) -> Result<()> {
 impl MeshProvider {
     pub async fn from_env(model: ModelConfig) -> Result<Self> {
         let config = crate::config::Config::global();
-        let port: u16 = config
-            .get_param("MESH_PORT")
-            .unwrap_or(MESH_DEFAULT_PORT);
+        let port: u16 = config.get_param("MESH_PORT").unwrap_or(MESH_DEFAULT_PORT);
 
         // Ensure mesh-llm is running (idempotent, only runs once per process)
         MESH_ENSURED
@@ -371,7 +363,14 @@ impl Provider for MeshProvider {
             ));
         }
 
-        let payload = create_request(model_config, system, messages, tools, &ImageFormat::OpenAi, true)?;
+        let payload = create_request(
+            model_config,
+            system,
+            messages,
+            tools,
+            &ImageFormat::OpenAi,
+            true,
+        )?;
 
         let mut log = RequestLog::start(model_config, &payload)?;
 

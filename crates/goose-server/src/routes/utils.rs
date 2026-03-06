@@ -94,8 +94,8 @@ pub fn inspect_keys(
 pub fn check_provider_configured(metadata: &ProviderMetadata, provider_type: ProviderType) -> bool {
     let config = Config::global();
 
-    // Special override
-    if metadata.name == "local" {
+    // Special override: local and mesh are always available
+    if metadata.name == "local" || metadata.name == "mesh" {
         return true;
     }
 
