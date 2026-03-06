@@ -1,27 +1,36 @@
+use std::io;
 use std::time::Duration;
 
 use anyhow::Result;
+use async_stream::try_stream;
 use async_trait::async_trait;
+use futures::future::BoxFuture;
+use futures::StreamExt;
+use futures::TryStreamExt;
+use once_cell::sync::Lazy;
 use reqwest::{Client, StatusCode};
 use serde_json::Value;
 use tokio::time::sleep;
+use tokio_util::io::StreamReader;
 use url::Url;
 
-use crate::message::Message;
+use crate::conversation::message::Message;
 use crate::model::ModelConfig;
-use crate::providers::base::{ConfigKey, Provider, ProviderMetadata, ProviderUsage};
+use crate::providers::base::{ConfigKey, MessageStream, Provider, ProviderDef, ProviderMetadata};
 
 use crate::providers::errors::ProviderError;
 use crate::providers::formats::gcpvertexai::{
-    create_request, get_usage, response_to_message, ClaudeVersion, GcpVertexAIModel, GeminiVersion,
-    ModelProvider, RequestContext,
+    create_request, response_to_streaming_message, GcpLocation, ModelProvider, RequestContext,
+    DEFAULT_MODEL, KNOWN_MODELS,
 };
-
-use crate::providers::formats::gcpvertexai::GcpLocation::Iowa;
 use crate::providers::gcpauth::GcpAuth;
-use crate::providers::utils::emit_debug_trace;
-use mcp_core::tool::Tool;
+use crate::providers::openai_compatible::map_http_error_to_provider_error;
+use crate::providers::retry::RetryConfig;
+use crate::providers::utils::RequestLog;
+use crate::session_context::SESSION_ID_HEADER;
+use rmcp::model::Tool;
 
+const GCP_VERTEX_AI_PROVIDER_NAME: &str = "gcp_vertex_ai";
 /// Base URL for GCP Vertex AI documentation
 const GCP_VERTEX_AI_DOC_URL: &str = "https://cloud.google.com/vertex-ai";
 /// Default timeout for API requests in seconds
@@ -34,6 +43,69 @@ const DEFAULT_MAX_RETRIES: usize = 6;
 const DEFAULT_BACKOFF_MULTIPLIER: f64 = 2.0;
 /// Default maximum interval for retry (in milliseconds)
 const DEFAULT_MAX_RETRY_INTERVAL_MS: u64 = 320_000;
+/// Status code for Anthropic's API overloaded error (529)
+static STATUS_API_OVERLOADED: Lazy<StatusCode> =
+    Lazy::new(|| StatusCode::from_u16(529).expect("Valid status code 529 for API_OVERLOADED"));
+
+fn rate_limit_error_message(response_text: &str) -> String {
+    let cite = "See https://cloud.google.com/vertex-ai/generative-ai/docs/error-code-429";
+    if response_text.contains("Exceeded the Provisioned Throughput") {
+        format!("Exceeded the Provisioned Throughput: {cite}")
+    } else {
+        format!("Pay-as-you-go resource exhausted: {cite}")
+    }
+}
+
+const OVERLOADED_ERROR_MSG: &str =
+    "Vertex AI Provider API is temporarily overloaded. This is similar to a rate limit \
+     error but indicates backend processing capacity issues.";
+
+fn build_vertex_url(
+    host: &str,
+    configured_location: &str,
+    project_id: &str,
+    model_name: &str,
+    provider: ModelProvider,
+    target_location: &str,
+    streaming: bool,
+) -> Result<Url, GcpVertexAIError> {
+    let host_url = if configured_location == target_location {
+        host.to_string()
+    } else {
+        host.replace(configured_location, target_location)
+    };
+
+    let base_url =
+        Url::parse(&host_url).map_err(|e| GcpVertexAIError::InvalidUrl(e.to_string()))?;
+
+    let endpoint = match (&provider, streaming) {
+        (ModelProvider::Anthropic, true) => "streamRawPredict",
+        (ModelProvider::Anthropic, false) => "rawPredict",
+        (ModelProvider::Google, true) => "streamGenerateContent",
+        (ModelProvider::Google, false) => "generateContent",
+        (ModelProvider::MaaS(_), true) => "streamGenerateContent",
+        (ModelProvider::MaaS(_), false) => "generateContent",
+    };
+
+    let path = format!(
+        "v1/projects/{}/locations/{}/publishers/{}/models/{}:{}",
+        project_id,
+        target_location,
+        provider.as_str(),
+        model_name,
+        endpoint
+    );
+
+    let mut url = base_url
+        .join(&path)
+        .map_err(|e| GcpVertexAIError::InvalidUrl(e.to_string()))?;
+
+    if streaming && !matches!(provider, ModelProvider::Anthropic) {
+        url.set_query(Some("alt=sse"));
+    }
+
+    Ok(url)
+}
 
 /// Represents errors specific to GCP Vertex AI operations.
 #[derive(Debug, thiserror::Error)]
@@ -45,53 +117,6 @@ enum GcpVertexAIError {
     /// Error during GCP authentication
     #[error("Authentication error: {0}")]
     AuthError(String),
-}
-
-/// Retry configuration for handling rate limit errors
-#[derive(Debug, Clone)]
-struct RetryConfig {
-    /// Maximum number of retry attempts
-    max_retries: usize,
-    /// Initial interval between retries in milliseconds
-    initial_interval_ms: u64,
-    /// Multiplier for backoff (exponential)
-    backoff_multiplier: f64,
-    /// Maximum interval between retries in milliseconds
-    max_interval_ms: u64,
-}
-
-impl Default for RetryConfig {
-    fn default() -> Self {
-        Self {
-            max_retries: DEFAULT_MAX_RETRIES,
-            initial_interval_ms: DEFAULT_INITIAL_RETRY_INTERVAL_MS,
-            backoff_multiplier: DEFAULT_BACKOFF_MULTIPLIER,
-            max_interval_ms: DEFAULT_MAX_RETRY_INTERVAL_MS,
-        }
-    }
-}
-
-impl RetryConfig {
-    /// Calculate the delay for a specific retry attempt (with jitter)
-    fn delay_for_attempt(&self, attempt: usize) -> Duration {
-        if attempt == 0 {
-            return Duration::from_millis(0);
-        }
-
-        // Calculate exponential backoff
-        let exponent = (attempt - 1) as u32;
-        let base_delay_ms = (self.initial_interval_ms as f64
-            * self.backoff_multiplier.powi(exponent as i32)) as u64;
-
-        // Apply max limit
-        let capped_delay_ms = std::cmp::min(base_delay_ms, self.max_interval_ms);
-
-        // Add jitter (+/-20% randomness) to avoid thundering herd problem
-        let jitter_factor = 0.8 + (rand::random::<f64>() * 0.4); // Between 0.8 and 1.2
-        let jittered_delay_ms = (capped_delay_ms as f64 * jitter_factor) as u64;
-
-        Duration::from_millis(jittered_delay_ms)
-    }
 }
 
 /// Provider implementation for Google Cloud Platform's Vertex AI service.
@@ -118,6 +143,8 @@ pub struct GcpVertexAIProvider {
     /// Retry configuration for handling rate limit errors
     #[serde(skip)]
     retry_config: RetryConfig,
+    #[serde(skip)]
+    name: String,
 }
 
 impl GcpVertexAIProvider {
@@ -128,27 +155,11 @@ impl GcpVertexAIProvider {
     ///
     /// # Arguments
     /// * `model` - Configuration for the model to be used
-    pub fn from_env(model: ModelConfig) -> Result<Self> {
-        Self::new(model)
-    }
-
-    /// Creates a new provider instance with the specified model configuration.
-    ///
-    /// # Arguments
-    /// * `model` - Configuration for the model to be used
-    pub fn new(model: ModelConfig) -> Result<Self> {
-        futures::executor::block_on(Self::new_async(model))
-    }
-
-    /// Async implementation of new provider instance creation.
-    ///
-    /// # Arguments
-    /// * `model` - Configuration for the model to be used
-    async fn new_async(model: ModelConfig) -> Result<Self> {
+    pub async fn from_env(model: ModelConfig) -> Result<Self> {
         let config = crate::config::Config::global();
         let project_id = config.get_param("GCP_PROJECT_ID")?;
         let location = Self::determine_location(config)?;
-        let host = format!("https://{}-aiplatform.googleapis.com", location);
+        let host = Self::build_host_url(&location);
 
         let client = Client::builder()
             .timeout(Duration::from_secs(DEFAULT_TIMEOUT_SECS))
@@ -167,11 +178,13 @@ impl GcpVertexAIProvider {
             location,
             model,
             retry_config,
+            name: GCP_VERTEX_AI_PROVIDER_NAME.to_string(),
         })
     }
 
     /// Loads retry configuration from environment variables or uses defaults.
     fn load_retry_config(config: &crate::config::Config) -> RetryConfig {
+        // Load max retries for 429 rate limit errors
         let max_retries = config
             .get_param("GCP_MAX_RETRIES")
             .ok()
@@ -196,12 +209,12 @@ impl GcpVertexAIProvider {
             .and_then(|v: String| v.parse::<u64>().ok())
             .unwrap_or(DEFAULT_MAX_RETRY_INTERVAL_MS);
 
-        RetryConfig {
+        RetryConfig::new(
             max_retries,
             initial_interval_ms,
             backoff_multiplier,
             max_interval_ms,
-        }
+        )
     }
 
     /// Determines the appropriate GCP location for model deployment.
@@ -214,7 +227,15 @@ impl GcpVertexAIProvider {
             .get_param("GCP_LOCATION")
             .ok()
             .filter(|location: &String| !location.trim().is_empty())
-            .unwrap_or_else(|| Iowa.to_string()))
+            .unwrap_or_else(|| GcpLocation::Iowa.to_string()))
+    }
+
+    fn build_host_url(location: &str) -> String {
+        if location == "global" {
+            "https://aiplatform.googleapis.com".to_string()
+        } else {
+            format!("https://{}-aiplatform.googleapis.com", location)
+        }
     }
 
     /// Retrieves an authentication token for API requests.
@@ -226,258 +247,314 @@ impl GcpVertexAIProvider {
             .map_err(|e| GcpVertexAIError::AuthError(e.to_string()))
     }
 
-    /// Constructs the appropriate API endpoint URL for a given provider.
-    ///
-    /// # Arguments
-    /// * `provider` - The model provider (Anthropic or Google)
-    /// * `location` - The GCP location for model deployment
     fn build_request_url(
         &self,
         provider: ModelProvider,
         location: &str,
+        streaming: bool,
     ) -> Result<Url, GcpVertexAIError> {
-        // Create host URL for the specified location
-        let host_url = if self.location == location {
-            self.host.clone()
-        } else {
-            // Only allocate a new string if location differs
-            self.host.replace(&self.location, location)
-        };
-
-        let base_url =
-            Url::parse(&host_url).map_err(|e| GcpVertexAIError::InvalidUrl(e.to_string()))?;
-
-        // Determine endpoint based on provider type
-        let endpoint = match provider {
-            ModelProvider::Anthropic => "streamRawPredict",
-            ModelProvider::Google => "generateContent",
-        };
-
-        // Construct path for URL
-        let path = format!(
-            "v1/projects/{}/locations/{}/publishers/{}/models/{}:{}",
-            self.project_id,
+        build_vertex_url(
+            &self.host,
+            &self.location,
+            &self.project_id,
+            &self.model.model_name,
+            provider,
             location,
-            provider.as_str(),
-            self.model.model_name,
-            endpoint
-        );
-
-        base_url
-            .join(&path)
-            .map_err(|e| GcpVertexAIError::InvalidUrl(e.to_string()))
+            streaming,
+        )
     }
 
-    /// Makes an authenticated POST request to the Vertex AI API at a specific location.
-    /// Includes retry logic for 429 Too Many Requests errors.
-    ///
-    /// # Arguments
-    /// * `payload` - The request payload to send
-    /// * `context` - Request context containing model information
-    /// * `location` - The GCP location for the request
-    async fn post_with_location(
+    async fn send_request_with_retry(
         &self,
+        session_id: Option<&str>,
+        url: Url,
         payload: &Value,
-        context: &RequestContext,
-        location: &str,
-    ) -> Result<Value, ProviderError> {
-        let url = self
-            .build_request_url(context.provider(), location)
-            .map_err(|e| ProviderError::RequestFailed(e.to_string()))?;
-
-        // Initialize retry counter
-        let mut attempts = 0;
+    ) -> Result<reqwest::Response, ProviderError> {
+        let mut rate_limit_attempts = 0;
+        let mut overloaded_attempts = 0;
         let mut last_error = None;
+        let max_retries = self.retry_config.max_retries;
 
         loop {
-            // Check if we've exceeded max retries
-            if attempts > 0 && attempts > self.retry_config.max_retries {
-                let error_msg = format!(
-                    "Exceeded maximum retry attempts ({}) for rate limiting (429)",
-                    self.retry_config.max_retries
+            if rate_limit_attempts > max_retries && overloaded_attempts > max_retries {
+                return Err(
+                    last_error.unwrap_or_else(|| ProviderError::RateLimitExceeded {
+                        details: format!("Exceeded maximum retry attempts ({max_retries})"),
+                        retry_delay: None,
+                    }),
                 );
-                tracing::error!("{}", error_msg);
-                return Err(last_error.unwrap_or(ProviderError::RateLimitExceeded(error_msg)));
             }
 
-            // Get a fresh auth token for each attempt
             let auth_header = self
                 .get_auth_header()
                 .await
                 .map_err(|e| ProviderError::Authentication(e.to_string()))?;
 
-            // Make the request
-            let response = self
+            let mut request = self
                 .client
                 .post(url.clone())
                 .json(payload)
-                .header("Authorization", auth_header)
+                .header("Authorization", auth_header);
+
+            if let Some(session_id) = session_id.filter(|id| !id.is_empty()) {
+                request = request.header(SESSION_ID_HEADER, session_id);
+            }
+
+            let response = request
                 .send()
                 .await
                 .map_err(|e| ProviderError::RequestFailed(e.to_string()))?;
 
             let status = response.status();
 
-            // If not a 429, process normally
-            if status != StatusCode::TOO_MANY_REQUESTS {
-                let response_json = response.json::<Value>().await.map_err(|e| {
-                    ProviderError::RequestFailed(format!("Failed to parse response: {e}"))
-                })?;
-
-                return match status {
-                    StatusCode::OK => Ok(response_json),
-                    StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => {
-                        tracing::debug!(
-                            "Authentication failed. Status: {status}, Payload: {payload:?}"
-                        );
-                        Err(ProviderError::Authentication(format!(
-                            "Authentication failed: {response_json:?}"
-                        )))
-                    }
-                    _ => {
-                        tracing::debug!(
-                            "Request failed. Status: {status}, Response: {response_json:?}"
-                        );
-                        Err(ProviderError::RequestFailed(format!(
-                            "Request failed with status {status}: {response_json:?}"
-                        )))
-                    }
-                };
-            }
-
-            // Handle 429 Too Many Requests
-            attempts += 1;
-
-            // Try to parse response for more detailed error info
-            let cite_gcp_vertex_429 =
-                "See https://cloud.google.com/vertex-ai/generative-ai/docs/error-code-429";
-            let response_text = response.text().await.unwrap_or_default();
-            let quota_error = if response_text.contains("Exceeded the Provisioned Throughput") {
-                format!("Exceeded the Provisioned Throughput: {cite_gcp_vertex_429}.")
+            if status == StatusCode::TOO_MANY_REQUESTS {
+                rate_limit_attempts += 1;
+                if rate_limit_attempts > max_retries {
+                    return Err(
+                        last_error.unwrap_or_else(|| ProviderError::RateLimitExceeded {
+                            details: format!("Exceeded max retries ({max_retries}) for 429"),
+                            retry_delay: None,
+                        }),
+                    );
+                }
+                let msg = rate_limit_error_message(&response.text().await.unwrap_or_default());
+                tracing::warn!("429 (attempt {rate_limit_attempts}/{max_retries}): {msg}");
+                last_error = Some(ProviderError::RateLimitExceeded {
+                    details: msg,
+                    retry_delay: None,
+                });
+                sleep(self.retry_config.delay_for_attempt(rate_limit_attempts)).await;
+            } else if status == *STATUS_API_OVERLOADED {
+                overloaded_attempts += 1;
+                if overloaded_attempts > max_retries {
+                    return Err(
+                        last_error.unwrap_or_else(|| ProviderError::RateLimitExceeded {
+                            details: format!("Exceeded max retries ({max_retries}) for 529"),
+                            retry_delay: None,
+                        }),
+                    );
+                }
+                tracing::warn!(
+                    "529 (attempt {overloaded_attempts}/{max_retries}): {OVERLOADED_ERROR_MSG}"
+                );
+                last_error = Some(ProviderError::RateLimitExceeded {
+                    details: OVERLOADED_ERROR_MSG.to_string(),
+                    retry_delay: None,
+                });
+                sleep(self.retry_config.delay_for_attempt(overloaded_attempts)).await;
+            } else if status == StatusCode::OK {
+                return Ok(response);
+            } else if status == StatusCode::UNAUTHORIZED || status == StatusCode::FORBIDDEN {
+                return Err(ProviderError::Authentication(format!(
+                    "Authentication failed with status: {status}"
+                )));
             } else {
-                format!("Pay-as-you-go resource exhausted: {cite_gcp_vertex_429}.")
-            };
-
-            tracing::warn!(
-                "Rate limit exceeded (attempt {}/{}): {}. Retrying after backoff...",
-                attempts,
-                self.retry_config.max_retries,
-                quota_error
-            );
-
-            // Store the error in case we need to return it after max retries
-            last_error = Some(ProviderError::RateLimitExceeded(quota_error));
-
-            // Calculate and apply the backoff delay
-            let delay = self.retry_config.delay_for_attempt(attempts);
-            tracing::info!("Backing off for {:?} before retry", delay);
-            sleep(delay).await;
+                let response_text = response.text().await.unwrap_or_default();
+                let payload = serde_json::from_str::<Value>(&response_text).ok();
+                return Err(map_http_error_to_provider_error(status, payload));
+            }
         }
     }
 
-    /// Makes an authenticated POST request to the Vertex AI API with fallback for invalid locations.
-    ///
-    /// # Arguments
-    /// * `payload` - The request payload to send
-    /// * `context` - Request context containing model information
-    async fn post(&self, payload: Value, context: &RequestContext) -> Result<Value, ProviderError> {
-        // Try with user-specified location first
+    async fn post_stream_with_location(
+        &self,
+        session_id: Option<&str>,
+        payload: &Value,
+        context: &RequestContext,
+        location: &str,
+    ) -> Result<reqwest::Response, ProviderError> {
+        let url = self
+            .build_request_url(context.provider(), location, true)
+            .map_err(|e| ProviderError::RequestFailed(e.to_string()))?;
+
+        self.send_request_with_retry(session_id, url, payload).await
+    }
+
+    async fn post_stream(
+        &self,
+        session_id: Option<&str>,
+        payload: &Value,
+        context: &RequestContext,
+    ) -> Result<reqwest::Response, ProviderError> {
         let result = self
-            .post_with_location(&payload, context, &self.location)
+            .post_stream_with_location(session_id, payload, context, &self.location)
             .await;
 
-        // If location is already the known location for the model or request succeeded, return result
         if self.location == context.model.known_location().to_string() || result.is_ok() {
             return result;
         }
 
-        // Check if we should retry with the model's known location
         match &result {
             Err(ProviderError::RequestFailed(msg)) => {
                 let model_name = context.model.to_string();
                 let configured_location = &self.location;
                 let known_location = context.model.known_location().to_string();
 
-                tracing::error!(
+                tracing::warn!(
                     "Trying known location {known_location} for {model_name} instead of {configured_location}: {msg}"
                 );
 
-                self.post_with_location(&payload, context, &known_location)
+                self.post_stream_with_location(session_id, payload, context, &known_location)
                     .await
             }
-            // For any other error, return the original result
             _ => result,
         }
     }
-}
 
-impl Default for GcpVertexAIProvider {
-    fn default() -> Self {
-        let model = ModelConfig::new(Self::metadata().default_model);
-        Self::new(model).expect("Failed to initialize VertexAI provider")
+    async fn filter_by_org_policy(&self, models: Vec<String>) -> Vec<String> {
+        let Ok(auth_header) = self.get_auth_header().await else {
+            tracing::debug!("Could not get auth header for org policy check, returning all models");
+            return models;
+        };
+
+        let url = format!(
+            "https://cloudresourcemanager.googleapis.com/v1/projects/{}:getEffectiveOrgPolicy",
+            self.project_id
+        );
+
+        let payload = serde_json::json!({
+            "constraint": "constraints/vertexai.allowedModels"
+        });
+
+        let response = match self
+            .client
+            .post(&url)
+            .header("Authorization", &auth_header)
+            .json(&payload)
+            .send()
+            .await
+        {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::debug!("Failed to fetch org policy: {e}, returning all models");
+                return models;
+            }
+        };
+
+        let json = match response.json::<Value>().await {
+            Ok(j) => j,
+            Err(e) => {
+                tracing::debug!("Failed to parse org policy response: {e}, returning all models");
+                return models;
+            }
+        };
+
+        let allowed_patterns: Vec<String> = json
+            .get("listPolicy")
+            .and_then(|lp| lp.get("allowedValues"))
+            .and_then(|av| av.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str())
+                    .map(|s| s.to_string())
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        if allowed_patterns.is_empty() {
+            return models;
+        }
+
+        models
+            .into_iter()
+            .filter(|model| Self::is_model_allowed(model, &allowed_patterns))
+            .collect()
+    }
+
+    fn is_model_allowed(model: &str, allowed_patterns: &[String]) -> bool {
+        let publisher = if model.starts_with("claude-") {
+            "anthropic"
+        } else if model.starts_with("gemini-") {
+            "google"
+        } else {
+            return true;
+        };
+
+        for pattern in allowed_patterns {
+            if pattern.contains(&format!("publishers/{publisher}/models/*")) {
+                return true;
+            }
+
+            let pattern_model = pattern
+                .split("/models/")
+                .nth(1)
+                .map(|s| s.trim_end_matches(":predict").trim_end_matches(":*"));
+
+            if let Some(pattern_model) = pattern_model {
+                if model == pattern_model || model.starts_with(&format!("{pattern_model}@")) {
+                    return true;
+                }
+            }
+        }
+
+        false
     }
 }
 
-#[async_trait]
-impl Provider for GcpVertexAIProvider {
-    /// Returns metadata about the GCP Vertex AI provider.
-    fn metadata() -> ProviderMetadata
-    where
-        Self: Sized,
-    {
-        let model_strings: Vec<String> = vec![
-            GcpVertexAIModel::Claude(ClaudeVersion::Sonnet35),
-            GcpVertexAIModel::Claude(ClaudeVersion::Sonnet35V2),
-            GcpVertexAIModel::Claude(ClaudeVersion::Sonnet37),
-            GcpVertexAIModel::Claude(ClaudeVersion::Haiku35),
-            GcpVertexAIModel::Gemini(GeminiVersion::Pro15),
-            GcpVertexAIModel::Gemini(GeminiVersion::Flash20),
-            GcpVertexAIModel::Gemini(GeminiVersion::Pro20Exp),
-        ]
-        .iter()
-        .map(|model| model.to_string())
-        .collect();
+impl ProviderDef for GcpVertexAIProvider {
+    type Provider = Self;
 
-        let known_models: Vec<&str> = model_strings.iter().map(|s| s.as_str()).collect();
-
+    fn metadata() -> ProviderMetadata {
         ProviderMetadata::new(
-            "gcp_vertex_ai",
+            GCP_VERTEX_AI_PROVIDER_NAME,
             "GCP Vertex AI",
             "Access variety of AI models such as Claude, Gemini through Vertex AI",
-            GcpVertexAIModel::Gemini(GeminiVersion::Flash20)
-                .to_string()
-                .as_str(),
-            known_models,
+            DEFAULT_MODEL,
+            KNOWN_MODELS.to_vec(),
             GCP_VERTEX_AI_DOC_URL,
             vec![
-                ConfigKey::new("GCP_PROJECT_ID", true, false, None),
-                ConfigKey::new("GCP_LOCATION", true, false, Some(Iowa.to_string().as_str())),
+                ConfigKey::new("GCP_PROJECT_ID", true, false, None, true),
+                ConfigKey::new(
+                    "GCP_LOCATION",
+                    true,
+                    false,
+                    Some(&GcpLocation::Iowa.to_string()),
+                    true,
+                ),
                 ConfigKey::new(
                     "GCP_MAX_RETRIES",
                     false,
                     false,
                     Some(&DEFAULT_MAX_RETRIES.to_string()),
+                    false,
                 ),
                 ConfigKey::new(
                     "GCP_INITIAL_RETRY_INTERVAL_MS",
                     false,
                     false,
                     Some(&DEFAULT_INITIAL_RETRY_INTERVAL_MS.to_string()),
+                    false,
                 ),
                 ConfigKey::new(
                     "GCP_BACKOFF_MULTIPLIER",
                     false,
                     false,
                     Some(&DEFAULT_BACKOFF_MULTIPLIER.to_string()),
+                    false,
                 ),
                 ConfigKey::new(
                     "GCP_MAX_RETRY_INTERVAL_MS",
                     false,
                     false,
                     Some(&DEFAULT_MAX_RETRY_INTERVAL_MS.to_string()),
+                    false,
                 ),
             ],
         )
+    }
+
+    fn from_env(
+        model: ModelConfig,
+        _extensions: Vec<crate::config::ExtensionConfig>,
+    ) -> BoxFuture<'static, Result<Self::Provider>> {
+        Box::pin(Self::from_env(model))
+    }
+}
+
+#[async_trait]
+impl Provider for GcpVertexAIProvider {
+    fn get_name(&self) -> &str {
+        &self.name
     }
 
     /// Completes a model interaction by sending a request and processing the response.
@@ -486,50 +563,73 @@ impl Provider for GcpVertexAIProvider {
     /// * `system` - System prompt or context
     /// * `messages` - Array of previous messages in the conversation
     /// * `tools` - Array of available tools for the model
-    #[tracing::instrument(
-        skip(self, system, messages, tools),
-        fields(model_config, input, output, input_tokens, output_tokens, total_tokens)
-    )]
-    async fn complete(
-        &self,
-        system: &str,
-        messages: &[Message],
-        tools: &[Tool],
-    ) -> Result<(Message, ProviderUsage), ProviderError> {
-        // Create request and context
-        let (request, context) = create_request(&self.model, system, messages, tools)?;
-
-        // Send request and process response
-        let response = self.post(request.clone(), &context).await?;
-        let usage = get_usage(&response, &context)?;
-
-        emit_debug_trace(&self.model, &request, &response, &usage);
-
-        // Convert response to message
-        let message = response_to_message(response, context)?;
-        let provider_usage = ProviderUsage::new(self.model.model_name.clone(), usage);
-
-        Ok((message, provider_usage))
-    }
-
     /// Returns the current model configuration.
     fn get_model_config(&self) -> ModelConfig {
         self.model.clone()
+    }
+
+    async fn stream(
+        &self,
+        model_config: &ModelConfig,
+        session_id: &str,
+        system: &str,
+        messages: &[Message],
+        tools: &[Tool],
+    ) -> Result<MessageStream, ProviderError> {
+        let (mut request, context) = create_request(model_config, system, messages, tools)?;
+
+        if matches!(context.provider(), ModelProvider::Anthropic) {
+            if let Some(obj) = request.as_object_mut() {
+                obj.insert("stream".to_string(), Value::Bool(true));
+            }
+        }
+
+        let mut log = RequestLog::start(model_config, &request)?;
+
+        let response = self
+            .post_stream(Some(session_id), &request, &context)
+            .await
+            .inspect_err(|e| {
+                let _ = log.error(e);
+            })?;
+
+        let stream = response.bytes_stream().map_err(io::Error::other);
+
+        let context_clone = context.clone();
+        Ok(Box::pin(try_stream! {
+            let stream_reader = StreamReader::new(stream);
+            let framed = tokio_util::codec::FramedRead::new(
+                stream_reader,
+                tokio_util::codec::LinesCodec::new(),
+            )
+            .map_err(anyhow::Error::from);
+
+            let mut message_stream = response_to_streaming_message(framed, &context_clone);
+
+            while let Some(message) = message_stream.next().await {
+                let (message, usage) = message
+                    .map_err(|e| ProviderError::RequestFailed(format!("Stream decode error: {}", e)))?;
+                log.write(&message, usage.as_ref().map(|u| &u.usage))?;
+                yield (message, usage);
+            }
+        }))
+    }
+
+    async fn fetch_supported_models(&self) -> Result<Vec<String>, ProviderError> {
+        let models: Vec<String> = KNOWN_MODELS.iter().map(|s| s.to_string()).collect();
+        let filtered = self.filter_by_org_policy(models).await;
+        Ok(filtered)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use reqwest::StatusCode;
 
     #[test]
     fn test_retry_config_delay_calculation() {
-        let config = RetryConfig {
-            max_retries: 5,
-            initial_interval_ms: 1000,
-            backoff_multiplier: 2.0,
-            max_interval_ms: 32000,
-        };
+        let config = RetryConfig::new(5, 1000, 2.0, 32000);
 
         // First attempt has no delay
         let delay0 = config.delay_for_attempt(0);
@@ -549,50 +649,97 @@ mod tests {
     }
 
     #[test]
-    fn test_model_provider_conversion() {
-        assert_eq!(ModelProvider::Anthropic.as_str(), "anthropic");
-        assert_eq!(ModelProvider::Google.as_str(), "google");
+    fn test_status_overloaded_code() {
+        // Test that we correctly handle the 529 status code
+
+        // Verify the custom status code is created correctly
+        assert_eq!(STATUS_API_OVERLOADED.as_u16(), 529);
+
+        // This is not a standard HTTP status code, so it's classified as server error
+        assert!(STATUS_API_OVERLOADED.is_server_error());
+
+        // Should be different from TOO_MANY_REQUESTS (429)
+        assert_ne!(*STATUS_API_OVERLOADED, StatusCode::TOO_MANY_REQUESTS);
+
+        // Should be different from SERVICE_UNAVAILABLE (503)
+        assert_ne!(*STATUS_API_OVERLOADED, StatusCode::SERVICE_UNAVAILABLE);
     }
 
     #[test]
-    fn test_url_construction() {
-        use url::Url;
-
-        let model_config = ModelConfig::new("claude-3-5-sonnet-v2@20241022".to_string());
-        let context = RequestContext::new(&model_config.model_name).unwrap();
-        let api_model_id = context.model.to_string();
-
-        let host = "https://us-east5-aiplatform.googleapis.com";
-        let project_id = "test-project";
-        let location = "us-east5";
-
-        let path = format!(
-            "v1/projects/{}/locations/{}/publishers/{}/models/{}:{}",
-            project_id,
-            location,
-            ModelProvider::Anthropic.as_str(),
-            api_model_id,
-            "streamRawPredict"
+    fn test_model_provider_conversion() {
+        assert_eq!(ModelProvider::Anthropic.as_str(), "anthropic".to_string());
+        assert_eq!(ModelProvider::Google.as_str(), "google".to_string());
+        assert_eq!(
+            ModelProvider::MaaS("qwen".to_string()).as_str(),
+            "qwen".to_string()
         );
+    }
 
-        let url = Url::parse(host).unwrap().join(&path).unwrap();
+    #[test]
+    fn test_build_vertex_url_endpoints() {
+        let anthropic_url = build_vertex_url(
+            "https://us-east5-aiplatform.googleapis.com",
+            "us-east5",
+            "test-project",
+            "claude-sonnet-4@20250514",
+            ModelProvider::Anthropic,
+            "us-east5",
+            false,
+        )
+        .unwrap();
+        assert!(anthropic_url.as_str().contains(":rawPredict"));
 
-        assert!(url.as_str().contains("publishers/anthropic"));
-        assert!(url.as_str().contains("projects/test-project"));
-        assert!(url.as_str().contains("locations/us-east5"));
+        let anthropic_stream = build_vertex_url(
+            "https://us-east5-aiplatform.googleapis.com",
+            "us-east5",
+            "test-project",
+            "claude-sonnet-4@20250514",
+            ModelProvider::Anthropic,
+            "us-east5",
+            true,
+        )
+        .unwrap();
+        assert!(anthropic_stream.as_str().contains(":streamRawPredict"));
+        assert!(anthropic_stream.query().is_none());
+
+        let google_stream = build_vertex_url(
+            "https://us-central1-aiplatform.googleapis.com",
+            "us-central1",
+            "test-project",
+            "gemini-2.5-flash",
+            ModelProvider::Google,
+            "us-central1",
+            true,
+        )
+        .unwrap();
+        assert!(google_stream.as_str().contains(":streamGenerateContent"));
+        assert_eq!(google_stream.query(), Some("alt=sse"));
+    }
+
+    #[test]
+    fn test_build_vertex_url_location_replacement() {
+        let url = build_vertex_url(
+            "https://us-east5-aiplatform.googleapis.com",
+            "us-east5",
+            "test-project",
+            "claude-sonnet-4@20250514",
+            ModelProvider::Anthropic,
+            "europe-west1",
+            false,
+        )
+        .unwrap();
+
+        assert!(url
+            .as_str()
+            .contains("europe-west1-aiplatform.googleapis.com"));
+        assert!(url.as_str().contains("locations/europe-west1"));
     }
 
     #[test]
     fn test_provider_metadata() {
         let metadata = GcpVertexAIProvider::metadata();
-        let model_names: Vec<String> = metadata
-            .known_models
-            .iter()
-            .map(|m| m.name.clone())
-            .collect();
-        assert!(model_names.contains(&"claude-3-5-sonnet-v2@20241022".to_string()));
-        assert!(model_names.contains(&"gemini-1.5-pro-002".to_string()));
-        // Should contain the original 2 config keys plus 4 new retry-related ones
+        assert!(!metadata.known_models.is_empty());
+        assert_eq!(metadata.default_model, "gemini-2.5-flash");
         assert_eq!(metadata.config_keys.len(), 6);
     }
 }

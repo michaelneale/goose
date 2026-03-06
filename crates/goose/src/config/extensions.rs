@@ -1,14 +1,17 @@
 use super::base::Config;
+use crate::agents::extension::PLATFORM_EXTENSIONS;
 use crate::agents::ExtensionConfig;
-use anyhow::Result;
+use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use serde_yaml::Mapping;
+use tracing::warn;
 use utoipa::ToSchema;
 
 pub const DEFAULT_EXTENSION: &str = "developer";
 pub const DEFAULT_EXTENSION_TIMEOUT: u64 = 300;
 pub const DEFAULT_EXTENSION_DESCRIPTION: &str = "";
 pub const DEFAULT_DISPLAY_NAME: &str = "Developer";
+const EXTENSIONS_CONFIG_KEY: &str = "extensions";
 
 #[derive(Debug, Deserialize, Serialize, Clone, ToSchema)]
 pub struct ExtensionEntry {
@@ -18,141 +21,194 @@ pub struct ExtensionEntry {
 }
 
 pub fn name_to_key(name: &str) -> String {
-    name.chars()
-        .filter(|c| !c.is_whitespace())
-        .collect::<String>()
-        .to_lowercase()
+    let mut result = String::with_capacity(name.len());
+    for c in name.chars() {
+        result.push(match c {
+            c if c.is_ascii_alphanumeric() || c == '_' || c == '-' => c,
+            c if c.is_whitespace() => continue,
+            _ => '_',
+        });
+    }
+    result.to_lowercase()
 }
 
-/// Extension configuration management
-pub struct ExtensionConfigManager;
-
-impl ExtensionConfigManager {
-    /// Get the extension configuration if enabled -- uses key
-    pub fn get_config(key: &str) -> Result<Option<ExtensionConfig>> {
-        let config = Config::global();
-
-        // Try to get the extension entry
-        let extensions: HashMap<String, ExtensionEntry> = match config.get_param("extensions") {
-            Ok(exts) => exts,
-            Err(super::ConfigError::NotFound(_)) => {
-                // Initialize with default developer extension
-                let defaults = HashMap::from([(
-                    name_to_key(DEFAULT_EXTENSION), // Use key format for top-level key in config
-                    ExtensionEntry {
-                        enabled: true,
-                        config: ExtensionConfig::Builtin {
-                            name: DEFAULT_EXTENSION.to_string(),
-                            display_name: Some(DEFAULT_DISPLAY_NAME.to_string()),
-                            timeout: Some(DEFAULT_EXTENSION_TIMEOUT),
-                            bundled: Some(true),
-                        },
-                    },
-                )]);
-                config.set_param("extensions", serde_json::to_value(&defaults)?)?;
-                defaults
-            }
-            Err(e) => return Err(e.into()),
-        };
-
-        Ok(extensions.get(key).and_then(|entry| {
-            if entry.enabled {
-                Some(entry.config.clone())
-            } else {
-                None
-            }
-        }))
-    }
-
-    pub fn get_config_by_name(name: &str) -> Result<Option<ExtensionConfig>> {
-        let config = Config::global();
-
-        // Try to get the extension entry
-        let extensions: HashMap<String, ExtensionEntry> = match config.get_param("extensions") {
-            Ok(exts) => exts,
-            Err(super::ConfigError::NotFound(_)) => HashMap::new(),
-            Err(_) => HashMap::new(),
-        };
-
-        Ok(extensions
-            .values()
-            .find(|entry| entry.config.name() == name)
-            .map(|entry| entry.config.clone()))
-    }
-
-    /// Set or update an extension configuration
-    pub fn set(entry: ExtensionEntry) -> Result<()> {
-        let config = Config::global();
-
-        let mut extensions: HashMap<String, ExtensionEntry> = config
-            .get_param("extensions")
-            .unwrap_or_else(|_| HashMap::new());
-
-        let key = entry.config.key();
-
-        extensions.insert(key, entry);
-        config.set_param("extensions", serde_json::to_value(extensions)?)?;
-        Ok(())
-    }
-
-    /// Remove an extension configuration -- uses the key
-    pub fn remove(key: &str) -> Result<()> {
-        let config = Config::global();
-
-        let mut extensions: HashMap<String, ExtensionEntry> = config
-            .get_param("extensions")
-            .unwrap_or_else(|_| HashMap::new());
-
-        extensions.remove(key);
-        config.set_param("extensions", serde_json::to_value(extensions)?)?;
-        Ok(())
-    }
-
-    /// Enable or disable an extension -- uses key
-    pub fn set_enabled(key: &str, enabled: bool) -> Result<()> {
-        let config = Config::global();
-
-        let mut extensions: HashMap<String, ExtensionEntry> = config
-            .get_param("extensions")
-            .unwrap_or_else(|_| HashMap::new());
-
-        if let Some(entry) = extensions.get_mut(key) {
-            entry.enabled = enabled;
-            config.set_param("extensions", serde_json::to_value(extensions)?)?;
+pub(crate) fn is_extension_available(config: &ExtensionConfig) -> bool {
+    match config {
+        ExtensionConfig::Platform { name, .. } => {
+            PLATFORM_EXTENSIONS.contains_key(name_to_key(name).as_str())
         }
-        Ok(())
-    }
-
-    /// Get all extensions and their configurations
-    pub fn get_all() -> Result<Vec<ExtensionEntry>> {
-        let config = Config::global();
-        let extensions: HashMap<String, ExtensionEntry> = match config.get_param("extensions") {
-            Ok(exts) => exts,
-            Err(super::ConfigError::NotFound(_)) => HashMap::new(),
-            Err(e) => return Err(e.into()),
-        };
-        Ok(Vec::from_iter(extensions.values().cloned()))
-    }
-
-    /// Get all extension names
-    pub fn get_all_names() -> Result<Vec<String>> {
-        let config = Config::global();
-        Ok(config
-            .get_param("extensions")
-            .unwrap_or_else(|_| get_keys(Default::default())))
-    }
-
-    /// Check if an extension is enabled - FIXED to use key
-    pub fn is_enabled(key: &str) -> Result<bool> {
-        let config = Config::global();
-        let extensions: HashMap<String, ExtensionEntry> = config
-            .get_param("extensions")
-            .unwrap_or_else(|_| HashMap::new());
-
-        Ok(extensions.get(key).map(|e| e.enabled).unwrap_or(false))
+        _ => true,
     }
 }
 
-fn get_keys(entries: HashMap<String, ExtensionEntry>) -> Vec<String> {
-    entries.into_keys().collect()
+fn get_extensions_map_with_config(config: &Config) -> IndexMap<String, ExtensionEntry> {
+    let raw: Mapping = config
+        .get_param(EXTENSIONS_CONFIG_KEY)
+        .unwrap_or_else(|err| {
+            warn!(
+                "Failed to load {}: {err}. Falling back to empty object.",
+                EXTENSIONS_CONFIG_KEY
+            );
+            Default::default()
+        });
+
+    let mut extensions_map = IndexMap::with_capacity(raw.len());
+    for (k, v) in raw {
+        match (k, serde_yaml::from_value::<ExtensionEntry>(v)) {
+            (serde_yaml::Value::String(key), Ok(entry)) => {
+                if !is_extension_available(&entry.config) {
+                    continue;
+                }
+                extensions_map.insert(key, entry);
+            }
+            (k, v) => {
+                warn!(
+                    key = ?k,
+                    value = ?v,
+                    "Skipping malformed extension config entry"
+                );
+            }
+        }
+    }
+
+    extensions_map
+}
+
+fn get_extensions_map() -> IndexMap<String, ExtensionEntry> {
+    get_extensions_map_with_config(Config::global())
+}
+
+fn save_extensions_map(extensions: IndexMap<String, ExtensionEntry>) {
+    let config = Config::global();
+    if let Err(e) = config.set_param(EXTENSIONS_CONFIG_KEY, &extensions) {
+        // TODO(jack) why is this just a debug statement?
+        tracing::debug!("Failed to save extensions config: {}", e);
+    }
+}
+
+pub fn get_extension_by_name(name: &str) -> Option<ExtensionConfig> {
+    let extensions = get_extensions_map();
+    extensions
+        .values()
+        .find(|entry| entry.config.name() == name)
+        .map(|entry| entry.config.clone())
+}
+
+pub fn set_extension(entry: ExtensionEntry) {
+    let mut extensions = get_extensions_map();
+    let key = entry.config.key();
+    extensions.insert(key, entry);
+    save_extensions_map(extensions);
+}
+
+pub fn remove_extension(key: &str) {
+    let mut extensions = get_extensions_map();
+    extensions.shift_remove(key);
+    save_extensions_map(extensions);
+}
+
+pub fn set_extension_enabled(key: &str, enabled: bool) {
+    let mut extensions = get_extensions_map();
+    if let Some(entry) = extensions.get_mut(key) {
+        entry.enabled = enabled;
+        save_extensions_map(extensions);
+    }
+}
+
+pub fn get_all_extensions() -> Vec<ExtensionEntry> {
+    let extensions = get_extensions_map();
+    extensions.into_values().collect()
+}
+
+pub fn get_all_extension_names() -> Vec<String> {
+    let extensions = get_extensions_map();
+    extensions.keys().cloned().collect()
+}
+
+pub fn is_extension_enabled(key: &str) -> bool {
+    let extensions = get_extensions_map();
+    extensions.get(key).map(|e| e.enabled).unwrap_or(false)
+}
+
+pub fn get_enabled_extensions() -> Vec<ExtensionConfig> {
+    get_all_extensions()
+        .into_iter()
+        .filter(|ext| ext.enabled)
+        .map(|ext| ext.config)
+        .collect()
+}
+
+pub fn get_enabled_extensions_with_config(config: &Config) -> Vec<ExtensionConfig> {
+    get_extensions_map_with_config(config)
+        .into_values()
+        .filter(|ext| ext.enabled)
+        .map(|ext| ext.config)
+        .collect()
+}
+
+pub fn get_warnings() -> Vec<String> {
+    let raw: Mapping = Config::global()
+        .get_param(EXTENSIONS_CONFIG_KEY)
+        .unwrap_or_default();
+
+    let mut warnings = Vec::new();
+    for (k, v) in raw {
+        if let (serde_yaml::Value::String(key), Ok(entry)) =
+            (k, serde_yaml::from_value::<ExtensionEntry>(v))
+        {
+            if matches!(entry.config, ExtensionConfig::Sse { .. }) {
+                warnings.push(format!(
+                    "'{}': SSE is unsupported, migrate to streamable_http",
+                    key
+                ));
+            }
+        }
+    }
+    warnings
+}
+
+pub fn resolve_extensions_for_new_session(
+    recipe_extensions: Option<&[ExtensionConfig]>,
+    override_extensions: Option<Vec<ExtensionConfig>>,
+) -> Vec<ExtensionConfig> {
+    let extensions = if let Some(exts) = recipe_extensions {
+        exts.to_vec()
+    } else if let Some(exts) = override_extensions {
+        exts
+    } else {
+        get_enabled_extensions()
+    };
+
+    extensions
+        .into_iter()
+        .filter(is_extension_available)
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_is_extension_available_filters_unknown_platform() {
+        let unknown_platform = ExtensionConfig::Platform {
+            name: "definitely_not_real_platform_extension".to_string(),
+            description: "unknown".to_string(),
+            display_name: None,
+            bundled: None,
+            available_tools: Vec::new(),
+        };
+
+        let builtin = ExtensionConfig::Builtin {
+            name: "developer".to_string(),
+            description: "".to_string(),
+            display_name: Some("Developer".to_string()),
+            timeout: None,
+            bundled: None,
+            available_tools: Vec::new(),
+        };
+
+        assert!(!is_extension_available(&unknown_platform));
+        assert!(is_extension_available(&builtin));
+    }
 }

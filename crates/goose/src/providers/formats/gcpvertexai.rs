@@ -1,12 +1,24 @@
 use super::{anthropic, google};
-use crate::message::Message;
+use crate::conversation::message::Message;
 use crate::model::ModelConfig;
 use crate::providers::base::Usage;
 use anyhow::{Context, Result};
-use mcp_core::tool::Tool;
+use rmcp::model::Tool;
 use serde_json::Value;
 
 use std::fmt;
+
+pub type StreamingMessageStream = std::pin::Pin<
+    Box<
+        dyn futures::Stream<
+                Item = anyhow::Result<(
+                    Option<Message>,
+                    Option<crate::providers::base::ProviderUsage>,
+                )>,
+            > + Send
+            + 'static,
+    >,
+>;
 
 /// Sensible default values of Google Cloud Platform (GCP) locations for model deployment.
 ///
@@ -17,6 +29,8 @@ pub enum GcpLocation {
     Iowa,
     /// Represents the us-east5 region in Ohio
     Ohio,
+    /// Represents the global endpoint (required for Gemini 3 models)
+    Global,
 }
 
 impl fmt::Display for GcpLocation {
@@ -24,18 +38,7 @@ impl fmt::Display for GcpLocation {
         match self {
             Self::Iowa => write!(f, "us-central1"),
             Self::Ohio => write!(f, "us-east5"),
-        }
-    }
-}
-
-impl TryFrom<&str> for GcpLocation {
-    type Error = ModelError;
-
-    fn try_from(s: &str) -> Result<Self, Self::Error> {
-        match s {
-            "us-central1" => Ok(Self::Iowa),
-            "us-east5" => Ok(Self::Ohio),
-            _ => Err(ModelError::UnsupportedLocation(s.to_string())),
+            Self::Global => write!(f, "global"),
         }
     }
 }
@@ -58,80 +61,66 @@ pub enum ModelError {
     UnsupportedLocation(String),
 }
 
-/// Represents available GCP Vertex AI models for Goose.
+/// Default model for GCP Vertex AI.
+pub const DEFAULT_MODEL: &str = "gemini-2.5-flash";
+
+pub const KNOWN_MODELS: &[&str] = &[
+    "claude-opus-4-6",
+    "claude-sonnet-4-6",
+    "claude-opus-4-5@20251101",
+    "claude-sonnet-4-5@20250929",
+    "claude-opus-4-1@20250805",
+    "claude-haiku-4-5@20251001",
+    "claude-opus-4@20250514",
+    "claude-sonnet-4@20250514",
+    "claude-3-5-haiku@20241022",
+    "claude-3-haiku@20240307",
+    "gemini-3-pro-preview",
+    "gemini-3-flash-preview",
+    "gemini-2.5-pro",
+    "gemini-2.5-flash",
+    "gemini-2.5-flash-lite",
+    "gemini-2.0-flash",
+    "gemini-2.0-flash-lite",
+];
+
+/// Represents available GCP Vertex AI models for goose.
 ///
-/// This enum encompasses different model families and their versions
-/// that are supported in the GCP Vertex AI platform.
+/// This enum encompasses different model families that are supported
+/// in the GCP Vertex AI platform.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GcpVertexAIModel {
-    /// Claude model family with specific versions
-    Claude(ClaudeVersion),
-    /// Gemini model family with specific versions
-    Gemini(GeminiVersion),
-}
-
-/// Represents available versions of the Claude model for Goose.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ClaudeVersion {
-    /// Claude 3.5 Sonnet initial version
-    Sonnet35,
-    /// Claude 3.5 Sonnet version 2
-    Sonnet35V2,
-    /// Claude 3.7 Sonnet
-    Sonnet37,
-    /// Claude 3.5 Haiku
-    Haiku35,
-    /// Generic Claude model for custom or new versions
-    Generic(String),
-}
-
-/// Represents available versions of the Gemini model for Goose.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum GeminiVersion {
-    /// Gemini 1.5 Pro version
-    Pro15,
-    /// Gemini 2.0 Flash version
-    Flash20,
-    /// Gemini 2.0 Pro Experimental version
-    Pro20Exp,
-    /// Gemini 2.5 Pro Experimental version
-    Pro25Exp,
-    /// Generic Gemini model for custom or new versions
-    Generic(String),
+    /// Claude model family
+    Claude(String),
+    /// Gemini model family
+    Gemini(String),
+    /// MaaS (Model as a Service) models from Model Garden
+    /// Contains (publisher, full_model_name)
+    MaaS(String, String),
 }
 
 impl fmt::Display for GcpVertexAIModel {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let model_id = match self {
-            Self::Claude(version) => match version {
-                ClaudeVersion::Sonnet35 => "claude-3-5-sonnet@20240620",
-                ClaudeVersion::Sonnet35V2 => "claude-3-5-sonnet-v2@20241022",
-                ClaudeVersion::Sonnet37 => "claude-3-7-sonnet@20250219",
-                ClaudeVersion::Haiku35 => "claude-3-5-haiku@20241022",
-                ClaudeVersion::Generic(name) => name,
-            },
-            Self::Gemini(version) => match version {
-                GeminiVersion::Pro15 => "gemini-1.5-pro-002",
-                GeminiVersion::Flash20 => "gemini-2.0-flash-001",
-                GeminiVersion::Pro20Exp => "gemini-2.0-pro-exp-02-05",
-                GeminiVersion::Pro25Exp => "gemini-2.5-pro-exp-03-25",
-                GeminiVersion::Generic(name) => name,
-            },
-        };
-        write!(f, "{model_id}")
+        match self {
+            Self::Claude(name) => write!(f, "{name}"),
+            Self::Gemini(name) => write!(f, "{name}"),
+            Self::MaaS(_, name) => write!(f, "{name}"),
+        }
     }
 }
 
 impl GcpVertexAIModel {
     /// Returns the default GCP location for the model.
     ///
-    /// Each model family has a well-known location:
+    /// Each model family has a well-known location based on availability:
     /// - Claude models default to Ohio (us-east5)
     /// - Gemini models default to Iowa (us-central1)
+    /// - MaaS models default to Iowa (us-central1)
     pub fn known_location(&self) -> GcpLocation {
         match self {
             Self::Claude(_) => GcpLocation::Ohio,
             Self::Gemini(_) => GcpLocation::Iowa,
+            Self::MaaS(_, _) => GcpLocation::Iowa,
         }
     }
 }
@@ -140,24 +129,19 @@ impl TryFrom<&str> for GcpVertexAIModel {
     type Error = ModelError;
 
     fn try_from(s: &str) -> Result<Self, Self::Error> {
-        // Known models
-        match s {
-            "claude-3-5-sonnet@20240620" => Ok(Self::Claude(ClaudeVersion::Sonnet35)),
-            "claude-3-5-sonnet-v2@20241022" => Ok(Self::Claude(ClaudeVersion::Sonnet35V2)),
-            "claude-3-7-sonnet@20250219" => Ok(Self::Claude(ClaudeVersion::Sonnet37)),
-            "claude-3-5-haiku@20241022" => Ok(Self::Claude(ClaudeVersion::Haiku35)),
-            "gemini-1.5-pro-002" => Ok(Self::Gemini(GeminiVersion::Pro15)),
-            "gemini-2.0-flash-001" => Ok(Self::Gemini(GeminiVersion::Flash20)),
-            "gemini-2.0-pro-exp-02-05" => Ok(Self::Gemini(GeminiVersion::Pro20Exp)),
-            "gemini-2.5-pro-exp-03-25" => Ok(Self::Gemini(GeminiVersion::Pro25Exp)),
-            // Generic models based on prefix matching
-            _ if s.starts_with("claude-") => {
-                Ok(Self::Claude(ClaudeVersion::Generic(s.to_string())))
-            }
-            _ if s.starts_with("gemini-") => {
-                Ok(Self::Gemini(GeminiVersion::Generic(s.to_string())))
-            }
-            _ => Err(ModelError::UnsupportedModel(s.to_string())),
+        if s.starts_with("claude-") {
+            Ok(Self::Claude(s.to_string()))
+        } else if s.starts_with("gemini-") {
+            Ok(Self::Gemini(s.to_string()))
+        } else if s.ends_with("-maas") {
+            let publisher = s
+                .split('-')
+                .next()
+                .ok_or_else(|| ModelError::UnsupportedModel(s.to_string()))?
+                .to_string();
+            Ok(Self::MaaS(publisher, s.to_string()))
+        } else {
+            Err(ModelError::UnsupportedModel(s.to_string()))
         }
     }
 }
@@ -190,28 +174,32 @@ impl RequestContext {
 
     /// Returns the provider associated with the model.
     pub fn provider(&self) -> ModelProvider {
-        match self.model {
+        match &self.model {
             GcpVertexAIModel::Claude(_) => ModelProvider::Anthropic,
             GcpVertexAIModel::Gemini(_) => ModelProvider::Google,
+            GcpVertexAIModel::MaaS(publisher, _) => ModelProvider::MaaS(publisher.clone()),
         }
     }
 }
 
 /// Represents available model providers.
-#[derive(Debug, Clone, PartialEq, Eq, Copy)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ModelProvider {
     /// Anthropic provider (Claude models)
     Anthropic,
     /// Google provider (Gemini models)
     Google,
+    /// MaaS provider (Model as a Service from Model Garden)
+    MaaS(String),
 }
 
 impl ModelProvider {
     /// Returns the string representation of the provider.
-    pub fn as_str(&self) -> &'static str {
+    pub fn as_str(&self) -> String {
         match self {
-            Self::Anthropic => "anthropic",
-            Self::Google => "google",
+            Self::Anthropic => "anthropic".to_string(),
+            Self::Google => "google".to_string(),
+            Self::MaaS(publisher) => publisher.clone(),
         }
     }
 }
@@ -293,6 +281,12 @@ pub fn create_request(
         GcpVertexAIModel::Gemini(_) => {
             create_google_request(model_config, system, messages, tools)?
         }
+        GcpVertexAIModel::MaaS(_, _) => {
+            // TODO: Branch on publisher for format selection once we know which
+            // MaaS providers use which formats (e.g., OpenAI vs Google format)
+            // For now, default to Google format since most use generateContent endpoint
+            create_google_request(model_config, system, messages, tools)?
+        }
     };
 
     Ok((request, context))
@@ -308,8 +302,9 @@ pub fn create_request(
 /// * `Result<Message>` - Converted message
 pub fn response_to_message(response: Value, request_context: RequestContext) -> Result<Message> {
     match request_context.provider() {
-        ModelProvider::Anthropic => anthropic::response_to_message(response),
+        ModelProvider::Anthropic => anthropic::response_to_message(&response),
         ModelProvider::Google => google::response_to_message(response),
+        ModelProvider::MaaS(_) => google::response_to_message(response),
     }
 }
 
@@ -325,6 +320,22 @@ pub fn get_usage(data: &Value, request_context: &RequestContext) -> Result<Usage
     match request_context.provider() {
         ModelProvider::Anthropic => anthropic::get_usage(data),
         ModelProvider::Google => google::get_usage(data),
+        ModelProvider::MaaS(_) => google::get_usage(data),
+    }
+}
+
+pub fn response_to_streaming_message<S>(
+    stream: S,
+    request_context: &RequestContext,
+) -> StreamingMessageStream
+where
+    S: futures::Stream<Item = anyhow::Result<String>> + Unpin + Send + 'static,
+{
+    match request_context.provider() {
+        ModelProvider::Anthropic => Box::pin(anthropic::response_to_streaming_message(stream)),
+        ModelProvider::Google | ModelProvider::MaaS(_) => {
+            Box::pin(google::response_to_streaming_message(stream))
+        }
     }
 }
 
@@ -335,21 +346,16 @@ mod tests {
 
     #[test]
     fn test_model_parsing() -> Result<()> {
-        let valid_models = [
-            "claude-3-5-sonnet@20240620",
-            "claude-3-5-sonnet-v2@20241022",
-            "claude-3-7-sonnet@20250219",
-            "claude-3-5-haiku@20241022",
-            "gemini-1.5-pro-002",
-            "gemini-2.0-flash-001",
-            "gemini-2.0-pro-exp-02-05",
-            "gemini-2.5-pro-exp-03-25",
-        ];
+        let claude = GcpVertexAIModel::try_from("claude-sonnet-4@20250514")?;
+        assert!(matches!(claude, GcpVertexAIModel::Claude(_)));
+        assert_eq!(claude.to_string(), "claude-sonnet-4@20250514");
 
-        for model_id in valid_models {
-            let model = GcpVertexAIModel::try_from(model_id)?;
-            assert_eq!(model.to_string(), model_id);
-        }
+        let gemini = GcpVertexAIModel::try_from("gemini-2.5-flash")?;
+        assert!(matches!(gemini, GcpVertexAIModel::Gemini(_)));
+        assert_eq!(gemini.to_string(), "gemini-2.5-flash");
+
+        let maas = GcpVertexAIModel::try_from("qwen-maas")?;
+        assert!(matches!(maas, GcpVertexAIModel::MaaS(_, _)));
 
         assert!(GcpVertexAIModel::try_from("unsupported-model").is_err());
         Ok(())
@@ -357,71 +363,24 @@ mod tests {
 
     #[test]
     fn test_default_locations() -> Result<()> {
-        let test_cases = [
-            ("claude-3-5-sonnet@20240620", GcpLocation::Ohio),
-            ("claude-3-5-sonnet-v2@20241022", GcpLocation::Ohio),
-            ("claude-3-7-sonnet@20250219", GcpLocation::Ohio),
-            ("claude-3-5-haiku@20241022", GcpLocation::Ohio),
-            ("gemini-1.5-pro-002", GcpLocation::Iowa),
-            ("gemini-2.0-flash-001", GcpLocation::Iowa),
-            ("gemini-2.0-pro-exp-02-05", GcpLocation::Iowa),
-            ("gemini-2.5-pro-exp-03-25", GcpLocation::Iowa),
-        ];
+        let claude_model = GcpVertexAIModel::try_from("claude-sonnet-4@20250514")?;
+        assert_eq!(claude_model.known_location(), GcpLocation::Ohio);
 
-        for (model_id, expected_location) in test_cases {
-            let model = GcpVertexAIModel::try_from(model_id)?;
-            assert_eq!(
-                model.known_location(),
-                expected_location,
-                "Model {model_id} should have default location {expected_location:?}",
-            );
-
-            let context = RequestContext::new(model_id)?;
-            assert_eq!(
-                context.model.known_location(),
-                expected_location,
-                "RequestContext for {model_id} should have default location {expected_location:?}",
-            );
-        }
+        let gemini_model = GcpVertexAIModel::try_from("gemini-2.5-flash")?;
+        assert_eq!(gemini_model.known_location(), GcpLocation::Iowa);
 
         Ok(())
     }
 
     #[test]
-    fn test_generic_model_parsing() -> Result<()> {
-        // Test generic Claude models
-        let claude_models = [
-            "claude-3-8-apex@20250301",
-            "claude-new-version",
-            "claude-experimental",
-        ];
+    fn test_unknown_model_parsing() -> Result<()> {
+        let model = GcpVertexAIModel::try_from("claude-future-version")?;
+        assert!(matches!(model, GcpVertexAIModel::Claude(_)));
+        assert_eq!(model.to_string(), "claude-future-version");
 
-        for model_id in claude_models {
-            let model = GcpVertexAIModel::try_from(model_id)?;
-            match model {
-                GcpVertexAIModel::Claude(ClaudeVersion::Generic(ref name)) => {
-                    assert_eq!(name, model_id);
-                }
-                _ => panic!("Expected Claude generic model for {model_id}"),
-            }
-            assert_eq!(model.to_string(), model_id);
-            assert_eq!(model.known_location(), GcpLocation::Ohio);
-        }
-
-        // Test generic Gemini models
-        let gemini_models = ["gemini-3-pro", "gemini-2.5-flash", "gemini-experimental"];
-
-        for model_id in gemini_models {
-            let model = GcpVertexAIModel::try_from(model_id)?;
-            match model {
-                GcpVertexAIModel::Gemini(GeminiVersion::Generic(ref name)) => {
-                    assert_eq!(name, model_id);
-                }
-                _ => panic!("Expected Gemini generic model for {model_id}"),
-            }
-            assert_eq!(model.to_string(), model_id);
-            assert_eq!(model.known_location(), GcpLocation::Iowa);
-        }
+        let model = GcpVertexAIModel::try_from("gemini-4.0-ultra")?;
+        assert!(matches!(model, GcpVertexAIModel::Gemini(_)));
+        assert_eq!(model.to_string(), "gemini-4.0-ultra");
 
         Ok(())
     }

@@ -20,8 +20,8 @@
     "noFallthroughCasesInSwitch": true,
 
     /* Electron/Node.js specific */
-    "types": ["node", "electron"],
-    "typeRoots": ["./node_modules/@types", "./src/types"],
+    "types": ["node"],
+    "typeRoots": ["./node_modules/@types", "./src/types", "./node_modules/electron"],
     "esModuleInterop": true,
     "allowSyntheticDefaultImports": true,
     "forceConsistentCasingInFileNames": true,
@@ -38,8 +38,8 @@
     "strictPropertyInitialization": true,
     "noImplicitThis": true,
     "alwaysStrict": true,
-    "noImplicitReturns": true
+    "noImplicitReturns": true,
   },
-  "include": ["src"],
-  "references": [{ "path": "./tsconfig.node.json" }]
+  "include": ["src", "tests/integration"],
+  "references": [{ "path": "./tsconfig.node.json" }],
 }

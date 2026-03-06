@@ -1,26 +1,121 @@
-use crate::message::{Message, MessageContent};
+use crate::conversation::message::{Message, MessageContent};
 use crate::model::ModelConfig;
-use crate::providers::base::Usage;
-use crate::providers::errors::ProviderError;
 use crate::providers::utils::{
-    convert_image, detect_image_path, is_valid_function_name, load_image_file,
+    convert_image, detect_image_path, is_valid_function_name, load_image_file, safely_parse_json,
     sanitize_function_name, ImageFormat,
 };
 use anyhow::{anyhow, Error};
-use mcp_core::ToolError;
-use mcp_core::{Content, Role, Tool, ToolCall};
+use rmcp::model::{
+    object, AnnotateAble, CallToolRequestParams, Content, ErrorCode, ErrorData, RawContent,
+    ResourceContents, Role, Tool,
+};
+use serde::Serialize;
 use serde_json::{json, Value};
+use std::borrow::Cow;
+
+#[derive(Serialize)]
+struct DatabricksMessage {
+    content: Value,
+    role: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_calls: Option<Vec<Value>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_call_id: Option<String>,
+}
+
+fn format_text_content(text: &str, image_format: &ImageFormat) -> (Vec<Value>, bool) {
+    let mut items = vec![json!({"type": "text", "text": text})];
+    let has_image = if let Some(path) = detect_image_path(text) {
+        if let Ok(image) = load_image_file(path) {
+            items.push(convert_image(&image, image_format));
+        }
+        true
+    } else {
+        false
+    };
+    (items, has_image)
+}
+
+fn format_tool_response(
+    response: &crate::conversation::message::ToolResponse,
+    image_format: &ImageFormat,
+) -> Vec<DatabricksMessage> {
+    let mut result = Vec::new();
+
+    match &response.tool_result {
+        Ok(call_result) => {
+            let abridged: Vec<_> = call_result.content.iter().map(|c| c.raw.clone()).collect();
+
+            let mut tool_content = Vec::new();
+            let mut image_messages = Vec::new();
+
+            for content in abridged {
+                match content {
+                    RawContent::Image(image) => {
+                        tool_content.push(Content::text(
+                            "This tool result included an image that is uploaded in the next message.",
+                        ));
+                        image_messages.push(DatabricksMessage {
+                            role: "user".to_string(),
+                            content: [convert_image(&image.no_annotation(), image_format)].into(),
+                            tool_calls: None,
+                            tool_call_id: None,
+                        });
+                    }
+                    RawContent::Resource(resource) => {
+                        let text = match &resource.resource {
+                            ResourceContents::TextResourceContents { text, .. } => text.clone(),
+                            _ => String::new(),
+                        };
+                        tool_content.push(Content::text(text));
+                    }
+                    _ => tool_content.push(content.no_annotation()),
+                }
+            }
+
+            let tool_response_content: Value = json!(tool_content
+                .iter()
+                .filter_map(|c| c.as_text().map(|t| t.text.clone()))
+                .collect::<Vec<String>>()
+                .join(" "));
+
+            result.push(DatabricksMessage {
+                content: tool_response_content,
+                role: "tool".to_string(),
+                tool_call_id: Some(response.id.clone()),
+                tool_calls: None,
+            });
+            result.extend(image_messages);
+        }
+        Err(e) => {
+            result.push(DatabricksMessage {
+                role: "tool".to_string(),
+                content: format!("The tool call returned the following error:\n{}", e).into(),
+                tool_call_id: Some(response.id.clone()),
+                tool_calls: None,
+            });
+        }
+    }
+
+    result
+}
 
 /// Convert internal Message format to Databricks' API message specification
 ///   Databricks is mostly OpenAI compatible, but has some differences (reasoning type, etc)
 ///   some openai compatible endpoints use the anthropic image spec at the content level
 ///   even though the message structure is otherwise following openai, the enum switches this
-pub fn format_messages(messages: &[Message], image_format: &ImageFormat) -> Vec<Value> {
+fn format_messages(messages: &[Message], image_format: &ImageFormat) -> Vec<DatabricksMessage> {
     let mut result = Vec::new();
     for message in messages {
-        let mut converted = json!({
-            "role": message.role
-        });
+        let mut converted = DatabricksMessage {
+            content: Value::Null,
+            role: match message.role {
+                Role::User => "user".to_string(),
+                Role::Assistant => "assistant".to_string(),
+            },
+            tool_calls: None,
+            tool_call_id: None,
+        };
 
         let mut content_array = Vec::new();
         let mut has_tool_calls = false;
@@ -30,53 +125,27 @@ pub fn format_messages(messages: &[Message], image_format: &ImageFormat) -> Vec<
             match content {
                 MessageContent::Text(text) => {
                     if !text.text.is_empty() {
-                        // Check for image paths in the text
-                        if let Some(image_path) = detect_image_path(&text.text) {
-                            has_multiple_content = true;
-                            // Try to load and convert the image
-                            if let Ok(image) = load_image_file(image_path) {
-                                content_array.push(json!({
-                                    "type": "text",
-                                    "text": text.text
-                                }));
-                                content_array.push(convert_image(&image, image_format));
-                            } else {
-                                content_array.push(json!({
-                                    "type": "text",
-                                    "text": text.text
-                                }));
-                            }
-                        } else {
-                            content_array.push(json!({
-                                "type": "text",
-                                "text": text.text
-                            }));
-                        }
+                        let (items, multi) = format_text_content(&text.text, image_format);
+                        content_array.extend(items);
+                        has_multiple_content |= multi;
                     }
                 }
                 MessageContent::Thinking(content) => {
                     has_multiple_content = true;
                     content_array.push(json!({
                         "type": "reasoning",
-                        "summary": [
-                            {
-                                "type": "summary_text",
-                                "text": content.thinking,
-                                "signature": content.signature
-                            }
-                        ]
+                        "summary": [{
+                            "type": "summary_text",
+                            "text": content.thinking,
+                            "signature": content.signature
+                        }]
                     }));
                 }
                 MessageContent::RedactedThinking(content) => {
                     has_multiple_content = true;
                     content_array.push(json!({
                         "type": "reasoning",
-                        "summary": [
-                            {
-                                "type": "summary_encrypted_text",
-                                "data": content.data
-                            }
-                        ]
+                        "summary": [{"type": "summary_encrypted_text", "data": content.data}]
                     }));
                 }
                 MessageContent::ToolRequest(request) => {
@@ -84,151 +153,74 @@ pub fn format_messages(messages: &[Message], image_format: &ImageFormat) -> Vec<
                     match &request.tool_call {
                         Ok(tool_call) => {
                             let sanitized_name = sanitize_function_name(&tool_call.name);
+                            let arguments_str = tool_call
+                                .arguments
+                                .as_ref()
+                                .map(|args| {
+                                    serde_json::to_string(args).unwrap_or_else(|_| "{}".to_string())
+                                })
+                                .unwrap_or_else(|| "{}".to_string());
 
-                            // Get mutable access to the "tool_calls" field in the converted object
-                            // If "tool_calls" doesn't exist, insert an empty JSON array
-                            let tool_calls = converted
-                                .as_object_mut()
-                                .unwrap()
-                                .entry("tool_calls")
-                                .or_insert(json!([]));
-
-                            tool_calls.as_array_mut().unwrap().push(json!({
+                            let tool_calls = converted.tool_calls.get_or_insert_default();
+                            let mut tool_call_json = json!({
                                 "id": request.id,
                                 "type": "function",
                                 "function": {
                                     "name": sanitized_name,
-                                    "arguments": tool_call.arguments.to_string(),
+                                    "arguments": arguments_str,
                                 }
-                            }));
-                        }
-                        Err(e) => {
-                            content_array.push(json!({
-                                "type": "text",
-                                "text": format!("Error: {}", e)
-                            }));
-                        }
-                    }
-                }
-                MessageContent::ContextLengthExceeded(_) => {
-                    continue;
-                }
-                MessageContent::SummarizationRequested(_) => {
-                    continue;
-                }
-                MessageContent::ToolResponse(response) => {
-                    match &response.tool_result {
-                        Ok(contents) => {
-                            // Send only contents with no audience or with Assistant in the audience
-                            let abridged: Vec<_> = contents
-                                .iter()
-                                .filter(|content| {
-                                    content
-                                        .audience()
-                                        .is_none_or(|audience| audience.contains(&Role::Assistant))
-                                })
-                                .map(|content| content.unannotated())
-                                .collect();
+                            });
 
-                            // Process all content, replacing images with placeholder text
-                            let mut tool_content = Vec::new();
-                            let mut image_messages = Vec::new();
-
-                            for content in abridged {
-                                match content {
-                                    Content::Image(image) => {
-                                        // Add placeholder text in the tool response
-                                        tool_content.push(Content::text("This tool result included an image that is uploaded in the next message."));
-
-                                        // Create a separate image message
-                                        image_messages.push(json!({
-                                            "role": "user",
-                                            "content": [convert_image(&image, image_format)]
-                                        }));
-                                    }
-                                    Content::Resource(resource) => {
-                                        tool_content.push(Content::text(resource.get_text()));
-                                    }
-                                    _ => {
-                                        tool_content.push(content);
-                                    }
+                            if let Some(metadata) = &request.metadata {
+                                for (key, value) in metadata {
+                                    tool_call_json[key] = value.clone();
                                 }
                             }
-                            let tool_response_content: Value = json!(tool_content
-                                .iter()
-                                .map(|content| match content {
-                                    Content::Text(text) => text.text.clone(),
-                                    _ => String::new(),
-                                })
-                                .collect::<Vec<String>>()
-                                .join(" "));
 
-                            // Add tool response as a separate message
-                            result.push(json!({
-                                "role": "tool",
-                                "content": tool_response_content,
-                                "tool_call_id": response.id
-                            }));
-                            // Then add any image messages that need to follow
-                            result.extend(image_messages);
+                            tool_calls.push(tool_call_json);
                         }
                         Err(e) => {
-                            // A tool result error is shown as output so the model can interpret the error message
-                            result.push(json!({
-                                "role": "tool",
-                                "content": format!("The tool call returned the following error:\n{}", e),
-                                "tool_call_id": response.id
-                            }));
+                            content_array
+                                .push(json!({"type": "text", "text": format!("Error: {}", e)}));
                         }
                     }
                 }
-                MessageContent::ToolConfirmationRequest(_) => {
-                    // Skip tool confirmation requests
+                MessageContent::ToolResponse(response) => {
+                    result.extend(format_tool_response(response, image_format));
                 }
                 MessageContent::Image(image) => {
-                    // Handle direct image content
-                    content_array.push(json!({
-                        "type": "image_url",
-                        "image_url": {
-                            "url": convert_image(image, image_format)
-                        }
-                    }));
+                    content_array.push(convert_image(image, image_format));
                 }
                 MessageContent::FrontendToolRequest(req) => {
-                    // Frontend tool requests are converted to text messages
-                    if let Ok(tool_call) = &req.tool_call {
-                        content_array.push(json!({
-                            "type": "text",
-                            "text": format!(
-                                "Frontend tool request: {} ({})",
-                                tool_call.name,
-                                serde_json::to_string_pretty(&tool_call.arguments).unwrap()
-                            )
-                        }));
-                    } else {
-                        content_array.push(json!({
-                            "type": "text",
-                            "text": format!(
-                                "Frontend tool request error: {}",
-                                req.tool_call.as_ref().unwrap_err()
-                            )
-                        }));
-                    }
+                    let text = match &req.tool_call {
+                        Ok(tool_call) => format!(
+                            "Frontend tool request: {} ({})",
+                            tool_call.name,
+                            serde_json::to_string_pretty(&tool_call.arguments).unwrap()
+                        ),
+                        Err(e) => format!("Frontend tool request error: {}", e),
+                    };
+                    content_array.push(json!({"type": "text", "text": text}));
+                }
+                MessageContent::SystemNotification(_)
+                | MessageContent::ToolConfirmationRequest(_)
+                | MessageContent::ActionRequired(_) => {}
+                MessageContent::Reasoning(_reasoning) => {
+                    // Reasoning content is for OpenAI-compatible APIs (e.g., DeepSeek)
+                    // Databricks doesn't use this format, so skip
                 }
             }
         }
 
         if !content_array.is_empty() {
-            // If we only have a single text content and no other special content,
-            // use the simple string format
-            if content_array.len() == 1
+            converted.content = if content_array.len() == 1
                 && !has_multiple_content
                 && content_array[0]["type"] == "text"
             {
-                converted["content"] = json!(content_array[0]["text"]);
+                json!(content_array[0]["text"])
             } else {
-                converted["content"] = json!(content_array);
-            }
+                json!(content_array)
+            };
         }
 
         if !content_array.is_empty() || has_tool_calls {
@@ -239,24 +231,46 @@ pub fn format_messages(messages: &[Message], image_format: &ImageFormat) -> Vec<
     result
 }
 
-/// Convert internal Tool format to OpenAI's API tool specification
-pub fn format_tools(tools: &[Tool]) -> anyhow::Result<Vec<Value>> {
+pub fn format_tools(tools: &[Tool], model_name: &str) -> anyhow::Result<Vec<Value>> {
     let mut tool_names = std::collections::HashSet::new();
     let mut result = Vec::new();
+
+    let is_gemini = model_name.contains("gemini");
 
     for tool in tools {
         if !tool_names.insert(&tool.name) {
             return Err(anyhow!("Duplicate tool name: {}", tool.name));
         }
 
+        let has_properties = tool
+            .input_schema
+            .get("properties")
+            .and_then(|v| v.as_object())
+            .is_some_and(|p| !p.is_empty());
+
+        let function_def = if is_gemini {
+            let mut def = json!({
+                "name": tool.name,
+                "description": tool.description,
+            });
+            if has_properties {
+                def["parametersJsonSchema"] = json!(tool.input_schema);
+            }
+            def
+        } else {
+            let mut def = json!({
+                "name": tool.name,
+                "description": tool.description,
+            });
+            if has_properties {
+                def["parameters"] = json!(tool.input_schema);
+            }
+            def
+        };
+
         result.push(json!({
             "type": "function",
-            "function": {
-                "name": tool.name,
-                // do not silently truncate description
-                "description": tool.description,
-                "parameters": tool.input_schema,
-            }
+            "function": function_def,
         }));
     }
 
@@ -264,8 +278,9 @@ pub fn format_tools(tools: &[Tool]) -> anyhow::Result<Vec<Value>> {
 }
 
 /// Convert Databricks' API response to internal Message format
-pub fn response_to_message(response: Value) -> anyhow::Result<Message> {
-    let original = response["choices"][0]["message"].clone();
+#[allow(clippy::too_many_lines)]
+pub fn response_to_message(response: &Value) -> anyhow::Result<Message> {
+    let original = &response["choices"][0]["message"];
     let mut content = Vec::new();
 
     // Handle array-based content
@@ -322,34 +337,52 @@ pub fn response_to_message(response: Value) -> anyhow::Result<Message> {
                     .as_str()
                     .unwrap_or_default()
                     .to_string();
-                let mut arguments = tool_call["function"]["arguments"]
+
+                // Get the raw arguments string from the LLM.
+                let arguments_str = tool_call["function"]["arguments"]
                     .as_str()
                     .unwrap_or_default()
                     .to_string();
-                // If arguments is empty, we will have invalid json parsing error later.
-                if arguments.is_empty() {
-                    arguments = "{}".to_string();
-                }
+
+                // If arguments_str is empty, default to an empty JSON object string.
+                let arguments_str = if arguments_str.is_empty() {
+                    "{}".to_string()
+                } else {
+                    arguments_str
+                };
 
                 if !is_valid_function_name(&function_name) {
-                    let error = ToolError::NotFound(format!(
-                        "The provided function name '{}' had invalid characters, it must match this regex [a-zA-Z0-9_-]+",
-                        function_name
-                    ));
+                    let error = ErrorData {
+                        code: ErrorCode::INVALID_REQUEST,
+                        message: Cow::from(format!(
+                            "The provided function name '{}' had invalid characters, it must match this regex [a-zA-Z0-9_-]+",
+                            function_name
+                        )),
+                        data: None,
+                    };
                     content.push(MessageContent::tool_request(id, Err(error)));
                 } else {
-                    match serde_json::from_str::<Value>(&arguments) {
+                    match safely_parse_json(&arguments_str) {
                         Ok(params) => {
                             content.push(MessageContent::tool_request(
                                 id,
-                                Ok(ToolCall::new(&function_name, params)),
+                                Ok(CallToolRequestParams {
+                                    meta: None,
+                                    task: None,
+                                    name: function_name.into(),
+                                    arguments: Some(object(params)),
+                                }),
                             ));
                         }
                         Err(e) => {
-                            let error = ToolError::InvalidParameters(format!(
-                                "Could not interpret tool use parameters for id {}: {}",
-                                id, e
-                            ));
+                            let error = ErrorData {
+                                code: ErrorCode::INVALID_PARAMS,
+                                message: Cow::from(format!(
+                                    "Could not interpret tool use parameters for id {}: {}. Raw arguments: '{}'",
+                                    id, e, arguments_str
+                                )),
+                                data: None,
+                            };
                             content.push(MessageContent::tool_request(id, Err(error)));
                         }
                     }
@@ -358,38 +391,97 @@ pub fn response_to_message(response: Value) -> anyhow::Result<Message> {
         }
     }
 
-    Ok(Message {
-        role: Role::Assistant,
-        created: chrono::Utc::now().timestamp(),
+    Ok(Message::new(
+        Role::Assistant,
+        chrono::Utc::now().timestamp(),
         content,
-    })
+    ))
 }
 
-pub fn get_usage(data: &Value) -> Result<Usage, ProviderError> {
-    let usage = data
-        .get("usage")
-        .ok_or_else(|| ProviderError::UsageError("No usage data in response".to_string()))?;
+/// Check if the model name indicates a Claude/Anthropic model that supports cache control.
+fn is_claude_model(model_name: &str) -> bool {
+    model_name.contains("claude")
+}
 
-    let input_tokens = usage
-        .get("prompt_tokens")
-        .and_then(|v| v.as_i64())
-        .map(|v| v as i32);
+/// Add Anthropic-style cache_control fields to the request payload for Claude models.
+/// This enables prompt caching to reduce costs when using Claude via Databricks.
+///
+/// Cache control is added to:
+/// - The system message
+/// - The last two user messages (for incremental caching across turns)
+/// - The last tool definition (so all tools are cached as a single prefix)
+pub fn apply_cache_control_for_claude(payload: &mut Value) {
+    if let Some(messages_spec) = payload
+        .as_object_mut()
+        .and_then(|obj| obj.get_mut("messages"))
+        .and_then(|messages| messages.as_array_mut())
+    {
+        // Add cache_control to the last two user messages for incremental caching.
+        // The last message gets cached so future turns can read from it.
+        // The second-to-last user message is also cached to read from the previous cache.
+        let mut user_count = 0;
+        for message in messages_spec.iter_mut().rev() {
+            if message.get("role") == Some(&json!("user")) {
+                if let Some(content) = message.get_mut("content") {
+                    if let Some(content_str) = content.as_str() {
+                        *content = json!([{
+                            "type": "text",
+                            "text": content_str,
+                            "cache_control": { "type": "ephemeral" }
+                        }]);
+                    } else if let Some(content_array) = content.as_array_mut() {
+                        // Content is already an array, add cache_control to the last element
+                        if let Some(last_content) = content_array.last_mut() {
+                            if let Some(obj) = last_content.as_object_mut() {
+                                obj.insert(
+                                    "cache_control".to_string(),
+                                    json!({ "type": "ephemeral" }),
+                                );
+                            }
+                        }
+                    }
+                }
+                user_count += 1;
+                if user_count >= 2 {
+                    break;
+                }
+            }
+        }
 
-    let output_tokens = usage
-        .get("completion_tokens")
-        .and_then(|v| v.as_i64())
-        .map(|v| v as i32);
+        // Add cache_control to the system message
+        if let Some(system_message) = messages_spec
+            .iter_mut()
+            .find(|msg| msg.get("role") == Some(&json!("system")))
+        {
+            if let Some(content) = system_message.get_mut("content") {
+                if let Some(content_str) = content.as_str() {
+                    *system_message = json!({
+                        "role": "system",
+                        "content": [{
+                            "type": "text",
+                            "text": content_str,
+                            "cache_control": { "type": "ephemeral" }
+                        }]
+                    });
+                }
+            }
+        }
+    }
 
-    let total_tokens = usage
-        .get("total_tokens")
-        .and_then(|v| v.as_i64())
-        .map(|v| v as i32)
-        .or_else(|| match (input_tokens, output_tokens) {
-            (Some(input), Some(output)) => Some(input + output),
-            _ => None,
-        });
-
-    Ok(Usage::new(input_tokens, output_tokens, total_tokens))
+    // Add cache_control to the last tool definition
+    if let Some(tools_spec) = payload
+        .as_object_mut()
+        .and_then(|obj| obj.get_mut("tools"))
+        .and_then(|tools| tools.as_array_mut())
+    {
+        if let Some(last_tool) = tools_spec.last_mut() {
+            if let Some(function) = last_tool.get_mut("function") {
+                if let Some(obj) = function.as_object_mut() {
+                    obj.insert("cache_control".to_string(), json!({ "type": "ephemeral" }));
+                }
+            }
+        }
+    }
 }
 
 /// Validates and fixes tool schemas to ensure they have proper parameter structure.
@@ -438,6 +530,7 @@ fn ensure_valid_json_schema(schema: &mut Value) {
     }
 }
 
+#[allow(clippy::too_many_lines)]
 pub fn create_request(
     model_config: &ModelConfig,
     system: &str,
@@ -447,17 +540,16 @@ pub fn create_request(
 ) -> anyhow::Result<Value, Error> {
     if model_config.model_name.starts_with("o1-mini") {
         return Err(anyhow!(
-            "o1-mini model is not currently supported since Goose uses tool calling and o1-mini does not support it. Please use o1 or o3 models instead."
+            "o1-mini model is not currently supported since goose uses tool calling and o1-mini does not support it. Please use o1 or o3 models instead."
         ));
     }
 
     let model_name = model_config.model_name.to_string();
-    let is_o1 = model_name.starts_with("o1") || model_name.starts_with("goose-o1");
-    let is_o3 = model_name.starts_with("o3") || model_name.starts_with("goose-o3");
-    let is_claude_3_7_sonnet = model_name.contains("claude-3-7-sonnet"); // can be goose- or databricks-
+    let is_openai_reasoning_model = model_config.is_openai_reasoning_model();
+    let is_claude_sonnet =
+        model_name.contains("claude-3-7-sonnet") || model_name.contains("claude-4-sonnet"); // can be goose- or databricks-
 
-    // Only extract reasoning effort for O1/O3 models
-    let (model_name, reasoning_effort) = if is_o1 || is_o3 {
+    let (model_name, reasoning_effort) = if is_openai_reasoning_model {
         let parts: Vec<&str> = model_config.model_name.split('-').collect();
         let last_part = parts.last().unwrap();
 
@@ -472,18 +564,19 @@ pub fn create_request(
             ),
         }
     } else {
-        // For non-O family models, use the model name as is and no reasoning effort
         (model_config.model_name.to_string(), None)
     };
 
-    let system_message = json!({
-        "role": if is_o1 || is_o3 { "developer" } else { "system" },
-        "content": system
-    });
+    let system_message = DatabricksMessage {
+        role: "system".to_string(),
+        content: system.into(),
+        tool_calls: None,
+        tool_call_id: None,
+    };
 
     let messages_spec = format_messages(messages, image_format);
     let mut tools_spec = if !tools.is_empty() {
-        format_tools(tools)?
+        format_tools(tools, &model_config.model_name)?
     } else {
         vec![]
     };
@@ -513,22 +606,21 @@ pub fn create_request(
             .insert("tools".to_string(), json!(tools_spec));
     }
 
-    // Add thinking parameters for Claude 3.7 Sonnet model when requested
     let is_thinking_enabled = std::env::var("CLAUDE_THINKING_ENABLED").is_ok();
-    if is_claude_3_7_sonnet && is_thinking_enabled {
-        // Minimum budget_tokens is 1024
-        let budget_tokens = std::env::var("CLAUDE_THINKING_BUDGET")
-            .unwrap_or_else(|_| "16000".to_string())
-            .parse()
-            .unwrap_or(16000);
+    if is_claude_sonnet && is_thinking_enabled {
+        // Anthropic requires budget_tokens >= 1024
+        const DEFAULT_THINKING_BUDGET: i32 = 16000;
+        let budget_tokens: i32 = std::env::var("CLAUDE_THINKING_BUDGET")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(DEFAULT_THINKING_BUDGET);
 
-        // For Claude models with thinking enabled, we need to add max_tokens + budget_tokens
-        // Default to 8192 (Claude max output) + budget if not specified
-        let max_completion_tokens = model_config.max_tokens.unwrap_or(8192);
-        payload.as_object_mut().unwrap().insert(
-            "max_tokens".to_string(),
-            json!(max_completion_tokens + budget_tokens),
-        );
+        // With thinking enabled, max_tokens must include both output and thinking budget
+        let max_tokens = model_config.max_output_tokens() + budget_tokens;
+        payload
+            .as_object_mut()
+            .unwrap()
+            .insert("max_tokens".to_string(), json!(max_tokens));
 
         payload.as_object_mut().unwrap().insert(
             "thinking".to_string(),
@@ -538,14 +630,13 @@ pub fn create_request(
             }),
         );
 
-        // Temperature is fixed to 2 when using claude 3.7 thinking with Databricks
         payload
             .as_object_mut()
             .unwrap()
             .insert("temperature".to_string(), json!(2));
     } else {
-        // o1, o3 models currently don't support temperature
-        if !is_o1 && !is_o3 {
+        // open ai reasoning models currently don't support temperature
+        if !is_openai_reasoning_model {
             if let Some(temp) = model_config.temperature {
                 payload
                     .as_object_mut()
@@ -554,17 +645,23 @@ pub fn create_request(
             }
         }
 
-        // o1 models use max_completion_tokens instead of max_tokens
-        if let Some(tokens) = model_config.max_tokens {
-            let key = if is_o1 || is_o3 {
-                "max_completion_tokens"
-            } else {
-                "max_tokens"
-            };
-            payload
-                .as_object_mut()
-                .unwrap()
-                .insert(key.to_string(), json!(tokens));
+        payload.as_object_mut().unwrap().insert(
+            "max_completion_tokens".to_string(),
+            json!(model_config.max_output_tokens()),
+        );
+    }
+
+    // Apply cache control for Claude models to enable prompt caching
+    if is_claude_model(&model_config.model_name) {
+        apply_cache_control_for_claude(&mut payload);
+    }
+
+    // Add request_params to the payload (e.g., anthropic_beta for extended context)
+    if let Some(params) = &model_config.request_params {
+        if let Some(obj) = payload.as_object_mut() {
+            for (key, value) in params {
+                obj.insert(key.clone(), value.clone());
+            }
         }
     }
 
@@ -574,84 +671,10 @@ pub fn create_request(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mcp_core::content::Content;
+    use crate::conversation::message::Message;
+    use rmcp::model::CallToolResult;
+    use rmcp::object;
     use serde_json::json;
-
-    #[test]
-    fn test_validate_tool_schemas() {
-        // Test case 1: Empty parameters object
-        // Input JSON with an incomplete parameters object
-        let mut actual = vec![json!({
-            "type": "function",
-            "function": {
-                "name": "test_func",
-                "description": "test description",
-                "parameters": {
-                    "type": "object"
-                }
-            }
-        })];
-
-        // Run the function to validate and update schemas
-        validate_tool_schemas(&mut actual);
-
-        // Expected JSON after validation
-        let expected = vec![json!({
-            "type": "function",
-            "function": {
-                "name": "test_func",
-                "description": "test description",
-                "parameters": {
-                    "type": "object",
-                    "properties": {},
-                    "required": []
-                }
-            }
-        })];
-
-        // Compare entire JSON structures instead of individual fields
-        assert_eq!(actual, expected);
-
-        // Test case 2: Missing type field
-        let mut tools = vec![json!({
-            "type": "function",
-            "function": {
-                "name": "test_func",
-                "description": "test description",
-                "parameters": {
-                    "properties": {}
-                }
-            }
-        })];
-
-        validate_tool_schemas(&mut tools);
-
-        let params = tools[0]["function"]["parameters"].as_object().unwrap();
-        assert_eq!(params["type"], "object");
-
-        // Test case 3: Complete valid schema should remain unchanged
-        let original_schema = json!({
-            "type": "function",
-            "function": {
-                "name": "test_func",
-                "description": "test description",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "location": {
-                            "type": "string",
-                            "description": "City and country"
-                        }
-                    },
-                    "required": ["location"]
-                }
-            }
-        });
-
-        let mut tools = vec![original_schema.clone()];
-        validate_tool_schemas(&mut tools);
-        assert_eq!(tools[0], original_schema);
-    }
 
     const OPENAI_TOOL_USE_RESPONSE: &str = r#"{
         "choices": [{
@@ -679,8 +702,8 @@ mod tests {
         let spec = format_messages(&[message], &ImageFormat::OpenAi);
 
         assert_eq!(spec.len(), 1);
-        assert_eq!(spec[0]["role"], "user");
-        assert_eq!(spec[0]["content"], "Hello");
+        assert_eq!(spec[0].role, "user");
+        assert_eq!(spec[0].content, "Hello");
         Ok(())
     }
 
@@ -689,7 +712,8 @@ mod tests {
         let tool = Tool::new(
             "test_tool",
             "A test tool",
-            json!({
+            object!({
+                "$schema": "http://json-schema.org/draft-07/schema#",
                 "type": "object",
                 "properties": {
                     "input": {
@@ -699,14 +723,28 @@ mod tests {
                 },
                 "required": ["input"]
             }),
-            None,
         );
 
-        let spec = format_tools(&[tool])?;
+        let spec = format_tools(std::slice::from_ref(&tool), "gpt-4o")?;
+        assert_eq!(
+            spec[0]["function"]["parameters"]["$schema"],
+            "http://json-schema.org/draft-07/schema#"
+        );
 
-        assert_eq!(spec.len(), 1);
-        assert_eq!(spec[0]["type"], "function");
-        assert_eq!(spec[0]["function"]["name"], "test_tool");
+        let spec = format_tools(std::slice::from_ref(&tool), "gemini-2-5-flash")?;
+        assert!(spec[0]["function"].get("parametersJsonSchema").is_some());
+        assert_eq!(
+            spec[0]["function"]["parametersJsonSchema"]["type"],
+            "object"
+        );
+
+        let spec = format_tools(&[tool], "databricks-gemini-3-pro")?;
+        assert!(spec[0]["function"].get("parametersJsonSchema").is_some());
+        assert_eq!(
+            spec[0]["function"]["parametersJsonSchema"]["type"],
+            "object"
+        );
+
         Ok(())
     }
 
@@ -717,21 +755,34 @@ mod tests {
             Message::user().with_text("How are you?"),
             Message::assistant().with_tool_request(
                 "tool1",
-                Ok(ToolCall::new("example", json!({"param1": "value1"}))),
+                Ok(CallToolRequestParams {
+                    meta: None,
+                    task: None,
+                    name: "example".into(),
+                    arguments: Some(object!({"param1": "value1"})),
+                }),
             ),
         ];
 
-        // Get the ID from the tool request to use in the response
         let tool_id = if let MessageContent::ToolRequest(request) = &messages[2].content[0] {
-            request.id.clone()
+            &request.id
         } else {
             panic!("should be tool request");
         };
 
-        messages
-            .push(Message::user().with_tool_response(tool_id, Ok(vec![Content::text("Result")])));
+        messages.push(Message::user().with_tool_response(
+            tool_id,
+            Ok(CallToolResult {
+                content: vec![Content::text("Result")],
+                structured_content: None,
+                is_error: Some(false),
+                meta: None,
+            }),
+        ));
 
-        let spec = format_messages(&messages, &ImageFormat::OpenAi);
+        let as_value =
+            serde_json::to_value(format_messages(&messages, &ImageFormat::OpenAi)).unwrap();
+        let spec = as_value.as_array().unwrap();
 
         assert_eq!(spec.len(), 4);
         assert_eq!(spec[0]["role"], "assistant");
@@ -751,20 +802,33 @@ mod tests {
     fn test_format_messages_multiple_content() -> anyhow::Result<()> {
         let mut messages = vec![Message::assistant().with_tool_request(
             "tool1",
-            Ok(ToolCall::new("example", json!({"param1": "value1"}))),
+            Ok(CallToolRequestParams {
+                meta: None,
+                task: None,
+                name: "example".into(),
+                arguments: Some(object!({"param1": "value1"})),
+            }),
         )];
 
-        // Get the ID from the tool request to use in the response
         let tool_id = if let MessageContent::ToolRequest(request) = &messages[0].content[0] {
-            request.id.clone()
+            &request.id
         } else {
             panic!("should be tool request");
         };
 
-        messages
-            .push(Message::user().with_tool_response(tool_id, Ok(vec![Content::text("Result")])));
+        messages.push(Message::user().with_tool_response(
+            tool_id,
+            Ok(CallToolResult {
+                content: vec![Content::text("Result")],
+                structured_content: None,
+                is_error: Some(false),
+                meta: None,
+            }),
+        ));
 
-        let spec = format_messages(&messages, &ImageFormat::OpenAi);
+        let as_value =
+            serde_json::to_value(format_messages(&messages, &ImageFormat::OpenAi)).unwrap();
+        let spec = as_value.as_array().unwrap();
 
         assert_eq!(spec.len(), 2);
         assert_eq!(spec[0]["role"], "assistant");
@@ -781,7 +845,7 @@ mod tests {
         let tool1 = Tool::new(
             "test_tool",
             "Test tool",
-            json!({
+            object!({
                 "type": "object",
                 "properties": {
                     "input": {
@@ -791,13 +855,12 @@ mod tests {
                 },
                 "required": ["input"]
             }),
-            None,
         );
 
         let tool2 = Tool::new(
             "test_tool",
             "Test tool",
-            json!({
+            object!({
                 "type": "object",
                 "properties": {
                     "input": {
@@ -807,10 +870,9 @@ mod tests {
                 },
                 "required": ["input"]
             }),
-            None,
         );
 
-        let result = format_tools(&[tool1, tool2]);
+        let result = format_tools(&[tool1, tool2], "gpt-4o");
         assert!(result.is_err());
         assert!(result
             .unwrap_err()
@@ -821,15 +883,7 @@ mod tests {
     }
 
     #[test]
-    fn test_format_tools_empty() -> anyhow::Result<()> {
-        let spec = format_tools(&[])?;
-        assert!(spec.is_empty());
-        Ok(())
-    }
-
-    #[test]
     fn test_format_messages_with_image_path() -> anyhow::Result<()> {
-        // Create a temporary PNG file with valid PNG magic numbers
         let temp_dir = tempfile::tempdir()?;
         let png_path = temp_dir.path().join("test.png");
         let png_data = [
@@ -837,12 +891,14 @@ mod tests {
             0x0D, 0x0A, 0x1A, 0x0A, // PNG header
             0x00, 0x00, 0x00, 0x0D, // Rest of fake PNG data
         ];
-        std::fs::write(&png_path, &png_data)?;
+        std::fs::write(&png_path, png_data)?;
         let png_path_str = png_path.to_str().unwrap();
 
         // Create message with image path
         let message = Message::user().with_text(format!("Here is an image: {}", png_path_str));
-        let spec = format_messages(&[message], &ImageFormat::OpenAi);
+        let as_value =
+            serde_json::to_value(format_messages(&[message], &ImageFormat::OpenAi)).unwrap();
+        let spec = as_value.as_array().unwrap();
 
         assert_eq!(spec.len(), 1);
         assert_eq!(spec[0]["role"], "user");
@@ -877,7 +933,7 @@ mod tests {
             }
         });
 
-        let message = response_to_message(response)?;
+        let message = response_to_message(&response)?;
         assert_eq!(message.content.len(), 1);
         if let MessageContent::Text(text) = &message.content[0] {
             assert_eq!(text.text, "Hello from John Cena!");
@@ -892,13 +948,13 @@ mod tests {
     #[test]
     fn test_response_to_message_valid_toolrequest() -> anyhow::Result<()> {
         let response: Value = serde_json::from_str(OPENAI_TOOL_USE_RESPONSE)?;
-        let message = response_to_message(response)?;
+        let message = response_to_message(&response)?;
 
         assert_eq!(message.content.len(), 1);
         if let MessageContent::ToolRequest(request) = &message.content[0] {
             let tool_call = request.tool_call.as_ref().unwrap();
             assert_eq!(tool_call.name, "example_fn");
-            assert_eq!(tool_call.arguments, json!({"param": "value"}));
+            assert_eq!(tool_call.arguments, Some(object!({"param": "value"})));
         } else {
             panic!("Expected ToolRequest content");
         }
@@ -912,11 +968,15 @@ mod tests {
         response["choices"][0]["message"]["tool_calls"][0]["function"]["name"] =
             json!("invalid fn");
 
-        let message = response_to_message(response)?;
+        let message = response_to_message(&response)?;
 
         if let MessageContent::ToolRequest(request) = &message.content[0] {
             match &request.tool_call {
-                Err(ToolError::NotFound(msg)) => {
+                Err(ErrorData {
+                    code: ErrorCode::INVALID_REQUEST,
+                    message: msg,
+                    data: None,
+                }) => {
                     assert!(msg.starts_with("The provided function name"));
                 }
                 _ => panic!("Expected ToolNotFound error"),
@@ -934,11 +994,15 @@ mod tests {
         response["choices"][0]["message"]["tool_calls"][0]["function"]["arguments"] =
             json!("invalid json {");
 
-        let message = response_to_message(response)?;
+        let message = response_to_message(&response)?;
 
         if let MessageContent::ToolRequest(request) = &message.content[0] {
             match &request.tool_call {
-                Err(ToolError::InvalidParameters(msg)) => {
+                Err(ErrorData {
+                    code: ErrorCode::INVALID_PARAMS,
+                    message: msg,
+                    data: None,
+                }) => {
                     assert!(msg.starts_with("Could not interpret tool use parameters"));
                 }
                 _ => panic!("Expected InvalidParameters error"),
@@ -956,12 +1020,12 @@ mod tests {
         response["choices"][0]["message"]["tool_calls"][0]["function"]["arguments"] =
             serde_json::Value::String("".to_string());
 
-        let message = response_to_message(response)?;
+        let message = response_to_message(&response)?;
 
         if let MessageContent::ToolRequest(request) = &message.content[0] {
             let tool_call = request.tool_call.as_ref().unwrap();
             assert_eq!(tool_call.name, "example_fn");
-            assert_eq!(tool_call.arguments, json!({}));
+            assert_eq!(tool_call.arguments, Some(object!({})));
         } else {
             panic!("Expected ToolRequest content");
         }
@@ -974,12 +1038,14 @@ mod tests {
         // Test default medium reasoning effort for O3 model
         let model_config = ModelConfig {
             model_name: "gpt-4o".to_string(),
-            tokenizer_name: "gpt-4o".to_string(),
             context_limit: Some(4096),
             temperature: None,
             max_tokens: Some(1024),
             toolshim: false,
             toolshim_model: None,
+            fast_model_config: None,
+            request_params: None,
+            reasoning: None,
         };
         let request = create_request(&model_config, "system", &[], &[], &ImageFormat::OpenAi)?;
         let obj = request.as_object().unwrap();
@@ -991,39 +1057,6 @@ mod tests {
                     "content": "system"
                 }
             ],
-            "max_tokens": 1024
-        });
-
-        for (key, value) in expected.as_object().unwrap() {
-            assert_eq!(obj.get(key).unwrap(), value);
-        }
-
-        Ok(())
-    }
-
-    #[test]
-    fn test_create_request_o1_default() -> anyhow::Result<()> {
-        // Test default medium reasoning effort for O1 model
-        let model_config = ModelConfig {
-            model_name: "o1".to_string(),
-            tokenizer_name: "o1".to_string(),
-            context_limit: Some(4096),
-            temperature: None,
-            max_tokens: Some(1024),
-            toolshim: false,
-            toolshim_model: None,
-        };
-        let request = create_request(&model_config, "system", &[], &[], &ImageFormat::OpenAi)?;
-        let obj = request.as_object().unwrap();
-        let expected = json!({
-            "model": "o1",
-            "messages": [
-                {
-                    "role": "developer",
-                    "content": "system"
-                }
-            ],
-            "reasoning_effort": "medium",
             "max_completion_tokens": 1024
         });
 
@@ -1035,35 +1068,20 @@ mod tests {
     }
 
     #[test]
-    fn test_create_request_o3_custom_reasoning_effort() -> anyhow::Result<()> {
-        // Test custom reasoning effort for O3 model
+    fn test_create_request_reasoning_effort() -> anyhow::Result<()> {
         let model_config = ModelConfig {
             model_name: "o3-mini-high".to_string(),
-            tokenizer_name: "o3-mini".to_string(),
             context_limit: Some(4096),
             temperature: None,
             max_tokens: Some(1024),
             toolshim: false,
             toolshim_model: None,
+            fast_model_config: None,
+            request_params: None,
+            reasoning: None,
         };
         let request = create_request(&model_config, "system", &[], &[], &ImageFormat::OpenAi)?;
-        let obj = request.as_object().unwrap();
-        let expected = json!({
-            "model": "o3-mini",
-            "messages": [
-                {
-                    "role": "developer",
-                    "content": "system"
-                }
-            ],
-            "reasoning_effort": "high",
-            "max_completion_tokens": 1024
-        });
-
-        for (key, value) in expected.as_object().unwrap() {
-            assert_eq!(obj.get(key).unwrap(), value);
-        }
-
+        assert_eq!(request["reasoning_effort"], "high");
         Ok(())
     }
 
@@ -1096,7 +1114,7 @@ mod tests {
             }]
         });
 
-        let message = response_to_message(response)?;
+        let message = response_to_message(&response)?;
         assert_eq!(message.content.len(), 2);
 
         if let MessageContent::Thinking(thinking) = &message.content[0] {
@@ -1143,7 +1161,7 @@ mod tests {
             }]
         });
 
-        let message = response_to_message(response)?;
+        let message = response_to_message(&response)?;
         assert_eq!(message.content.len(), 2);
 
         if let MessageContent::RedactedThinking(redacted) = &message.content[0] {
@@ -1157,6 +1175,386 @@ mod tests {
         } else {
             panic!("Expected Text content");
         }
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_format_messages_tool_request_with_none_arguments() -> anyhow::Result<()> {
+        // Test that tool calls with None arguments are formatted as "{}" string
+        let message = Message::assistant().with_tool_request(
+            "tool1",
+            Ok(CallToolRequestParams {
+                meta: None,
+                task: None,
+                name: "test_tool".into(),
+                arguments: None, // This is the key case the fix addresses
+            }),
+        );
+
+        let spec = format_messages(&[message], &ImageFormat::OpenAi);
+        let as_value = serde_json::to_value(spec)?;
+        let spec_array = as_value.as_array().unwrap();
+
+        assert_eq!(spec_array.len(), 1);
+        assert_eq!(spec_array[0]["role"], "assistant");
+        assert!(spec_array[0]["tool_calls"].is_array());
+
+        let tool_call = &spec_array[0]["tool_calls"][0];
+        assert_eq!(tool_call["id"], "tool1");
+        assert_eq!(tool_call["type"], "function");
+        assert_eq!(tool_call["function"]["name"], "test_tool");
+        // This should be the string "{}", not null
+        assert_eq!(tool_call["function"]["arguments"], "{}");
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_format_messages_tool_request_with_some_arguments() -> anyhow::Result<()> {
+        // Test that tool calls with Some arguments are properly JSON-serialized
+        let message = Message::assistant().with_tool_request(
+            "tool1",
+            Ok(CallToolRequestParams {
+                meta: None,
+                task: None,
+                name: "test_tool".into(),
+                arguments: Some(object!({"param": "value", "number": 42})),
+            }),
+        );
+
+        let spec = format_messages(&[message], &ImageFormat::OpenAi);
+        let as_value = serde_json::to_value(spec)?;
+        let spec_array = as_value.as_array().unwrap();
+
+        assert_eq!(spec_array.len(), 1);
+        assert_eq!(spec_array[0]["role"], "assistant");
+        assert!(spec_array[0]["tool_calls"].is_array());
+
+        let tool_call = &spec_array[0]["tool_calls"][0];
+        assert_eq!(tool_call["id"], "tool1");
+        assert_eq!(tool_call["type"], "function");
+        assert_eq!(tool_call["function"]["name"], "test_tool");
+        // This should be a JSON string representation
+        let args_str = tool_call["function"]["arguments"].as_str().unwrap();
+        let parsed_args: Value = serde_json::from_str(args_str)?;
+        assert_eq!(parsed_args["param"], "value");
+        assert_eq!(parsed_args["number"], 42);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_is_claude_model() {
+        assert!(is_claude_model("databricks-claude-sonnet-4"));
+        assert!(is_claude_model("databricks-claude-3-7-sonnet"));
+        assert!(is_claude_model("claude-sonnet-4"));
+        assert!(is_claude_model("goose-claude-sonnet"));
+        assert!(!is_claude_model("gpt-4o"));
+        assert!(!is_claude_model("gemini-2-5-flash"));
+        assert!(!is_claude_model("databricks-meta-llama-3-3-70b"));
+    }
+
+    #[test]
+    fn test_apply_cache_control_for_claude_system_message() -> anyhow::Result<()> {
+        let mut payload = json!({
+            "model": "databricks-claude-sonnet-4",
+            "messages": [
+                {
+                    "role": "system",
+                    "content": "You are a helpful assistant."
+                },
+                {
+                    "role": "user",
+                    "content": "Hello"
+                }
+            ]
+        });
+
+        apply_cache_control_for_claude(&mut payload);
+
+        let messages = payload["messages"].as_array().unwrap();
+        let system_msg = &messages[0];
+
+        // System message content should be converted to array with cache_control
+        assert!(system_msg["content"].is_array());
+        let content = system_msg["content"].as_array().unwrap();
+        assert_eq!(content.len(), 1);
+        assert_eq!(content[0]["type"], "text");
+        assert_eq!(content[0]["text"], "You are a helpful assistant.");
+        assert_eq!(content[0]["cache_control"]["type"], "ephemeral");
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_apply_cache_control_for_claude_user_messages() -> anyhow::Result<()> {
+        let mut payload = json!({
+            "model": "databricks-claude-sonnet-4",
+            "messages": [
+                {
+                    "role": "system",
+                    "content": "You are helpful"
+                },
+                {
+                    "role": "user",
+                    "content": "First question"
+                },
+                {
+                    "role": "assistant",
+                    "content": "First answer"
+                },
+                {
+                    "role": "user",
+                    "content": "Second question"
+                },
+                {
+                    "role": "assistant",
+                    "content": "Second answer"
+                },
+                {
+                    "role": "user",
+                    "content": "Third question"
+                }
+            ]
+        });
+
+        apply_cache_control_for_claude(&mut payload);
+
+        let messages = payload["messages"].as_array().unwrap();
+
+        // First user message should NOT have cache_control (only last 2)
+        let first_user = &messages[1];
+        assert_eq!(first_user["content"], "First question");
+
+        // Second-to-last user message should have cache_control
+        let second_user = &messages[3];
+        assert!(second_user["content"].is_array());
+        assert_eq!(
+            second_user["content"][0]["cache_control"]["type"],
+            "ephemeral"
+        );
+
+        // Last user message should have cache_control
+        let last_user = &messages[5];
+        assert!(last_user["content"].is_array());
+        assert_eq!(
+            last_user["content"][0]["cache_control"]["type"],
+            "ephemeral"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_apply_cache_control_for_claude_tools() -> anyhow::Result<()> {
+        let mut payload = json!({
+            "model": "databricks-claude-sonnet-4",
+            "messages": [
+                {
+                    "role": "system",
+                    "content": "You are helpful"
+                }
+            ],
+            "tools": [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "tool1",
+                        "description": "First tool"
+                    }
+                },
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "tool2",
+                        "description": "Second tool"
+                    }
+                }
+            ]
+        });
+
+        apply_cache_control_for_claude(&mut payload);
+
+        let tools = payload["tools"].as_array().unwrap();
+
+        // First tool should NOT have cache_control
+        assert!(tools[0]["function"].get("cache_control").is_none());
+
+        // Last tool should have cache_control
+        assert_eq!(tools[1]["function"]["cache_control"]["type"], "ephemeral");
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_format_messages_with_thought_signature_metadata() -> anyhow::Result<()> {
+        let mut metadata = serde_json::Map::new();
+        metadata.insert(
+            "thoughtSignature".to_string(),
+            json!("sig_abc123_test_signature"),
+        );
+
+        let message = Message::assistant().with_tool_request_with_metadata(
+            "tool1",
+            Ok(CallToolRequestParams {
+                meta: None,
+                task: None,
+                name: "test_tool".into(),
+                arguments: Some(object!({"param": "value"})),
+            }),
+            Some(&metadata),
+            None,
+        );
+
+        let spec = format_messages(&[message], &ImageFormat::OpenAi);
+        let as_value = serde_json::to_value(spec)?;
+        let spec_array = as_value.as_array().unwrap();
+
+        assert_eq!(spec_array.len(), 1);
+        let tool_call = &spec_array[0]["tool_calls"][0];
+        assert_eq!(tool_call["id"], "tool1");
+        assert_eq!(tool_call["function"]["name"], "test_tool");
+        assert_eq!(tool_call["thoughtSignature"], "sig_abc123_test_signature");
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_create_request_claude_has_cache_control() -> anyhow::Result<()> {
+        let model_config = ModelConfig {
+            model_name: "databricks-claude-sonnet-4".to_string(),
+            context_limit: Some(200000),
+            temperature: None,
+            max_tokens: Some(8192),
+            toolshim: false,
+            toolshim_model: None,
+            fast_model_config: None,
+            request_params: None,
+            reasoning: None,
+        };
+
+        let messages = vec![
+            Message::user().with_text("Hello"),
+            Message::assistant().with_text("Hi there!"),
+            Message::user().with_text("How are you?"),
+        ];
+
+        let tool = Tool::new(
+            "test_tool",
+            "A test tool",
+            object!({
+                "type": "object",
+                "properties": {}
+            }),
+        );
+
+        let request = create_request(
+            &model_config,
+            "You are helpful",
+            &messages,
+            &[tool],
+            &ImageFormat::OpenAi,
+        )?;
+
+        // Verify system message has cache_control
+        let messages_arr = request["messages"].as_array().unwrap();
+        let system_msg = &messages_arr[0];
+        assert!(system_msg["content"].is_array());
+        assert_eq!(
+            system_msg["content"][0]["cache_control"]["type"],
+            "ephemeral"
+        );
+
+        // Verify last tool has cache_control
+        let tools = request["tools"].as_array().unwrap();
+        assert_eq!(tools[0]["function"]["cache_control"]["type"], "ephemeral");
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_create_request_non_claude_no_cache_control() -> anyhow::Result<()> {
+        let model_config = ModelConfig {
+            model_name: "gpt-4o".to_string(),
+            context_limit: Some(128000),
+            temperature: None,
+            max_tokens: Some(4096),
+            toolshim: false,
+            toolshim_model: None,
+            fast_model_config: None,
+            request_params: None,
+            reasoning: None,
+        };
+
+        let messages = vec![Message::user().with_text("Hello")];
+
+        let tool = Tool::new(
+            "test_tool",
+            "A test tool",
+            object!({
+                "type": "object",
+                "properties": {}
+            }),
+        );
+
+        let request = create_request(
+            &model_config,
+            "You are helpful",
+            &messages,
+            &[tool],
+            &ImageFormat::OpenAi,
+        )?;
+
+        // Verify system message does NOT have cache_control (it's a plain string)
+        let messages_arr = request["messages"].as_array().unwrap();
+        let system_msg = &messages_arr[0];
+        assert!(system_msg["content"].is_string());
+
+        // Verify tool does NOT have cache_control
+        let tools = request["tools"].as_array().unwrap();
+        assert!(tools[0]["function"].get("cache_control").is_none());
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_format_messages_with_multiple_metadata_fields() -> anyhow::Result<()> {
+        let mut metadata = serde_json::Map::new();
+        metadata.insert("thoughtSignature".to_string(), json!("sig_top_level"));
+        metadata.insert(
+            "extra_content".to_string(),
+            json!({
+                "google": {
+                    "thought_signature": "sig_nested"
+                }
+            }),
+        );
+        metadata.insert("custom_field".to_string(), json!("custom_value"));
+
+        let message = Message::assistant().with_tool_request_with_metadata(
+            "tool1",
+            Ok(CallToolRequestParams {
+                meta: None,
+                task: None,
+                name: "test_tool".into(),
+                arguments: None,
+            }),
+            Some(&metadata),
+            None,
+        );
+
+        let spec = format_messages(&[message], &ImageFormat::OpenAi);
+        let as_value = serde_json::to_value(spec)?;
+        let spec_array = as_value.as_array().unwrap();
+
+        let tool_call = &spec_array[0]["tool_calls"][0];
+        assert_eq!(tool_call["thoughtSignature"], "sig_top_level");
+        assert_eq!(
+            tool_call["extra_content"]["google"]["thought_signature"],
+            "sig_nested"
+        );
+        assert_eq!(tool_call["custom_field"], "custom_value");
 
         Ok(())
     }

@@ -1,35 +1,35 @@
 use anyhow::Result;
-use dotenv::dotenv;
-use goose::{
-    message::Message,
-    providers::{base::Provider, databricks::DatabricksProvider},
-};
+use dotenvy::dotenv;
+use goose::conversation::message::Message;
+use goose::providers::create_with_named_model;
+use goose::providers::databricks::DATABRICKS_DEFAULT_MODEL;
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // Load environment variables from .env file
     dotenv().ok();
 
-    // Clear any token to force OAuth
     std::env::remove_var("DATABRICKS_TOKEN");
 
-    // Create the provider
-    let provider = DatabricksProvider::default();
+    let provider =
+        create_with_named_model("databricks", DATABRICKS_DEFAULT_MODEL, Vec::new()).await?;
 
-    // Create a simple message
     let message = Message::user().with_text("Tell me a short joke about programming.");
 
-    // Get a response
+    let model_config = provider.get_model_config();
     let (response, usage) = provider
-        .complete("You are a helpful assistant.", &[message], &[])
+        .complete(
+            &model_config,
+            "",
+            "You are a helpful assistant.",
+            &[message],
+            &[],
+        )
         .await?;
 
-    // Print the response and usage statistics
     println!("\nResponse from AI:");
     println!("---------------");
-    for content in response.content {
-        dbg!(content);
-    }
+    println!("{:?}", response);
+
     println!("\nToken Usage:");
     println!("------------");
     println!("Input tokens: {:?}", usage.usage.input_tokens);

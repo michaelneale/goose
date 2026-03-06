@@ -1,23 +1,23 @@
 ---
-sidebar_position: 13
+sidebar_position: 75
 title: Running Tasks
 sidebar_label: Run Tasks
 ---
 
-When working with the Goose CLI, you can pass files and instructions to the `goose run` command to execute tasks and workflows. This could be a simple one-liner command or a complex set of instructions stored in a file.
+When working with the goose CLI, you can pass files and instructions to the `goose run` command to execute tasks and workflows. This could be a simple one-liner command or a complex set of instructions stored in a file.
 
 ## Basic Usage
 
 The `goose run` command starts a new session, begins executing using any arguments provided and exits the session automatically once the task is complete. 
 
-There are multiple ways to run tasks with Goose; check out the [list of options](/docs/guides/goose-cli-commands.md#run-options).
+There are multiple ways to run tasks with goose; check out the [list of options](/docs/guides/goose-cli-commands.md#run-options).
 
 ### Text in the command
 ```bash
 goose run -t "your instructions here"
 ```
 
-Using the `-t` flag, one is able to pass a text instruction directly to the command. This is great for quick, one-off commands where you do not need an interactive session with Goose. The instructions will be executed, and the session will end. An example usage could be using in a CI/CD pipeline or running alongside other scripts.
+Using the `-t` flag, one is able to pass a text instruction directly to the command. This is great for quick, one-off commands where you do not need an interactive session with goose. The instructions will be executed, and the session will end. An example usage could be using in a CI/CD pipeline or running alongside other scripts.
 
 ### Using an instruction file
 If you have a complex set of instructions or a workflow that you want to automate, you can store them in a file and pass it to the `goose run` command:
@@ -50,7 +50,7 @@ Save findings in 'security_audit.md' with severity levels highlighted.
 ```
 
 ### With stdin
-You can also pass instructions to Goose using standard input via `-i -`. This is useful when you want to pipe commands from another tool or script into Goose.
+You can also pass instructions to goose using standard input via `-i -`. This is useful when you want to pipe commands from another tool or script into goose.
 
 #### Simple echo pipe
 
@@ -71,13 +71,13 @@ EOF
 
 ### Interactive Mode
 
-If you don't want Goose to exit at the end of the task, you can pass the `-s` or `--interactive` flag to start an interactive session after processing your initial commands:
+If you don't want goose to exit at the end of the task, you can pass the `-s` or `--interactive` flag to start an interactive session after processing your initial commands:
 
 ```bash
 goose run -i instructions.txt -s
 ```
 
-This is useful when you want to continue working with Goose after your initial commands are processed.
+This is useful when you want to continue working with goose after your initial commands are processed.
 
 ### Session Management
 
@@ -97,10 +97,16 @@ You can also run commands without creating or storing a session file by using th
 # Run a command without creating a session file
 goose run --no-session -t "your command here"
 ```
+### Set Provider and Model
+You can run goose sessions with a specific provider and model, which overrides the provider and model settings in your [environment variables](/docs/guides/environment-variables.md).
+
+```bash
+goose run --provider anthropic --model claude-4-sonnet -t "initial prompt"
+```
 
 ### Working with Extensions
 
-If you want to ensure specific extensions are available when running your task, you can indicate this with arguments. This can be done using the `--with-extension`, `--with-remote-extension`, or `--with-builtin` flags:
+If you want to ensure specific extensions are available when running your task, you can indicate this with arguments. This can be done using the `--with-extension`, `--with-remote-extension`, `--with-streamable-http-extension`, or `--with-builtin` flags:
 
 - Using built-in extensions e.g developer and computercontroller extensions
 
@@ -114,10 +120,10 @@ goose run --with-builtin "developer,computercontroller" -t "your instructions"
 goose run --with-extension "ENV1=value1 custom-extension-args" -t "your instructions"
 ```
 
-- Using remote extensions
+- Using streamable HTTP extensions
 
 ```bash
-goose run --with-remote-extension "url" -t "your instructions"
+goose run --with-streamable-http-extension "https://example.com/streamable" -t "your instructions"
 ```
 
 ### Debug Mode
@@ -140,6 +146,32 @@ goose run --debug -t "your instructions"
 # Debug a recipe execution
 goose run --debug --recipe recipe.yaml
 ```
+
+### JSON Output Format
+
+For automation, scripting, and CI/CD integration, you can get structured output from `goose run` using the `--output-format` flag:
+
+- `json` - Complete JSON output after execution finishes (best for CI pipelines, logging)
+- `stream-json` - Real-time structured output as events occur (best for progress monitoring, long-running tasks)
+
+```bash
+# Run with JSON output for automation
+goose run --output-format json -t "your instructions"
+
+# Stream JSON events in real-time
+goose run --output-format stream-json -t "your instructions"
+
+# Run a recipe with JSON output
+goose run --output-format json --recipe recipe.yaml
+
+# Combine with other options
+goose run --output-format json --no-session -t "automated task"
+```
+
+The JSON output includes:
+- Session metadata and execution results
+- Tool outputs and any errors
+- Structured data suitable for parsing by scripts and CI/CD pipelines
 
 ## Common Use Cases
 

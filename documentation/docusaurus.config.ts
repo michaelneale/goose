@@ -12,9 +12,9 @@ const inkeepIntegrationId = process.env.INKEEP_INTEGRATION_ID;
 const inkeepOrgId = process.env.INKEEP_ORG_ID;
 
 const config: Config = {
-  title: "codename goose",
+  title: "goose",
   tagline:
-    "Your local AI agent, automating engineering tasks seamlessly.",
+    "your local AI agent, automating engineering tasks seamlessly",
   favicon: "img/favicon.ico",
 
   // Set the production url of your site here
@@ -29,7 +29,12 @@ const config: Config = {
   projectName: "goose", // Usually your repo name.
 
   onBrokenLinks: "throw",
-  onBrokenMarkdownLinks: "warn",
+  
+  markdown: {
+    hooks: {
+      onBrokenMarkdownLinks: "warn",
+    },
+  },
 
   // Even if you don't use internationalization, you can use this field to set
   // useful metadata like html lang. For example, if your site is Chinese, you
@@ -38,6 +43,19 @@ const config: Config = {
     defaultLocale: "en",
     locales: ["en"],
   },
+
+
+  headTags: [
+    {
+      tagName: "link",
+      attributes: {
+        rel: "alternate",
+        type: "text/plain",
+        title: "LLM context",
+        href: "/goose/llms.txt",
+      },
+    },
+  ],
 
   presets: [
     [
@@ -48,6 +66,8 @@ const config: Config = {
         },
         blog: {
           showReadingTime: true,
+          readingTime: ({ content, frontMatter, defaultReadingTime }) =>
+            frontMatter.reading_time ?? defaultReadingTime({ content }),
           feedOptions: {
             type: ["rss", "atom"],
             xslt: true,
@@ -65,10 +85,15 @@ const config: Config = {
             "./src/css/tailwind.css",
           ],
         },
+        gtag: process.env.NODE_ENV === 'production' ? {
+          trackingID: 'G-ZS5D6SB4ZJ',
+          anonymizeIP: true,
+        } : false,
       } satisfies Preset.Options,
     ],
   ],
   plugins: [
+    require.resolve("./plugins/custom-webpack.cjs"),
     [
       "@docusaurus/plugin-client-redirects",
       {
@@ -106,18 +131,228 @@ const config: Config = {
             to: '/extensions'
           },
           {
+            from: '/v1/extensions/detail/nondeveloper',
+            to: '/docs/mcp/computer-controller-mcp'
+          },
+          {
+            from: '/docs/guides/managing-goose-sessions',
+            to: '/docs/guides/sessions/session-management'
+          },
+          {
+            from: '/docs/guides/smart-context-management',
+            to: '/docs/guides/sessions/smart-context-management'
+          },
+          {
             from: '/docs/guides/share-goose-sessions',
-            to: '/docs/guides/session-recipes'
-          }
+            to: '/docs/guides/recipes/session-recipes'
+          },
+          {
+            from: '/docs/guides/session-recipes',
+            to: '/docs/guides/recipes/session-recipes'
+          },
+          {
+            from: '/docs/guides/recipe-reference',
+            to: '/docs/guides/recipes/recipe-reference'
+          },
+          {
+            from: '/docs/guides/recipes/sub-recipes',
+            to: '/docs/guides/recipes/subrecipes'
+          },
+          {
+            from: '/docs/tutorials/sub-recipes-in-parallel',
+            to: '/docs/tutorials/subrecipes-in-parallel'
+          },
+          {
+            from: '/docs/guides/tool-permissions',
+            to: '/docs/guides/managing-tools/tool-permissions'
+          },
+          {
+            from: '/docs/guides/adjust-tool-output',
+            to: '/docs/guides/managing-tools/adjust-tool-output'
+          },
+          {
+            from: '/docs/guides/benchmarking',
+            to: '/docs/tutorials/benchmarking'
+          },
+          {
+            from: '/docs/guides/goose-in-docker',
+            to: '/docs/tutorials/goose-in-docker'
+          },
+          {
+            from: '/docs/guides/multi-model/creating-plans',
+            to: '/docs/guides/creating-plans'
+          },
+          {
+            from: '/docs/guides/config-file',
+            to: '/docs/guides/config-files',
+          },
+          {
+            from: '/docs/guides/using-goosehints',
+            to: '/docs/guides/context-engineering/using-goosehints',
+          },
+          // MCP tutorial redirects - moved from /docs/tutorials/ to /docs/mcp/
+          {
+            from: '/docs/tutorials/agentql-mcp',
+            to: '/docs/mcp/agentql-mcp'
+          },
+          {
+            from: '/docs/tutorials/asana-mcp',
+            to: '/docs/mcp/asana-mcp'
+          },
+          {
+            from: '/docs/tutorials/blender-mcp',
+            to: '/docs/mcp/blender-mcp'
+          },
+          {
+            from: '/docs/tutorials/brave-mcp',
+            to: '/docs/mcp/brave-mcp'
+          },
+          {
+            from: '/docs/tutorials/browserbase-mcp',
+            to: '/docs/mcp/browserbase-mcp'
+          },
+          {
+            from: '/docs/tutorials/computer-controller-mcp',
+            to: '/docs/mcp/computer-controller-mcp'
+          },
+          {
+            from: '/docs/tutorials/context7-mcp',
+            to: '/docs/mcp/context7-mcp'
+          },
+          {
+            from: '/docs/tutorials/developer-mcp',
+            to: '/docs/mcp/developer-mcp'
+          },
+          {
+            from: '/docs/tutorials/elevenlabs-mcp',
+            to: '/docs/mcp/elevenlabs-mcp'
+          },
+          {
+            from: '/docs/tutorials/fetch-mcp',
+            to: '/docs/mcp/fetch-mcp'
+          },
+          {
+            from: '/docs/tutorials/figma-mcp',
+            to: '/docs/mcp/figma-mcp'
+          },
+          {
+            from: '/docs/tutorials/filesystem-mcp',
+            to: '/docs/mcp/filesystem-mcp'
+          },
+          {
+            from: '/docs/tutorials/github-mcp',
+            to: '/docs/mcp/github-mcp'
+          },
+          {
+            from: '/docs/tutorials/google-drive-mcp',
+            to: '/docs/mcp/google-drive-mcp'
+          },
+          {
+            from: '/docs/tutorials/google-maps-mcp',
+            to: '/docs/mcp/google-maps-mcp'
+          },
+          {
+            from: '/docs/tutorials/jetbrains-mcp',
+            to: '/docs/mcp/jetbrains-mcp'
+          },
+          {
+            from: '/docs/tutorials/knowledge-graph-mcp',
+            to: '/docs/mcp/knowledge-graph-mcp'
+          },
+          {
+            from: '/docs/tutorials/mbot-mcp',
+            to: '/docs/mcp/mbot-mcp'
+          },
+          {
+            from: '/docs/tutorials/memory-mcp',
+            to: '/docs/mcp/memory-mcp'
+          },
+          {
+            from: '/docs/tutorials/nostrbook-mcp',
+            to: '/docs/mcp/nostrbook-mcp'
+          },
+          {
+            from: '/docs/tutorials/pdf-mcp',
+            to: '/docs/mcp/pdf-mcp'
+          },
+          {
+            from: '/docs/tutorials/pieces-mcp',
+            to: '/docs/mcp/pieces-mcp'
+          },
+          {
+            from: '/docs/tutorials/playwright-mcp',
+            to: '/docs/mcp/playwright-mcp'
+          },
+          {
+            from: '/docs/tutorials/postgres-mcp',
+            to: '/docs/mcp/postgres-mcp'
+          },
+          {
+            from: '/docs/tutorials/puppeteer-mcp',
+            to: '/docs/mcp/puppeteer-mcp'
+          },
+          {
+            from: '/docs/tutorials/reddit-mcp',
+            to: '/docs/mcp/reddit-mcp'
+          },
+          {
+            from: '/docs/tutorials/repomix-mcp',
+            to: '/docs/mcp/repomix-mcp'
+          },
+          {
+            from: '/docs/tutorials/selenium-mcp',
+            to: '/docs/mcp/selenium-mcp'
+          },
+          {
+            from: '/docs/tutorials/speech-mcp',
+            to: '/docs/mcp/speech-mcp'
+          },
+          {
+            from: '/docs/tutorials/square-mcp',
+            to: '/docs/mcp/square-mcp'
+          },
+          {
+            from: '/docs/tutorials/tavily-mcp',
+            to: '/docs/mcp/tavily-mcp'
+          },
+          {
+            from: '/docs/tutorials/tutorial-extension',
+            to: '/docs/mcp/tutorial-mcp'
+          },
+          {
+            from: '/docs/tutorials/vscode-mcp',
+            to: '/docs/mcp/vs-code-mcp'
+          },
+          {
+            from: '/docs/tutorials/youtube-transcript',
+            to: '/docs/mcp/youtube-transcript-mcp'
+          },
+          {
+            from: '/docs/guides/isolated-development-environments',
+            to: '/docs/tutorials/isolated-development-environments'
+          },
+          {
+            from: '/docs/experimental/subagents',
+            to: '/docs/guides/subagents'
+          }         
         ],
       },
     ],
     tailwindPlugin,
+    [
+      require.resolve("./plugins/markdown-export.cjs"),
+      {
+        enabled: true,
+      },
+    ],
   ],
   themes: ["@inkeep/docusaurus/chatButton", "@inkeep/docusaurus/searchBar"],
   themeConfig: {
     // Replace with your project's social card
     image: "img/home-banner.png",
+    colorMode: {
+      respectPrefersColorScheme: true
+    },
     navbar: {
       title: "",
       logo: {
@@ -132,7 +367,7 @@ const config: Config = {
           position: "left",
         },
         {
-          to: "/docs/category/getting-started",
+          to: "/docs/category/guides",
           position: "left",
           label: "Docs",
         },
@@ -140,6 +375,11 @@ const config: Config = {
           to: "/docs/category/tutorials",
           position: "left",
           label: "Tutorials",
+        },
+        {
+          to: "/docs/category/mcp-servers",
+          position: "left",
+          label: "MCPs",
         },
         { to: "/blog", label: "Blog", position: "left" },
         {
@@ -152,6 +392,10 @@ const config: Config = {
               label: 'Extensions',
             },
             {
+              to: '/skills',
+              label: 'Skills Marketplace',
+            },
+            {
               to: '/recipe-generator',
               label: 'Recipe Generator',
             },
@@ -160,14 +404,18 @@ const config: Config = {
               label: 'Prompt Library',
             },
             {
-              href: 'https://block.github.io/goose/install-link-generator/',
-              label: 'Install Link Generator',
+              to: '/recipes',
+              label: 'Recipe Cookbook',
+            },
+            {
+              to: 'deeplink-generator',
+              label: 'Deeplink Generator',
             },
           ],
         },
 
         {
-          href: "https://discord.gg/block-opensource",
+          href: "https://discord.gg/goose-oss",
           label: "Discord",
           position: "right",
         },
@@ -184,7 +432,7 @@ const config: Config = {
           title: "Quick Links",
           items: [
             {
-              label: "Install Goose",
+              label: "Install goose",
               to: "docs/getting-started/installation",
             },
             {
@@ -197,20 +445,24 @@ const config: Config = {
           title: "Community",
           items: [
             {
+              label: "Spotlight",
+              to: "community",
+            },
+            {
               label: "Discord",
-              href: "https://discord.gg/block-opensource",
+              href: "https://discord.gg/goose-oss",
             },
             {
               label: "YouTube",
-              href: "https://www.youtube.com/@blockopensource",
+              href: "https://www.youtube.com/@goose-oss",
             },
             {
               label: "LinkedIn",
-              href: "https://www.linkedin.com/company/block-opensource",
+              href: "https://www.linkedin.com/company/goose-oss",
             },
             {
               label: "Twitter / X",
-              href: "https://x.com/blockopensource",
+              href: "https://x.com/goose_oss",
             },
             {
               label: "BlueSky",
@@ -262,10 +514,19 @@ const config: Config = {
             },
           },
         ],
-        quickQuestions: ["What is Goose?"],
+        quickQuestions: ["What is goose?"],
       },
     },
+    // announcementBar: {
+    //   id: 'goose-grants',
+    //   content:
+    //     '✨ goose grant program now open: <a href="/goose/grants">apply now</a>! ✨',
+    //   backgroundColor: '#20232a',
+    //   textColor: '#fff',
+    //   isCloseable: false,
+    // },
   } satisfies Preset.ThemeConfig,
 };
+
 
 export default config;

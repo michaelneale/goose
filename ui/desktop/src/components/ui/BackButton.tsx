@@ -1,22 +1,27 @@
-import React from 'react';
-import Back from '../icons/Back';
+import React, { useEffect, useCallback } from 'react';
+import { ArrowLeft } from 'lucide-react';
+import { Button } from './button';
+import type { VariantProps } from 'class-variance-authority';
+import { buttonVariants } from './button';
+import { cn } from '../../utils';
 
-interface BackButtonProps {
-  onClick?: () => void; // Mark onClick as optional
+interface BackButtonProps extends VariantProps<typeof buttonVariants> {
+  onClick?: () => void;
   className?: string;
-  textSize?: 'sm' | 'base' | 'md' | 'lg';
-  iconSize?: 'w-3 h-3' | 'w-4 h-4' | 'w-5 h-5' | 'w-6 h-6' | 'w-7 h-7';
-  showText?: boolean; // Add new prop
+  showText?: boolean;
+  shape?: 'pill' | 'round';
 }
 
 const BackButton: React.FC<BackButtonProps> = ({
   onClick,
   className = '',
-  textSize = 'sm',
-  iconSize = 'w-3 h-3',
+  variant = 'secondary',
+  size = 'default',
+  shape = 'pill',
   showText = true,
+  ...props
 }) => {
-  const handleExit = () => {
+  const handleExit = useCallback(() => {
     if (onClick) {
       onClick(); // Custom onClick handler passed via props
     } else if (window.history.length > 1) {
@@ -24,16 +29,54 @@ const BackButton: React.FC<BackButtonProps> = ({
     } else {
       console.warn('No history to go back to');
     }
-  };
+  }, [onClick]);
+
+  // Set up mouse back button event listener.
+  useEffect(() => {
+    const handleMouseBack = () => {
+      handleExit();
+    };
+
+    if (window.electron) {
+      const mouseBackHandler = (e: MouseEvent) => {
+        // MouseButton 3 or 4 is typically back button.
+        if (e.button === 3 || e.button === 4) {
+          handleExit();
+          e.preventDefault();
+        }
+      };
+
+      window.electron.on('mouse-back-button-clicked', handleMouseBack);
+
+      // Also listen for mouseup events directly, for better OS compatibility.
+      document.addEventListener('mouseup', mouseBackHandler);
+
+      return () => {
+        if (window.electron) {
+          window.electron.off('mouse-back-button-clicked', handleMouseBack);
+        }
+        document.removeEventListener('mouseup', mouseBackHandler);
+      };
+    }
+
+    return undefined;
+  }, [handleExit]);
 
   return (
-    <button
+    <Button
       onClick={handleExit}
-      className={`flex items-center text-${textSize} text-textSubtle group hover:text-textStandard ${className}`}
+      variant={variant}
+      size={size}
+      shape={shape}
+      className={cn(
+        'rounded-full px-6 py-2 flex items-center gap-2 text-text-primary hover:cursor-pointer',
+        className
+      )}
+      {...props}
     >
-      <Back className={`${iconSize} group-hover:-translate-x-1 transition-all mr-1`} />
-      {showText && <span>Back</span>}
-    </button>
+      <ArrowLeft />
+      {showText && 'Back'}
+    </Button>
   );
 };
 

@@ -1,92 +1,110 @@
-import { app } from 'electron';
-import fs from 'fs';
-import path from 'path';
+export interface ExternalGoosedConfig {
+  enabled: boolean;
+  url: string;
+  secret: string;
+}
 
-// Types
-export interface EnvToggles {
-  GOOSE_SERVER__MEMORY: boolean;
-  GOOSE_SERVER__COMPUTER_CONTROLLER: boolean;
+export interface KeyboardShortcuts {
+  focusWindow: string | null;
+  quickLauncher: string | null;
+  newChat: string | null;
+  newChatWindow: string | null;
+  openDirectory: string | null;
+  settings: string | null;
+  find: string | null;
+  findNext: string | null;
+  findPrevious: string | null;
+  alwaysOnTop: string | null;
+  toggleNavigation: string | null;
+}
+
+export type DefaultKeyboardShortcuts = {
+  [K in keyof KeyboardShortcuts]: string;
+};
+
+export interface SessionSharingConfig {
+  enabled: boolean;
+  baseUrl: string;
 }
 
 export interface Settings {
-  envToggles: EnvToggles;
+  // Desktop app settings
+  showMenuBarIcon: boolean;
+  showDockIcon: boolean;
+  enableWakelock: boolean;
+  spellcheckEnabled: boolean;
+  externalGoosed: ExternalGoosedConfig;
+  globalShortcut?: string | null;
+  keyboardShortcuts: KeyboardShortcuts;
+
+  // UI preferences (migrated from localStorage)
+  theme: 'dark' | 'light';
+  useSystemTheme: boolean;
+  responseStyle: string;
+  showPricing: boolean;
+  sessionSharing: SessionSharingConfig;
+  seenAnnouncementIds: string[];
 }
 
-// Constants
-const SETTINGS_FILE = path.join(app.getPath('userData'), 'settings.json');
+export type SettingKey = keyof Settings;
 
-const defaultSettings: Settings = {
-  envToggles: {
-    GOOSE_SERVER__MEMORY: false,
-    GOOSE_SERVER__COMPUTER_CONTROLLER: false,
-  },
+export const defaultKeyboardShortcuts: DefaultKeyboardShortcuts = {
+  focusWindow: 'CommandOrControl+Alt+G',
+  quickLauncher: 'CommandOrControl+Alt+Shift+G',
+  newChat: 'CommandOrControl+T',
+  newChatWindow: 'CommandOrControl+N',
+  openDirectory: 'CommandOrControl+O',
+  settings: 'CommandOrControl+,',
+  find: 'CommandOrControl+F',
+  findNext: 'CommandOrControl+G',
+  findPrevious: 'CommandOrControl+Shift+G',
+  alwaysOnTop: 'CommandOrControl+Shift+T',
+  toggleNavigation: 'CommandOrControl+/',
 };
 
-// Settings management
-export function loadSettings(): Settings {
-  try {
-    if (fs.existsSync(SETTINGS_FILE)) {
-      const data = fs.readFileSync(SETTINGS_FILE, 'utf8');
-      return JSON.parse(data);
+export const defaultSettings: Settings = {
+  // Desktop app settings
+  showMenuBarIcon: true,
+  showDockIcon: true,
+  enableWakelock: false,
+  spellcheckEnabled: true,
+  keyboardShortcuts: defaultKeyboardShortcuts,
+  externalGoosed: {
+    enabled: false,
+    url: '',
+    secret: '',
+  },
+
+  // UI preferences
+  theme: 'light',
+  useSystemTheme: true,
+  responseStyle: 'concise',
+  showPricing: true,
+  sessionSharing: {
+    enabled: false,
+    baseUrl: '',
+  },
+  seenAnnouncementIds: [],
+};
+
+export function getKeyboardShortcuts(settings: Settings): KeyboardShortcuts {
+  if (!settings.keyboardShortcuts && settings.globalShortcut !== undefined) {
+    const focusShortcut = settings.globalShortcut;
+    let launcherShortcut: string | null = null;
+
+    if (focusShortcut) {
+      if (focusShortcut.includes('Shift')) {
+        launcherShortcut = focusShortcut;
+      } else {
+        launcherShortcut = focusShortcut.replace(/\+([Gg])$/, '+Shift+$1');
+      }
     }
-  } catch (error) {
-    console.error('Error loading settings:', error);
-  }
-  return defaultSettings;
-}
 
-export function saveSettings(settings: Settings): void {
-  try {
-    fs.writeFileSync(SETTINGS_FILE, JSON.stringify(settings, null, 2));
-  } catch (error) {
-    console.error('Error saving settings:', error);
+    return {
+      ...defaultKeyboardShortcuts,
+      focusWindow: focusShortcut,
+      quickLauncher: launcherShortcut,
+    };
   }
-}
-
-// Environment management
-export function updateEnvironmentVariables(envToggles: EnvToggles): void {
-  if (envToggles.GOOSE_SERVER__MEMORY) {
-    process.env.GOOSE_SERVER__MEMORY = 'true';
-  } else {
-    delete process.env.GOOSE_SERVER__MEMORY;
-  }
-
-  if (envToggles.GOOSE_SERVER__COMPUTER_CONTROLLER) {
-    process.env.GOOSE_SERVER__COMPUTER_CONTROLLER = 'true';
-  } else {
-    delete process.env.GOOSE_SERVER__COMPUTER_CONTROLLER;
-  }
-}
-
-// Menu management
-export function createEnvironmentMenu(
-  envToggles: EnvToggles,
-  onToggle: (newToggles: EnvToggles) => void
-) {
-  return [
-    {
-      label: 'Enable Memory Mode',
-      type: 'checkbox',
-      checked: envToggles.GOOSE_SERVER__MEMORY,
-      click: (menuItem: { checked: boolean }) => {
-        const newToggles = {
-          ...envToggles,
-          GOOSE_SERVER__MEMORY: menuItem.checked,
-        };
-        onToggle(newToggles);
-      },
-    },
-    {
-      label: 'Enable Computer Controller Mode',
-      type: 'checkbox',
-      checked: envToggles.GOOSE_SERVER__COMPUTER_CONTROLLER,
-      click: (menuItem: { checked: boolean }) => {
-        const newToggles = {
-          ...envToggles,
-          GOOSE_SERVER__COMPUTER_CONTROLLER: menuItem.checked,
-        };
-        onToggle(newToggles);
-      },
-    },
-  ];
+  return { ...defaultKeyboardShortcuts, ...settings.keyboardShortcuts };
 }

@@ -1,22 +1,22 @@
 use super::base::Usage;
 use super::errors::GoogleErrorCode;
+use crate::config::paths::Paths;
 use crate::model::ModelConfig;
-use anyhow::Result;
+use crate::providers::errors::ProviderError;
+use anyhow::{anyhow, Result};
 use base64::Engine;
 use regex::Regex;
 use reqwest::{Response, StatusCode};
+use rmcp::model::{AnnotateAble, ImageContent, RawImageContent};
 use serde::{Deserialize, Serialize};
-use serde_json::{from_value, json, Map, Value};
-use std::io::Read;
-use std::path::Path;
-
-use crate::providers::errors::{OpenAIError, ProviderError};
-use mcp_core::content::ImageContent;
-
-#[derive(serde::Deserialize)]
-struct OpenAIErrorResponse {
-    error: OpenAIError,
-}
+use serde_json::{json, Value};
+use std::fmt::Display;
+use std::fs::File;
+use std::io::{BufWriter, Read, Write};
+use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
+use std::time::Duration;
+use uuid::Uuid;
 
 #[derive(Debug, Copy, Clone, Serialize, Deserialize)]
 pub enum ImageFormat {
@@ -44,64 +44,48 @@ pub fn convert_image(image: &ImageContent, image_format: &ImageFormat) -> Value 
     }
 }
 
-/// Handle response from OpenAI compatible endpoints
-/// Error codes: https://platform.openai.com/docs/guides/error-codes
-/// Context window exceeded: https://community.openai.com/t/help-needed-tackling-context-length-limits-in-openai-models/617543
-pub async fn handle_response_openai_compat(response: Response) -> Result<Value, ProviderError> {
-    let status = response.status();
-    // Try to parse the response body as JSON (if applicable)
-    let payload = match response.json::<Value>().await {
-        Ok(json) => json,
-        Err(e) => return Err(ProviderError::RequestFailed(e.to_string())),
+pub fn filter_extensions_from_system_prompt(system: &str) -> String {
+    let Some(extensions_start) = system.find("# Extensions") else {
+        return system.to_string();
     };
 
-    match status {
-        StatusCode::OK => Ok(payload),
-        StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => {
-            Err(ProviderError::Authentication(format!("Authentication failed. Please ensure your API keys are valid and have the required permissions. \
-                Status: {}. Response: {:?}", status, payload)))
-        }
-        StatusCode::BAD_REQUEST | StatusCode::NOT_FOUND => {
-            tracing::debug!(
-                "{}", format!("Provider request failed with status: {}. Payload: {:?}", status, payload)
-            );
-            if let Ok(err_resp) = from_value::<OpenAIErrorResponse>(payload) {
-                let err = err_resp.error;
-                if err.is_context_length_exceeded() {
-                    return Err(ProviderError::ContextLengthExceeded(err.message.unwrap_or("Unknown error".to_string())));
-                }
-                return Err(ProviderError::RequestFailed(format!("{} (status {})", err, status.as_u16())));
-            }
-            Err(ProviderError::RequestFailed(format!("Unknown error (status {})", status)))
-        }
-        StatusCode::TOO_MANY_REQUESTS => {
-            Err(ProviderError::RateLimitExceeded(format!("{:?}", payload)))
-        }
-        StatusCode::INTERNAL_SERVER_ERROR | StatusCode::SERVICE_UNAVAILABLE => {
-            Err(ProviderError::ServerError(format!("{:?}", payload)))
-        }
-        _ => {
-            tracing::debug!(
-                "{}", format!("Provider request failed with status: {}. Payload: {:?}", status, payload)
-            );
-            Err(ProviderError::RequestFailed(format!("Request failed with status: {}", status)))
-        }
+    let Some(after_extensions) = system.get(extensions_start + 1..) else {
+        return system.to_string();
+    };
+
+    if let Some(next_section_pos) = after_extensions.find("\n# ") {
+        let Some(before) = system.get(..extensions_start) else {
+            return system.to_string();
+        };
+        let Some(after) = system.get(extensions_start + next_section_pos + 1..) else {
+            return system.to_string();
+        };
+        format!("{}{}", before.trim_end(), after)
+    } else {
+        system
+            .get(..extensions_start)
+            .map(|s| s.trim_end().to_string())
+            .unwrap_or_else(|| system.to_string())
     }
 }
 
-/// Check if the model is a Google model based on the "model" field in the payload.
-///
-/// ### Arguments
-/// - `payload`: The JSON payload as a `serde_json::Value`.
-///
-/// ### Returns
-/// - `bool`: Returns `true` if the model is a Google model, otherwise `false`.
-pub fn is_google_model(payload: &Value) -> bool {
-    if let Some(model) = payload.get("model").and_then(|m| m.as_str()) {
-        // Check if the model name contains "google"
-        return model.to_lowercase().contains("google");
+fn format_server_error_message(status_code: StatusCode, payload: Option<&Value>) -> String {
+    match payload {
+        Some(Value::Null) | None => format!(
+            "HTTP {}: No response body received from server",
+            status_code.as_u16()
+        ),
+        Some(p) => format!("HTTP {}: {}", status_code.as_u16(), p),
     }
-    false
+}
+
+pub fn is_google_model(payload: &Value) -> bool {
+    payload
+        .get("model")
+        .and_then(|m| m.as_str())
+        .unwrap_or("")
+        .to_lowercase()
+        .contains("google")
 }
 
 /// Extracts `StatusCode` from response status or payload error code.
@@ -122,6 +106,31 @@ fn get_google_final_status(status: StatusCode, payload: Option<&Value>) -> Statu
         }
     }
     status
+}
+
+fn parse_google_retry_delay(payload: &Value) -> Option<Duration> {
+    payload
+        .get("error")
+        .and_then(|error| error.get("details"))
+        .and_then(|details| details.as_array())
+        .and_then(|details_array| {
+            details_array.iter().find_map(|detail| {
+                if detail
+                    .get("@type")
+                    .and_then(|t| t.as_str())
+                    .is_some_and(|s| s.ends_with("RetryInfo"))
+                {
+                    detail
+                        .get("retryDelay")
+                        .and_then(|delay| delay.as_str())
+                        .and_then(|s| s.strip_suffix('s'))
+                        .and_then(|num| num.parse::<u64>().ok())
+                        .map(Duration::from_secs)
+                } else {
+                    None
+                }
+            })
+        })
 }
 
 /// Handle response from Google Gemini API-compatible endpoints.
@@ -166,11 +175,15 @@ pub async fn handle_response_google_compat(response: Response) -> Result<Value, 
             Err(ProviderError::RequestFailed(format!("Request failed with status: {}. Message: {}", final_status, error_msg)))
         }
         StatusCode::TOO_MANY_REQUESTS => {
-            Err(ProviderError::RateLimitExceeded(format!("{:?}", payload)))
+            let retry_delay = payload.as_ref().and_then(parse_google_retry_delay);
+            Err(ProviderError::RateLimitExceeded {
+                details: format!("{:?}", payload),
+                retry_delay,
+            })
         }
-        StatusCode::INTERNAL_SERVER_ERROR | StatusCode::SERVICE_UNAVAILABLE => {
-            Err(ProviderError::ServerError(format!("{:?}", payload)))
-        }
+        _ if final_status.is_server_error() => Err(ProviderError::ServerError(
+            format_server_error_message(final_status, payload.as_ref()),
+        )),
         _ => {
             tracing::debug!(
                 "{}", format!("Provider request failed with status: {}. Payload: {:?}", final_status, payload)
@@ -181,12 +194,14 @@ pub async fn handle_response_google_compat(response: Response) -> Result<Value, 
 }
 
 pub fn sanitize_function_name(name: &str) -> String {
-    let re = Regex::new(r"[^a-zA-Z0-9_-]").unwrap();
+    static RE: OnceLock<Regex> = OnceLock::new();
+    let re = RE.get_or_init(|| Regex::new(r"[^a-zA-Z0-9_-]").unwrap());
     re.replace_all(name, "_").to_string()
 }
 
 pub fn is_valid_function_name(name: &str) -> bool {
-    let re = Regex::new(r"^[a-zA-Z0-9_-]+$").unwrap();
+    static RE: OnceLock<Regex> = OnceLock::new();
+    let re = RE.get_or_init(|| Regex::new(r"^[a-zA-Z0-9_-]+$").unwrap());
     re.is_match(name)
 }
 
@@ -283,56 +298,204 @@ pub fn load_image_file(path: &str) -> Result<ImageContent, ProviderError> {
     // Convert to base64
     let data = base64::prelude::BASE64_STANDARD.encode(&bytes);
 
-    Ok(ImageContent {
+    Ok(RawImageContent {
         mime_type: mime_type.to_string(),
         data,
-        annotations: None,
-    })
+        meta: None,
+    }
+    .no_annotation())
 }
 
 pub fn unescape_json_values(value: &Value) -> Value {
+    let mut cloned = value.clone();
+    unescape_json_values_in_place(&mut cloned);
+    cloned
+}
+
+fn unescape_json_values_in_place(value: &mut Value) {
     match value {
         Value::Object(map) => {
-            let new_map: Map<String, Value> = map
-                .iter()
-                .map(|(k, v)| (k.clone(), unescape_json_values(v))) // Process each value
-                .collect();
-            Value::Object(new_map)
+            for v in map.values_mut() {
+                unescape_json_values_in_place(v);
+            }
         }
         Value::Array(arr) => {
-            let new_array: Vec<Value> = arr.iter().map(unescape_json_values).collect();
-            Value::Array(new_array)
+            for v in arr.iter_mut() {
+                unescape_json_values_in_place(v);
+            }
         }
         Value::String(s) => {
-            let unescaped = s
-                .replace("\\\\n", "\n")
-                .replace("\\\\t", "\t")
-                .replace("\\\\r", "\r")
-                .replace("\\\\\"", "\"")
-                .replace("\\n", "\n")
-                .replace("\\t", "\t")
-                .replace("\\r", "\r")
-                .replace("\\\"", "\"");
-            Value::String(unescaped)
+            if s.contains('\\') {
+                *s = s
+                    .replace("\\\\n", "\n")
+                    .replace("\\\\t", "\t")
+                    .replace("\\\\r", "\r")
+                    .replace("\\\\\"", "\"")
+                    .replace("\\n", "\n")
+                    .replace("\\t", "\t")
+                    .replace("\\r", "\r")
+                    .replace("\\\"", "\"");
+            }
         }
-        _ => value.clone(),
+        _ => {}
     }
 }
 
-pub fn emit_debug_trace(
-    model_config: &ModelConfig,
-    payload: &Value,
-    response: &Value,
-    usage: &Usage,
-) {
-    tracing::debug!(
-        model_config = %serde_json::to_string_pretty(model_config).unwrap_or_default(),
-        input = %serde_json::to_string_pretty(payload).unwrap_or_default(),
-        output = %serde_json::to_string_pretty(response).unwrap_or_default(),
-        input_tokens = ?usage.input_tokens.unwrap_or_default(),
-        output_tokens = ?usage.output_tokens.unwrap_or_default(),
-        total_tokens = ?usage.total_tokens.unwrap_or_default(),
-    );
+pub struct RequestLog {
+    writer: Option<BufWriter<File>>,
+    temp_path: PathBuf,
+}
+
+pub const LOGS_TO_KEEP: usize = 10;
+
+impl RequestLog {
+    pub fn start<Payload>(model_config: &ModelConfig, payload: &Payload) -> Result<Self>
+    where
+        Payload: Serialize,
+    {
+        let logs_dir = Paths::in_state_dir("logs");
+
+        let request_id = Uuid::new_v4();
+        let temp_name = format!("llm_request.{request_id}.jsonl");
+        let temp_path = logs_dir.join(PathBuf::from(temp_name));
+
+        let mut writer = BufWriter::new(
+            File::options()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(&temp_path)?,
+        );
+
+        let data = serde_json::json!({
+            "model_config": model_config,
+            "input": payload,
+        });
+        writeln!(writer, "{}", serde_json::to_string(&data)?)?;
+
+        Ok(Self {
+            writer: Some(writer),
+            temp_path,
+        })
+    }
+
+    fn write_json(&mut self, line: &serde_json::Value) -> Result<()> {
+        let writer = self
+            .writer
+            .as_mut()
+            .ok_or_else(|| anyhow!("logger is finished"))?;
+        writeln!(writer, "{}", serde_json::to_string(line)?)?;
+        Ok(())
+    }
+
+    pub fn error<E>(&mut self, error: E) -> Result<()>
+    where
+        E: Display,
+    {
+        self.write_json(&serde_json::json!({
+            "error": format!("{}", error),
+        }))
+    }
+
+    pub fn write<Payload>(&mut self, data: &Payload, usage: Option<&Usage>) -> Result<()>
+    where
+        Payload: Serialize,
+    {
+        self.write_json(&serde_json::json!({
+            "data": data,
+            "usage": usage,
+        }))
+    }
+
+    fn finish(&mut self) -> Result<()> {
+        if let Some(mut writer) = self.writer.take() {
+            writer.flush()?;
+            let logs_dir = Paths::in_state_dir("logs");
+            let log_path = |i| logs_dir.join(format!("llm_request.{}.jsonl", i));
+
+            for i in (0..LOGS_TO_KEEP - 1).rev() {
+                let _ = std::fs::rename(log_path(i), log_path(i + 1));
+            }
+
+            std::fs::rename(&self.temp_path, log_path(0))?;
+        }
+        Ok(())
+    }
+}
+
+impl Drop for RequestLog {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            return;
+        }
+        let _ = self.finish();
+    }
+}
+
+/// Safely parse a JSON string that may contain doubly-encoded or malformed JSON.
+/// This function first attempts to parse the input string as-is. If that fails,
+/// it applies control character escaping and tries again.
+///
+/// This approach preserves valid JSON like `{"key1": "value1",\n"key2": "value"}`
+/// (which contains a literal \n but is perfectly valid JSON) while still fixing
+/// broken JSON like `{"key1": "value1\n","key2": "value"}` (which contains an
+/// unescaped newline character).
+pub fn safely_parse_json(s: &str) -> Result<serde_json::Value, serde_json::Error> {
+    // First, try parsing the string as-is
+    match serde_json::from_str(s) {
+        Ok(value) => Ok(value),
+        Err(_) => {
+            // If that fails, try with control character escaping
+            let escaped = json_escape_control_chars_in_string(s);
+            serde_json::from_str(&escaped)
+        }
+    }
+}
+
+/// Helper to escape control characters in a string that is supposed to be a JSON document.
+/// This function iterates through the input string `s` and replaces any literal
+/// control characters (U+0000 to U+001F) with their JSON-escaped equivalents
+/// (e.g., '\n' becomes "\\n", '\u0001' becomes "\\u0001").
+///
+/// It does NOT escape quotes (") or backslashes (\) because it assumes `s` is a
+/// full JSON document, and these characters might be structural (e.g., object delimiters,
+/// existing valid escape sequences). The goal is to fix common LLM errors where
+/// control characters are emitted raw into what should be JSON string values,
+/// making the overall JSON structure unparsable.
+///
+/// If the input string `s` has other JSON syntax errors (e.g., an unescaped quote
+/// *within* a string value like `{"key": "string with " quote"}`), this function
+/// will not fix them. It specifically targets unescaped control characters.
+pub fn json_escape_control_chars_in_string(s: &str) -> String {
+    let mut r = String::with_capacity(s.len()); // Pre-allocate for efficiency
+    for c in s.chars() {
+        match c {
+            // ASCII Control characters (U+0000 to U+001F)
+            '\u{0000}'..='\u{001F}' => {
+                match c {
+                    '\u{0008}' => r.push_str("\\b"), // Backspace
+                    '\u{000C}' => r.push_str("\\f"), // Form feed
+                    '\n' => r.push_str("\\n"),       // Line feed
+                    '\r' => r.push_str("\\r"),       // Carriage return
+                    '\t' => r.push_str("\\t"),       // Tab
+                    // Other control characters (e.g., NUL, SOH, VT, etc.)
+                    // that don't have a specific short escape sequence.
+                    _ => {
+                        r.push_str(&format!("\\u{:04x}", c as u32));
+                    }
+                }
+            }
+            // Other characters are passed through.
+            // This includes quotes (") and backslashes (\). If these are part of the
+            // JSON structure (e.g. {"key": "value"}) or part of an already correctly
+            // escaped sequence within a string value (e.g. "string with \\\" quote"),
+            // they are preserved as is. This function does not attempt to fix
+            // malformed quote or backslash usage *within* string values if the LLM
+            // generates them incorrectly (e.g. {"key": "unescaped " quote in string"}).
+            _ => r.push(c),
+        }
+    }
+    r
 }
 
 #[cfg(test)]
@@ -350,7 +513,7 @@ mod tests {
             0x0D, 0x0A, 0x1A, 0x0A, // PNG header
             0x00, 0x00, 0x00, 0x0D, // Rest of fake PNG data
         ];
-        std::fs::write(&png_path, &png_data).unwrap();
+        std::fs::write(&png_path, png_data).unwrap();
         let png_path_str = png_path.to_str().unwrap();
 
         // Create a fake PNG (wrong magic numbers)
@@ -365,7 +528,7 @@ mod tests {
         let text = format!("Here is a fake image {}", fake_png_path.to_str().unwrap());
         assert_eq!(detect_image_path(&text), None);
 
-        // Test with non-existent file
+        // Test with nonexistent file
         let text = "Here is a fake.png that doesn't exist";
         assert_eq!(detect_image_path(text), None);
 
@@ -388,7 +551,7 @@ mod tests {
             0x0D, 0x0A, 0x1A, 0x0A, // PNG header
             0x00, 0x00, 0x00, 0x0D, // Rest of fake PNG data
         ];
-        std::fs::write(&png_path, &png_data).unwrap();
+        std::fs::write(&png_path, png_data).unwrap();
         let png_path_str = png_path.to_str().unwrap();
 
         // Create a fake PNG (wrong magic numbers)
@@ -410,7 +573,7 @@ mod tests {
             .to_string()
             .contains("not a valid image"));
 
-        // Test non-existent file
+        // Test nonexistent file
         let result = load_image_file("nonexistent.png");
         assert!(result.is_err());
 
@@ -418,7 +581,7 @@ mod tests {
         let gif_path = temp_dir.path().join("test.gif");
         // Minimal GIF89a header
         let gif_data = [0x47, 0x49, 0x46, 0x38, 0x39, 0x61];
-        std::fs::write(&gif_path, &gif_data).unwrap();
+        std::fs::write(&gif_path, gif_data).unwrap();
         let gif_path_str = gif_path.to_str().unwrap();
 
         // Test loading unsupported GIF format
@@ -559,5 +722,108 @@ mod tests {
             let result = get_google_final_status(status.unwrap_or(StatusCode::OK), Some(&payload));
             assert_eq!(result, expected_status);
         }
+    }
+
+    #[test]
+    fn test_safely_parse_json() {
+        // Test valid JSON that should parse without escaping (contains proper escape sequence)
+        let valid_json = r#"{"key1": "value1","key2": "value2"}"#;
+        let result = safely_parse_json(valid_json).unwrap();
+        assert_eq!(result["key1"], "value1");
+        assert_eq!(result["key2"], "value2");
+
+        // Test JSON with actual unescaped newlines that needs escaping
+        let invalid_json = "{\"key1\": \"value1\n\",\"key2\": \"value2\"}";
+        let result = safely_parse_json(invalid_json).unwrap();
+        assert_eq!(result["key1"], "value1\n");
+        assert_eq!(result["key2"], "value2");
+
+        // Test already valid JSON - should parse on first try
+        let good_json = r#"{"test": "value"}"#;
+        let result = safely_parse_json(good_json).unwrap();
+        assert_eq!(result["test"], "value");
+
+        // Test completely invalid JSON that can't be fixed
+        let broken_json = r#"{"key": "unclosed_string"#;
+        assert!(safely_parse_json(broken_json).is_err());
+
+        // Test empty object
+        let empty_json = "{}";
+        let result = safely_parse_json(empty_json).unwrap();
+        assert!(result.as_object().unwrap().is_empty());
+
+        // Test JSON with escaped newlines (valid JSON) - should parse on first try
+        let escaped_json = r#"{"key": "value with\nnewline"}"#;
+        let result = safely_parse_json(escaped_json).unwrap();
+        assert_eq!(result["key"], "value with\nnewline");
+    }
+
+    #[test]
+    fn test_json_escape_control_chars_in_string() {
+        // Test basic control character escaping
+        assert_eq!(
+            json_escape_control_chars_in_string("Hello\nWorld"),
+            "Hello\\nWorld"
+        );
+        assert_eq!(
+            json_escape_control_chars_in_string("Hello\tWorld"),
+            "Hello\\tWorld"
+        );
+        assert_eq!(
+            json_escape_control_chars_in_string("Hello\rWorld"),
+            "Hello\\rWorld"
+        );
+
+        // Test multiple control characters
+        assert_eq!(
+            json_escape_control_chars_in_string("Hello\n\tWorld\r"),
+            "Hello\\n\\tWorld\\r"
+        );
+
+        // Test that quotes and backslashes are preserved (not escaped)
+        assert_eq!(
+            json_escape_control_chars_in_string("Hello \"World\""),
+            "Hello \"World\""
+        );
+        assert_eq!(
+            json_escape_control_chars_in_string("Hello\\World"),
+            "Hello\\World"
+        );
+
+        // Test JSON-like string with control characters
+        assert_eq!(
+            json_escape_control_chars_in_string("{\"message\": \"Hello\nWorld\"}"),
+            "{\"message\": \"Hello\\nWorld\"}"
+        );
+
+        // Test no changes for normal strings
+        assert_eq!(
+            json_escape_control_chars_in_string("Hello World"),
+            "Hello World"
+        );
+
+        // Test other control characters get unicode escapes
+        assert_eq!(
+            json_escape_control_chars_in_string("Hello\u{0001}World"),
+            "Hello\\u0001World"
+        );
+    }
+
+    #[test]
+    fn test_parse_google_retry_delay() {
+        let payload = json!({
+            "error": {
+                "details": [
+                    {
+                        "@type": "type.googleapis.com/google.rpc.RetryInfo",
+                        "retryDelay": "42s"
+                    }
+                ]
+            }
+        });
+        assert_eq!(
+            parse_google_retry_delay(&payload),
+            Some(Duration::from_secs(42))
+        );
     }
 }

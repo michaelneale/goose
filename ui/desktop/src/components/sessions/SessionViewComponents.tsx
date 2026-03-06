@@ -2,13 +2,18 @@ import React from 'react';
 import { MessageSquare, AlertCircle } from 'lucide-react';
 import { Card } from '../ui/card';
 import { Button } from '../ui/button';
-import BackButton from '../ui/BackButton';
 import { ScrollArea } from '../ui/scroll-area';
 import MarkdownContent from '../MarkdownContent';
 import ToolCallWithResponse from '../ToolCallWithResponse';
-import { ToolRequestMessageContent, ToolResponseMessageContent } from '../../types/message';
-import { type Message } from '../../types/message';
+import ImagePreview from '../ImagePreview';
+import {
+  getTextAndImageContent,
+  getReasoningContent,
+  ToolRequestMessageContent,
+  ToolResponseMessageContent,
+} from '../../types/message';
 import { formatMessageTimestamp } from '../../utils/timeUtils';
+import { Message } from '../../api';
 
 /**
  * Get tool responses map from messages
@@ -38,35 +43,7 @@ export const getToolResponsesMap = (
   return responseMap;
 };
 
-/**
- * Props for the SessionHeaderCard component
- */
-export interface SessionHeaderCardProps {
-  onBack: () => void;
-  children: React.ReactNode;
-}
-
-/**
- * Common header card for session views
- */
-export const SessionHeaderCard: React.FC<SessionHeaderCardProps> = ({ onBack, children }) => {
-  return (
-    <Card className="rounded-none px-8 pt-6 pb-4 bg-bgAppInverse text-textProminentInverse flex items-center">
-      <BackButton
-        showText={false}
-        onClick={onBack}
-        iconSize="w-7 h-7"
-        className="!text-textProminentInverse dark:!text-textStandardInverse"
-      />
-      {children}
-    </Card>
-  );
-};
-
-/**
- * Props for the SessionMessages component
- */
-export interface SessionMessagesProps {
+interface SessionMessagesProps {
   messages: Message[];
   isLoading: boolean;
   error: string | null;
@@ -89,10 +66,10 @@ export const SessionMessages: React.FC<SessionMessagesProps> = ({
           <div className="space-y-4 mb-6">
             {isLoading ? (
               <div className="flex justify-center items-center py-12">
-                <div className="animate-spin rounded-full h-8 w-8 border-t-2 border-b-2 border-textStandard"></div>
+                <div className="animate-spin rounded-full h-8 w-8 border-t-2 border-b-2"></div>
               </div>
             ) : error ? (
-              <div className="flex flex-col items-center justify-center py-8 text-textSubtle">
+              <div className="flex flex-col items-center justify-center py-8 text-text-secondary">
                 <div className="text-red-500 mb-4">
                   <AlertCircle size={32} />
                 </div>
@@ -105,11 +82,8 @@ export const SessionMessages: React.FC<SessionMessagesProps> = ({
             ) : messages?.length > 0 ? (
               messages
                 .map((message, index) => {
-                  // Extract text content from the message
-                  const textContent = message.content
-                    .filter((c) => c.type === 'text')
-                    .map((c) => c.text)
-                    .join('\n');
+                  const { textContent, imagePaths } = getTextAndImageContent(message);
+                  const reasoningContent = getReasoningContent(message);
 
                   // Get tool requests from the message
                   const toolRequests = message.content
@@ -133,30 +107,52 @@ export const SessionMessages: React.FC<SessionMessagesProps> = ({
                       key={index}
                       className={`p-4 ${
                         message.role === 'user'
-                          ? 'bg-bgSecondary border border-borderSubtle'
-                          : 'bg-bgSubtle'
+                          ? 'bg-bgSecondary border border-border-primary'
+                          : 'bg-background-secondary'
                       }`}
                     >
                       <div className="flex justify-between items-center mb-2">
-                        <span className="font-medium text-textStandard">
+                        <span className="font-medium text-text-primary">
                           {message.role === 'user' ? 'You' : 'Goose'}
                         </span>
-                        <span className="text-xs text-textSubtle">
+                        <span className="text-xs text-text-secondary">
                           {formatMessageTimestamp(message.created)}
                         </span>
                       </div>
 
                       <div className="flex flex-col w-full">
+                        {/* Reasoning content */}
+                        {reasoningContent && (
+                          <details className="mb-2">
+                            <summary className="cursor-pointer text-xs text-textSubtle select-none">
+                              Show reasoning
+                            </summary>
+                            <div className="mt-2 text-sm">
+                              <MarkdownContent content={reasoningContent} />
+                            </div>
+                          </details>
+                        )}
+
                         {/* Text content */}
                         {textContent && (
-                          <div className={`${toolRequests.length > 0 ? 'mb-4' : ''}`}>
+                          <div
+                            className={`${toolRequests.length > 0 || imagePaths.length > 0 ? 'mb-4' : ''}`}
+                          >
                             <MarkdownContent content={textContent} />
+                          </div>
+                        )}
+
+                        {imagePaths.length > 0 && (
+                          <div className="flex flex-wrap gap-2 mt-2 mb-2">
+                            {imagePaths.map((imagePath, imageIndex) => (
+                              <ImagePreview key={imageIndex} src={imagePath} />
+                            ))}
                           </div>
                         )}
 
                         {/* Tool requests and responses */}
                         {toolRequests.length > 0 && (
-                          <div className="goose-message-tool bg-bgApp border border-borderSubtle dark:border-gray-700 rounded-b-2xl px-4 pt-4 pb-2 mt-1">
+                          <div className="goose-message-tool bg-background-primary border border-border-primary dark:border-gray-700 rounded-b-2xl px-4 pt-4 pb-2 mt-1">
                             {toolRequests.map((toolRequest) => (
                               <ToolCallWithResponse
                                 // In the session history page, if no tool response found for given request, it means the tool call
@@ -164,6 +160,7 @@ export const SessionMessages: React.FC<SessionMessagesProps> = ({
                                 isCancelledMessage={
                                   toolResponsesMap.get(toolRequest.id) == undefined
                                 }
+                                isPendingApproval={false}
                                 key={toolRequest.id}
                                 toolRequest={toolRequest}
                                 toolResponse={toolResponsesMap.get(toolRequest.id)}
@@ -177,7 +174,7 @@ export const SessionMessages: React.FC<SessionMessagesProps> = ({
                 })
                 .filter(Boolean) // Filter out null entries
             ) : (
-              <div className="flex flex-col items-center justify-center py-8 text-textSubtle">
+              <div className="flex flex-col items-center justify-center py-8 text-text-secondary">
                 <MessageSquare className="w-12 h-12 mb-4" />
                 <p className="text-lg mb-2">No messages found</p>
                 <p className="text-sm">This session doesn't contain any messages</p>

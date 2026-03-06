@@ -4,6 +4,22 @@
 default:
   @just --list
 
+# Run all style checks and formatting (precommit validation)
+check-everything:
+    @echo "🔧 RUNNING ALL STYLE CHECKS..."
+    @echo "  → Formatting Rust code..."
+    cargo fmt --all
+    @echo "  → Running clippy linting..."
+    cargo clippy --all-targets -- -D warnings
+    @echo "  → Checking for banned TLS crates..."
+    ./scripts/check-no-native-tls.sh
+    @echo "  → Checking UI code formatting..."
+    cd ui/desktop && npm run lint:check
+    @echo "  → Validating OpenAPI schema..."
+    ./scripts/check-openapi-schema.sh
+    @echo ""
+    @echo "✅ All style checks passed!"
+
 # Default release command
 release-binary:
     @echo "Building release version..."
@@ -11,6 +27,25 @@ release-binary:
     @just copy-binary
     @echo "Generating OpenAPI schema..."
     cargo run -p goose-server --bin generate_schema
+
+# release-windows docker build command
+win_docker_build_sh := '''rustup target add x86_64-pc-windows-gnu && \
+	apt-get update && \
+	apt-get install -y mingw-w64 protobuf-compiler cmake && \
+	export CC_x86_64_pc_windows_gnu=x86_64-w64-mingw32-gcc && \
+	export CXX_x86_64_pc_windows_gnu=x86_64-w64-mingw32-g++ && \
+	export AR_x86_64_pc_windows_gnu=x86_64-w64-mingw32-ar && \
+	export CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER=x86_64-w64-mingw32-gcc && \
+	export PKG_CONFIG_ALLOW_CROSS=1 && \
+	export PROTOC=/usr/bin/protoc && \
+	export PATH=/usr/bin:\$PATH && \
+	protoc --version && \
+	cargo build --release --target x86_64-pc-windows-gnu && \
+	GCC_DIR=\$(ls -d /usr/lib/gcc/x86_64-w64-mingw32/*/ | head -n 1) && \
+	cp \$GCC_DIR/libstdc++-6.dll /usr/src/myapp/target/x86_64-pc-windows-gnu/release/ && \
+	cp \$GCC_DIR/libgcc_s_seh-1.dll /usr/src/myapp/target/x86_64-pc-windows-gnu/release/ && \
+	cp /usr/x86_64-w64-mingw32/lib/libwinpthread-1.dll /usr/src/myapp/target/x86_64-pc-windows-gnu/release/
+'''
 
 # Build Windows executable
 release-windows:
@@ -23,17 +58,16 @@ release-windows:
             -v goose-windows-cache:/usr/local/cargo/registry \
             -w /usr/src/myapp \
             rust:latest \
-            sh -c "rustup target add x86_64-pc-windows-gnu && \
-                apt-get update && \
-                apt-get install -y mingw-w64 && \
-                cargo build --release --target x86_64-pc-windows-gnu && \
-                GCC_DIR=\$(ls -d /usr/lib/gcc/x86_64-w64-mingw32/*/ | head -n 1) && \
-                cp \$GCC_DIR/libstdc++-6.dll /usr/src/myapp/target/x86_64-pc-windows-gnu/release/ && \
-                cp \$GCC_DIR/libgcc_s_seh-1.dll /usr/src/myapp/target/x86_64-pc-windows-gnu/release/ && \
-                cp /usr/x86_64-w64-mingw32/lib/libwinpthread-1.dll /usr/src/myapp/target/x86_64-pc-windows-gnu/release/"
+            sh -c "{{win_docker_build_sh}}"
     else
         echo "Building Windows executable using Docker through PowerShell..."
-        powershell.exe -Command "docker volume create goose-windows-cache; docker run --rm -v ${PWD}:/usr/src/myapp -v goose-windows-cache:/usr/local/cargo/registry -w /usr/src/myapp rust:latest sh -c 'rustup target add x86_64-pc-windows-gnu && apt-get update && apt-get install -y mingw-w64 && cargo build --release --target x86_64-pc-windows-gnu && GCC_DIR=\$(ls -d /usr/lib/gcc/x86_64-w64-mingw32/*/ | head -n 1) && cp \$GCC_DIR/libstdc++-6.dll /usr/src/myapp/target/x86_64-pc-windows-gnu/release/ && cp \$GCC_DIR/libgcc_s_seh-1.dll /usr/src/myapp/target/x86_64-pc-windows-gnu/release/ && cp /usr/x86_64-w64-mingw32/lib/libwinpthread-1.dll /usr/src/myapp/target/x86_64-pc-windows-gnu/release/'"
+        powershell.exe -Command "docker volume create goose-windows-cache; \`
+            docker run --rm \`
+                -v ${PWD}:/usr/src/myapp \`
+                -v goose-windows-cache:/usr/local/cargo/registry \`
+                -w /usr/src/myapp \`
+                rust:latest \`
+                sh -c '{{win_docker_build_sh}}'"
     fi
     echo "Windows executable and required DLLs created at ./target/x86_64-pc-windows-gnu/release/"
 
@@ -51,6 +85,13 @@ copy-binary BUILD_MODE="release":
         echo "Binary not found in target/{{BUILD_MODE}}"; \
         exit 1; \
     fi
+    @if [ -f ./target/{{BUILD_MODE}}/goose ]; then \
+        echo "Copying goose CLI binary from target/{{BUILD_MODE}}..."; \
+        cp -p ./target/{{BUILD_MODE}}/goose ./ui/desktop/src/bin/; \
+    else \
+        echo "goose CLI binary not found in target/{{BUILD_MODE}}"; \
+        exit 1; \
+    fi
 
 # Copy binary command for Intel build
 copy-binary-intel:
@@ -59,6 +100,13 @@ copy-binary-intel:
         cp -p ./target/x86_64-apple-darwin/release/goosed ./ui/desktop/src/bin/; \
     else \
         echo "Intel release binary not found."; \
+        exit 1; \
+    fi
+    @if [ -f ./target/x86_64-apple-darwin/release/goose ]; then \
+        echo "Copying Intel goose CLI binary to ui/desktop/src/bin..."; \
+        cp -p ./target/x86_64-apple-darwin/release/goose ./ui/desktop/src/bin/; \
+    else \
+        echo "Intel goose CLI binary not found."; \
         exit 1; \
     fi
 
@@ -79,15 +127,55 @@ run-ui:
     @echo "Running UI..."
     cd ui/desktop && npm install && npm run start-gui
 
+run-ui-playwright:
+    #!/usr/bin/env sh
+    just release-binary
+    echo "Running UI with Playwright debugging..."
+    RUN_DIR="$HOME/goose-runs/$(date +%Y%m%d-%H%M%S)"
+    mkdir -p "$RUN_DIR"
+    echo "Using isolated directory: $RUN_DIR"
+    cd ui/desktop && ENABLE_PLAYWRIGHT=true GOOSE_PATH_ROOT="$RUN_DIR" npm run start-gui
+
 run-ui-only:
     @echo "Running UI..."
     cd ui/desktop && npm install && npm run start-gui
 
+debug-ui *alpha:
+    @echo "🚀 Starting goose frontend in external backend mode{{ if alpha == "alpha" { " with alpha features enabled" } else { "" } }}"
+    cd ui/desktop && \
+    export GOOSE_EXTERNAL_BACKEND=true && \
+    {{ if alpha == "alpha" { "export ALPHA=true &&" } else { "" } }} \
+    npm install && \
+    npm run {{ if alpha == "alpha" { "start-alpha-gui" } else { "start-gui" } }}
+
+# Run UI with main process debugging enabled
+# To debug main process:
+# 1. Run: just debug-ui-main-process
+# 2. Open Chrome → chrome://inspect
+# 3. Click "Open dedicated DevTools for Node"
+# 4. If not auto-detected, click "Configure" and add: localhost:9229
+
+debug-ui-main-process:
+	@echo "🔍 Starting goose UI with main process debugging enabled"
+	@just release-binary
+	cd ui/desktop && \
+	npm install && \
+	npm run start-gui-debug
+
+# Package the desktop app locally for testing (macOS)
+# Applies ad-hoc code signing with entitlements (needed for mic access, etc.)
+package-ui:
+    @just release-binary
+    @echo "Packaging desktop app..."
+    cd ui/desktop && npm install && npm run package
+    @echo "Signing with entitlements..."
+    codesign --force --deep --sign - --entitlements ui/desktop/entitlements.plist ui/desktop/out/Goose-darwin-arm64/Goose.app
+    @echo "Done! Launch with: open ui/desktop/out/Goose-darwin-arm64/Goose.app"
 
 # Run UI with alpha changes
 run-ui-alpha:
     @just release-binary
-    @echo "Running UI..."
+    @echo "Running UI with alpha features..."
     cd ui/desktop && npm install && ALPHA=true npm run start-alpha-gui
 
 # Run UI with latest (Windows version)
@@ -105,12 +193,38 @@ run-docs:
 # Run server
 run-server:
     @echo "Running server..."
-    cargo run -p goose-server
+    cargo run -p goose-server --bin goosed agent
+
+# Check if OpenAPI schema is up-to-date
+check-openapi-schema: generate-openapi
+    ./scripts/check-openapi-schema.sh
+
+# Generate OpenAPI specification without starting the UI
+generate-openapi:
+    @echo "Generating OpenAPI schema..."
+    cargo run -p goose-server --bin generate_schema
+    @echo "Generating frontend API..."
+    cd ui/desktop && npx @hey-api/openapi-ts
+
+# Generate manpages for the CLI
+generate-manpages:
+    @echo "Generating manpages..."
+    cargo run -p goose-cli --bin generate_manpages
+    @echo "Manpages generated at target/man/"
+
+# make GUI with latest binary
+lint-ui:
+    cd ui/desktop && npm run lint:check
 
 # make GUI with latest binary
 make-ui:
     @just release-binary
     cd ui/desktop && npm run bundle:default
+
+# make GUI with latest binary and alpha features enabled
+make-ui-alpha:
+    @just release-binary
+    cd ui/desktop && npm run bundle:alpha
 
 # make GUI with latest Windows binary
 make-ui-windows:
@@ -124,25 +238,8 @@ make-ui-windows:
         echo "Copying Windows binary and DLLs..." && \
         cp -f ./target/x86_64-pc-windows-gnu/release/goosed.exe ./ui/desktop/src/bin/ && \
         cp -f ./target/x86_64-pc-windows-gnu/release/*.dll ./ui/desktop/src/bin/ && \
-        if [ -d "./ui/desktop/src/platform/windows/bin" ]; then \
-            echo "Copying Windows platform files..." && \
-            for file in ./ui/desktop/src/platform/windows/bin/*.{exe,dll,cmd}; do \
-                if [ -f "$file" ] && [ "$(basename "$file")" != "goosed.exe" ]; then \
-                    cp -f "$file" ./ui/desktop/src/bin/; \
-                fi; \
-            done && \
-            if [ -d "./ui/desktop/src/platform/windows/bin/goose-npm" ]; then \
-                echo "Setting up npm environment..." && \
-                rsync -a --delete ./ui/desktop/src/platform/windows/bin/goose-npm/ ./ui/desktop/src/bin/goose-npm/; \
-            fi && \
-            echo "Windows-specific files copied successfully"; \
-        fi && \
         echo "Starting Windows package build..." && \
-        (cd ui/desktop && echo "In desktop directory, running npm bundle:windows..." && npm run bundle:windows) && \
-        echo "Creating resources directory..." && \
-        (cd ui/desktop && mkdir -p out/Goose-win32-x64/resources/bin) && \
-        echo "Copying final binaries..." && \
-        (cd ui/desktop && rsync -av src/bin/ out/Goose-win32-x64/resources/bin/) && \
+        (cd ui/desktop && npm run bundle:windows) && \
         echo "Windows package build complete!"; \
     else \
         echo "Windows binary not found."; \
@@ -154,10 +251,7 @@ make-ui-intel:
     @just release-intel
     cd ui/desktop && npm run bundle:intel
 
-# Setup langfuse server
-langfuse-server:
-    #!/usr/bin/env bash
-    ./scripts/setup_langfuse.sh
+
 
 # Run UI with debug build
 run-dev:
@@ -172,12 +266,11 @@ install-deps:
     cd ui/desktop && npm install
     cd documentation && yarn
 
-# ensure the current branch is "main" or error
-ensure-main:
+ensure-release-branch:
     #!/usr/bin/env bash
     branch=$(git rev-parse --abbrev-ref HEAD); \
-    if [ "$branch" != "main" ]; then \
-        echo "Error: You are not on the main branch (current: $branch)"; \
+    if [[ ! "$branch" == release/* ]]; then \
+        echo "Error: You are not on a release branch (current: $branch)"; \
         exit 1; \
     fi
 
@@ -185,7 +278,7 @@ ensure-main:
     git fetch
     # @{u} refers to upstream branch of current branch
     if [ "$(git rev-parse HEAD)" != "$(git rev-parse @{u})" ]; then \
-        echo "Error: Your branch is not up to date with the upstream main branch"; \
+        echo "Error: Your branch is not up to date with the upstream branch"; \
         echo "  ensure your branch is up to date (git pull)"; \
         exit 1; \
     fi
@@ -206,8 +299,14 @@ validate version:
       exit 1
     fi
 
+get-next-minor-version:
+    @python -c "import sys; v=sys.argv[1].split('.'); print(f'{v[0]}.{int(v[1])+1}.0')" $(just get-tag-version)
+
+get-next-patch-version:
+    @python -c "import sys; v=sys.argv[1].split('.'); print(f'{v[0]}.{v[1]}.{int(v[2])+1}')" $(just get-tag-version)
+
 # set cargo and app versions, must be semver
-release version: ensure-main
+prepare-release version:
     @just validate {{ version }} || exit 1
 
     @git switch -c "release/{{ version }}"
@@ -218,15 +317,27 @@ release version: ensure-main
     # see --workspace flag https://doc.rust-lang.org/cargo/commands/cargo-update.html
     # used to update Cargo.lock after we've bumped versions in Cargo.toml
     @cargo update --workspace
-    @git add Cargo.toml Cargo.lock ui/desktop/package.json ui/desktop/package-lock.json
+    @just set-openapi-version {{ version }}
+    @cargo run --bin build_canonical_models
+    @git add \
+        Cargo.toml \
+        Cargo.lock \
+        ui/desktop/package.json \
+        ui/desktop/package-lock.json \
+        ui/desktop/openapi.json \
+        crates/goose/src/providers/canonical/data/canonical_models.json \
+        crates/goose/src/providers/canonical/data/canonical_mapping_report.json
     @git commit --message "chore(release): release version {{ version }}"
+
+set-openapi-version version:
+    @jq '.info.version |= "{{ version }}"' ui/desktop/openapi.json > ui/desktop/openapi.json.tmp && mv ui/desktop/openapi.json.tmp ui/desktop/openapi.json
 
 # extract version from Cargo.toml
 get-tag-version:
     @uvx --from=toml-cli toml get --toml-path=Cargo.toml "workspace.package.version"
 
-# create the git tag from Cargo.toml, must be on main
-tag: ensure-main
+# create the git tag from Cargo.toml, checking we're on a release branch
+tag: ensure-release-branch
     git tag v$(just get-tag-version)
 
 # create tag and push to origin (use this when release branch is merged to main)
@@ -235,11 +346,11 @@ tag-push: tag
     git push origin tag v$(just get-tag-version)
 
 # generate release notes from git commits
-release-notes:
+release-notes old:
     #!/usr/bin/env bash
-    git log --pretty=format:"- %s" v$(just get-tag-version)..HEAD
+    git log --pretty=format:"- %s" {{ old }}..v$(just get-tag-version)
 
-### s = file seperator based on OS
+### s = file separator based on OS
 s := if os() == "windows" { "\\" } else { "/" }
 
 ### testing/debugging
@@ -253,16 +364,16 @@ set windows-shell := ["powershell.exe", "-NoLogo", "-Command"]
 ### Build the core code
 ### profile = --release or "" for debug
 ### allparam = OR/AND/ANY/NONE --workspace --all-features --all-targets
-win-bld profile allparam: 
+win-bld profile allparam:
   cargo run {{profile}} -p goose-server --bin  generate_schema
   cargo build {{profile}} {{allparam}}
 
 ### Build just debug
-win-bld-dbg: 
+win-bld-dbg:
   just win-bld " " " "
 
 ### Build debug and test, examples,...
-win-bld-dbg-all: 
+win-bld-dbg-all:
   just win-bld " " "--workspace --all-targets --all-features"
 
 ### Build just release
@@ -278,14 +389,14 @@ win-app-deps:
   cd ui{{s}}desktop ; npm install
 
 ### Windows copy {release|debug} files to ui\desktop\src\bin
-### s = os depenent file seperator
+### s = os dependent file separator
 ### profile = release or debug
 win-copy-win profile:
   copy target{{s}}{{profile}}{{s}}*.exe ui{{s}}desktop{{s}}src{{s}}bin
   copy target{{s}}{{profile}}{{s}}*.dll ui{{s}}desktop{{s}}src{{s}}bin
 
 ### "Other" copy {release|debug} files to ui/desktop/src/bin
-### s = os depenent file seperator
+### s = os dependent file separator
 ### profile = release or debug
 win-copy-oth profile:
   find target{{s}}{{profile}}{{s}} -maxdepth 1 -type f -executable -print -exec cp {} ui{{s}}desktop{{s}}src{{s}}bin \;
@@ -297,7 +408,7 @@ win-app-copy profile="release":
 
 ### Only copy binaries, npm install, start-gui
 ### profile = release or debug
-### s = os depenent file seperator
+### s = os dependent file separator
 win-app-run profile:
   just win-app-copy {{profile}}
   just win-app-deps
@@ -325,23 +436,9 @@ win-total-rls *allparam:
   just win-bld-rls{{allparam}}
   just win-run-rls
 
-### Build and run the Kotlin example with 
-### auto-generated bindings for goose-llm 
-kotlin-example:
-    # Build Rust dylib and generate Kotlin bindings
-    cargo build -p goose-llm
-    cargo run --features=uniffi/cli --bin uniffi-bindgen generate \
-        --library ./target/debug/libgoose_llm.dylib --language kotlin --out-dir bindings/kotlin
+build-test-tools:
+  cargo build -p goose-test
 
-    # Compile and run the Kotlin example
-    cd bindings/kotlin/ && kotlinc \
-      example/Usage.kt \
-      uniffi/goose_llm/goose_llm.kt \
-      -classpath "libs/kotlin-stdlib-1.9.0.jar:libs/kotlinx-coroutines-core-jvm-1.7.3.jar:libs/jna-5.13.0.jar" \
-      -include-runtime \
-      -d example.jar
-
-    cd bindings/kotlin/ && java \
-      -Djna.library.path=$HOME/Development/goose/target/debug \
-      -classpath "example.jar:libs/kotlin-stdlib-1.9.0.jar:libs/kotlinx-coroutines-core-jvm-1.7.3.jar:libs/jna-5.13.0.jar" \
-      UsageKt
+record-mcp-tests: build-test-tools
+  GOOSE_RECORD_MCP=1 cargo test --package goose --test mcp_integration_test
+  git add crates/goose/tests/mcp_replays/

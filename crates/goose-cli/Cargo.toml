@@ -7,61 +7,76 @@ license.workspace = true
 repository.workspace = true
 description.workspace = true
 
+[lints]
+workspace = true
+
 [[bin]]
 name = "goose"
 path = "src/main.rs"
 
+[[bin]]
+name = "generate_manpages"
+path = "src/bin/generate_manpages.rs"
+
 [dependencies]
-goose = { path = "../goose" }
-goose-bench = { path = "../goose-bench" }
+clap_mangen = "0.2.31"
+goose = { path = "../goose", default-features = false }
+goose-acp = { path = "../goose-acp", default-features = false }
 goose-mcp = { path = "../goose-mcp" }
-mcp-client = { path = "../mcp-client" }
-mcp-server = { path = "../mcp-server" }
-mcp-core = { path = "../mcp-core" }
-clap = { version = "4.4", features = ["derive"] }
+rmcp = { workspace = true }
+clap = { workspace = true }
 cliclack = "0.3.5"
-console = "0.15.8"
-bat = "0.24.0"
-anyhow = "1.0"
-serde_json = "1.0"
-tokio = { version = "1.43", features = ["full"] }
-futures = "0.3"
-serde = { version = "1.0", features = ["derive"] }  # For serialization
-serde_yaml = "0.9"
-etcetera = "0.8.0"
-reqwest = { version = "0.12.9", features = [
-        "rustls-tls-native-roots",
-        "json",
-        "cookies",
-        "gzip",
-        "brotli",
-        "deflate",
-        "zstd",
-        "charset",
-        "http2",
-        "stream"
-    ], default-features = false }
-rand = "0.8.5"
+console = "0.16.1"
+uuid = { workspace = true }
+dotenvy = { workspace = true }
+bat = { version = "0.26.1", default-features = false, features = ["regex-onig"] }
+anyhow = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+futures = { workspace = true }
+serde = { workspace = true }
+serde_yaml = { workspace = true }
+tempfile = { workspace = true }
+etcetera = { workspace = true }
+rand = { workspace = true }
 rustyline = "15.0.0"
-tracing = "0.1"
-chrono = "0.4"
-tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json", "time"] }
-tracing-appender = "0.2"
-once_cell = "1.20.2"
+tracing = { workspace = true }
+chrono = { workspace = true }
+tracing-subscriber = { workspace = true, features = ["env-filter", "fmt", "json", "time"] }
+tracing-appender = { workspace = true }
 shlex = "1.3.0"
-async-trait = "0.1.86"
-base64 = "0.22.1"
-regex = "1.11.1"
-minijinja = "2.8.0"
-nix = { version = "0.30.1", features = ["process", "signal"] }
+async-trait = { workspace = true }
+base64 = { workspace = true }
+regex = { workspace = true }
 tar = "0.4"
+reqwest = { workspace = true, features = ["blocking", "rustls"], default-features = false }
+zip = { version = "^8.0", default-features = false, features = ["deflate"] }
+bzip2 = "0.5"
+# Web server dependencies
+axum = { workspace = true, features = ["ws", "macros"] }
+tower-http = { workspace = true, features = ["cors", "fs", "auth"] }
+http = { workspace = true }
+webbrowser = { workspace = true }
+indicatif = "0.18.1"
+tokio-util = { workspace = true, features = ["compat", "rt"] }
+anstream = "0.6.18"
+open = "5.3.2"
+url = { workspace = true }
+urlencoding = { workspace = true }
+clap_complete = "4.5.62"
+comfy-table = "7.2.2"
 
 [target.'cfg(target_os = "windows")'.dependencies]
 winapi = { version = "0.3", features = ["wincred"] }
 
+[features]
+default = ["code-mode"]
+code-mode = ["goose/code-mode", "goose-acp/code-mode"]
+cuda = ["goose/cuda"]
+# disables the update command
+disable-update = []
 
 [dev-dependencies]
-tempfile = "3"
-temp-env = { version = "0.3.6", features = ["async_closure"] }
-test-case = "3.3"
-tokio = { version = "1.43", features = ["rt", "macros"] }
+tempfile = { workspace = true }
+test-case = { workspace = true }
+tokio = { workspace = true }

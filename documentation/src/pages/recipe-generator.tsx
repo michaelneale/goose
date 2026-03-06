@@ -12,7 +12,7 @@ export default function RecipeGenerator() {
   const [activities, setActivities] = useState([]);
   const [newActivity, setNewActivity] = useState('');
   const [copied, setCopied] = useState(false);
-  const [errors, setErrors] = useState({});
+  const [errors, setErrors] = useState<{[key: string]: string}>({});
   const [outputFormat, setOutputFormat] = useState('url'); // 'url' or 'yaml'
   const [authorContact, setAuthorContact] = useState('');
   const [extensionsList, setExtensionsList] = useState([
@@ -59,7 +59,7 @@ export default function RecipeGenerator() {
 
   // Form validation
   const validateForm = useCallback(() => {
-    const newErrors = {};
+    const newErrors: {[key: string]: string} = {};
     
     if (!title.trim()) {
       newErrors.title = 'Title is required';
@@ -89,6 +89,7 @@ export default function RecipeGenerator() {
           title,
           description,
           instructions,
+          prompt: prompt.trim() || undefined,
           activities: activities.length > 0 ? activities : undefined
         };
 
@@ -170,11 +171,13 @@ instructions: ${instructions}
 
   return (
     <Layout>
-      <div className="container mx-auto px-4 py-12 max-w-4xl">
+      <div className="container mx-auto px-4 py-8 md:p-24">
 
-        <div className="mb-8">
-          <h1 className="text-4xl font-bold mb-4 text-textProminent">Recipe Generator</h1>
-          <p className="text-lg text-textSubtle">
+        <div className="pb-8 md:pb-16">
+          <h1 className="text-4xl md:text-[64px] font-medium text-textProminent">
+            Recipe Generator
+          </h1>
+          <p className="text-textProminent">
             Create a shareable Goose recipe URL that others can use to launch a session with your predefined settings.
           </p>
         </div>
@@ -270,6 +273,23 @@ instructions: ${instructions}
               {errors.instructions && <div className="text-red-500 text-sm mt-1">{errors.instructions}</div>}
             </div>
 
+            {/* Initial Prompt */}
+            <div>
+              <label htmlFor="prompt" className="block text-sm font-medium text-textStandard mb-2">
+                Initial Prompt (optional)
+              </label>
+              <textarea
+                id="prompt"
+                value={prompt}
+                onChange={(e) => setPrompt(e.target.value)}
+                className="w-full p-3 border border-borderSubtle rounded-lg bg-bgSubtle text-textStandard min-h-[100px]"
+                placeholder="Enter an initial prompt to start the conversation (optional)"
+              />
+              <div className="text-sm text-textSubtle mt-1">
+                If provided, this message will automatically start the conversation when the recipe is launched.
+              </div>
+            </div>
+
             {/* YAML-specific fields */}
             {outputFormat === 'yaml' && (
               <>
@@ -284,19 +304,6 @@ instructions: ${instructions}
                     onChange={(e) => setAuthorContact(e.target.value)}
                     className="w-full p-3 border border-borderSubtle rounded-lg bg-bgSubtle text-textStandard"
                     placeholder="Enter author contact information"
-                  />
-                </div>
-
-                <div>
-                  <label htmlFor="prompt" className="block text-sm font-medium text-textStandard mb-2">
-                    Initial Prompt (optional)
-                  </label>
-                  <textarea
-                    id="prompt"
-                    value={prompt}
-                    onChange={(e) => setPrompt(e.target.value)}
-                    className="w-full p-3 border border-borderSubtle rounded-lg bg-bgSubtle text-textStandard min-h-[100px]"
-                    placeholder="Enter an initial prompt for the recipe"
                   />
                 </div>
 

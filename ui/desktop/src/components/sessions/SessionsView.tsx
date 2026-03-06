@@ -1,98 +1,103 @@
-import React, { useState } from 'react';
-import { View, ViewOptions } from '../../App';
-import { fetchSessionDetails, type SessionDetails } from '../../sessions';
+import React, { useState, useEffect, useCallback } from 'react';
 import SessionListView from './SessionListView';
 import SessionHistoryView from './SessionHistoryView';
-import { toastError } from '../../toasts';
+import { useLocation } from 'react-router-dom';
+import { getSession, Session } from '../../api';
+import { useNavigation } from '../../hooks/useNavigation';
 
-interface SessionsViewProps {
-  setView: (view: View, viewOptions?: ViewOptions) => void;
-}
-
-const SessionsView: React.FC<SessionsViewProps> = ({ setView }) => {
-  const [selectedSession, setSelectedSession] = useState<SessionDetails | null>(null);
+const SessionsView: React.FC = () => {
+  const [selectedSession, setSelectedSession] = useState<Session | null>(null);
+  const [showSessionHistory, setShowSessionHistory] = useState(false);
   const [isLoadingSession, setIsLoadingSession] = useState(false);
   const [error, setError] = useState<string | null>(null);
-
-  const handleSelectSession = async (sessionId: string) => {
-    await loadSessionDetails(sessionId);
-  };
+  const [initialSessionId, setInitialSessionId] = useState<string | null>(null);
+  const location = useLocation();
+  const setView = useNavigation();
 
   const loadSessionDetails = async (sessionId: string) => {
     setIsLoadingSession(true);
     setError(null);
+    setShowSessionHistory(true);
     try {
-      const sessionDetails = await fetchSessionDetails(sessionId);
-      setSelectedSession(sessionDetails);
+      const response = await getSession<true>({
+        path: { session_id: sessionId },
+        throwOnError: true,
+      });
+      setSelectedSession(response.data);
     } catch (err) {
       console.error(`Failed to load session details for ${sessionId}:`, err);
       setError('Failed to load session details. Please try again later.');
       // Keep the selected session null if there's an error
       setSelectedSession(null);
-
-      toastError({
-        title: 'Failed to load session. The file may be corrupted.',
-        msg: 'Please try again later.',
-        traceback: err,
-      });
+      setShowSessionHistory(false);
     } finally {
       setIsLoadingSession(false);
+      setInitialSessionId(null);
     }
   };
+
+  const handleSelectSession = useCallback(
+    async (sessionId: string) => {
+      setView('pair', {
+        disableAnimation: true,
+        resumeSessionId: sessionId,
+      });
+    },
+    [setView]
+  );
+
+  // Check if a session ID was passed in the location state (from SessionsInsights)
+  useEffect(() => {
+    const state = location.state as { selectedSessionId?: string } | null;
+    if (state?.selectedSessionId) {
+      // Set immediate loading state to prevent flash of session list
+      setIsLoadingSession(true);
+      setInitialSessionId(state.selectedSessionId);
+      handleSelectSession(state.selectedSessionId);
+      // Clear the state to prevent reloading on navigation
+      window.history.replaceState({}, document.title);
+    }
+  }, [location.state, handleSelectSession]);
 
   const handleBackToSessions = () => {
-    setSelectedSession(null);
+    setShowSessionHistory(false);
     setError(null);
-  };
-
-  const handleResumeSession = () => {
-    if (selectedSession) {
-      console.log('Selected session object:', JSON.stringify(selectedSession, null, 2));
-
-      // Get the working directory from the session metadata
-      const workingDir = selectedSession.metadata.working_dir;
-
-      if (workingDir) {
-        console.log(
-          `Resuming session with ID: ${selectedSession.session_id}, in working dir: ${workingDir}`
-        );
-
-        // Create a new chat window with the working directory and session ID
-        window.electron.createChatWindow(
-          undefined,
-          workingDir,
-          undefined,
-          selectedSession.session_id
-        );
-      } else {
-        // Fallback if no working directory is found
-        console.error('No working directory found in session metadata');
-        // We could show a toast or alert here
-      }
-    }
   };
 
   const handleRetryLoadSession = () => {
     if (selectedSession) {
-      loadSessionDetails(selectedSession.session_id);
+      loadSessionDetails(selectedSession.id);
     }
   };
 
-  // If a session is selected, show the session history view
-  // Otherwise, show the sessions list view with a button to test shared sessions
-  return selectedSession ? (
+  // If we're loading an initial session or have a selected showSessionHistory, show the session history view
+  // Otherwise, show the sessions list view
+  return (showSessionHistory && selectedSession) || (isLoadingSession && initialSessionId) ? (
     <SessionHistoryView
-      session={selectedSession}
+      session={
+        selectedSession || {
+          id: initialSessionId || '',
+          conversation: [],
+          name: 'Loading...',
+          working_dir: '',
+          message_count: 0,
+          total_tokens: 0,
+          created_at: '',
+          updated_at: '',
+          extension_data: {},
+          user_set_name: false,
+        }
+      }
       isLoading={isLoadingSession}
       error={error}
       onBack={handleBackToSessions}
-      onResume={handleResumeSession}
       onRetry={handleRetryLoadSession}
     />
   ) : (
-    <>
-      <SessionListView setView={setView} onSelectSession={handleSelectSession} />
-    </>
+    <SessionListView
+      onSelectSession={handleSelectSession}
+      selectedSessionId={selectedSession?.id ?? null}
+    />
   );
 };
 

@@ -14,6 +14,7 @@ export class SearchHighlighter {
   private onMatchesChange?: (count: number) => void;
   private currentMatchIndex: number = -1;
   private isScrollingProgrammatically: boolean = false;
+  private highlightTimeout?: ReturnType<typeof setTimeout>;
 
   constructor(container: HTMLElement, onMatchesChange?: (count: number) => void) {
     this.container = container;
@@ -32,11 +33,11 @@ export class SearchHighlighter {
       z-index: 1;
     `;
 
-    // Find scroll container (look for our custom data attribute first, then fallback to radix)
+    // Find scroll container (look for our custom data attribute first, then fall back to radix)
+    const searchScrollArea = container.closest('[data-search-scroll-area]');
     this.scrollContainer =
-      container
-        .closest('[data-search-scroll-area]')
-        ?.querySelector('[data-radix-scroll-area-viewport]') ||
+      searchScrollArea?.querySelector('[data-radix-scroll-area-viewport]') ||
+      (searchScrollArea as HTMLElement) ||
       container.closest('[data-radix-scroll-area-viewport]');
 
     if (this.scrollContainer) {
@@ -72,12 +73,32 @@ export class SearchHighlighter {
       let shouldUpdate = false;
       for (const mutation of mutations) {
         if (mutation.type === 'childList' && mutation.addedNodes.length > 0) {
+          // Ignore mutations from our own overlay
+          if (mutation.target === this.overlay || this.overlay.contains(mutation.target as Node)) {
+            continue;
+          }
+          // Ignore mutations that only add/remove our highlight elements
+          const isOnlyHighlights = Array.from(mutation.addedNodes).every(
+            (node) =>
+              node instanceof HTMLElement &&
+              (node.classList.contains('search-highlight') ||
+                node.classList.contains('search-highlight-container'))
+          );
+          if (isOnlyHighlights) {
+            continue;
+          }
           shouldUpdate = true;
           break;
         }
       }
       if (shouldUpdate && this.currentTerm) {
-        this.highlight(this.currentTerm, this.caseSensitive);
+        // Debounce the highlight update to avoid rapid re-highlighting
+        if (this.highlightTimeout) {
+          clearTimeout(this.highlightTimeout);
+        }
+        this.highlightTimeout = setTimeout(() => {
+          this.highlight(this.currentTerm, this.caseSensitive);
+        }, 100);
       }
     });
     this.mutationObserver.observe(container, { childList: true, subtree: true });
@@ -151,8 +172,9 @@ export class SearchHighlighter {
         const scrollLeft = this.scrollContainer?.scrollLeft || 0;
 
         // Calculate the highlight position relative to the scroll container
-        const top = rect.top + scrollTop - containerRect.top;
-        const left = rect.left + scrollLeft - containerRect.left;
+        // rect.top/left are already relative to viewport, so we need to adjust for scroll container position
+        const top = rect.top - containerRect.top + scrollTop;
+        const left = rect.left - containerRect.left + scrollLeft;
 
         highlightRect.style.cssText = `
           position: absolute;
@@ -258,6 +280,9 @@ export class SearchHighlighter {
   }
 
   destroy() {
+    if (this.highlightTimeout) {
+      clearTimeout(this.highlightTimeout);
+    }
     this.resizeObserver.disconnect();
     this.mutationObserver.disconnect();
     this.overlay.remove();

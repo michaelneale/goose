@@ -1,22 +1,36 @@
 name: "Bundle Desktop (Windows)"
 
 on:
-#  push:
-#    branches: [ "main" ]
-#  pull_request:
-#    branches: [ "main" ]
+  workflow_dispatch:
   workflow_call:
     inputs:
+      version:
+        description: 'Version to build'
+        required: false
+        type: string
       signing:
         description: 'Whether to sign the Windows executable'
         required: false
         type: boolean
         default: false
+      ref:
+        description: 'Git ref to checkout'
+        required: false
+        type: string
+        default: ''
     secrets:
-      WINDOWS_CERTIFICATE:
+      WINDOWS_CODESIGN_CERTIFICATE:
         required: false
-      WINDOWS_CERTIFICATE_PASSWORD:
+      WINDOW_SIGNING_ROLE:
         required: false
+      WINDOW_SIGNING_ROLE_TAG:
+        required: false
+
+# Permissions required for OIDC authentication with AWS
+permissions:
+  id-token: write   # Required to fetch the OIDC token
+  contents: read    # Required by actions/checkout
+  actions: read     # May be needed for some workflows
 
 jobs:
   build-desktop-windows:
@@ -24,134 +38,222 @@ jobs:
     runs-on: windows-latest
 
     steps:
-      # 1) Check out source
       - name: Checkout repository
-        uses: actions/checkout@f43a0e5ff2bd294095638e18286ca9a3d1956744
-
-      # 2) Set up Rust
-      - name: Set up Rust
-        uses: dtolnay/rust-toolchain@38b70195107dddab2c7bbd522bcf763bac00963b
-        # If you need a specific version, you could do:
-        # or uses: actions/setup-rust@v1
-        # with:
-        #   rust-version: 1.73.0
-
-      # 3) Set up Node.js
-      - name: Set up Node.js
-        uses: actions/setup-node@1a4442cacd436585916779262731d5b162bc6ec7 # pin@v3
+        uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8  # v6.0.1
         with:
-          node-version: 16
+          ref: ${{ inputs.ref != '' && inputs.ref || '' }}
 
-      # 4) Cache dependencies (optional, can add more paths if needed)
+      - name: Configure AWS credentials
+        if: inputs.signing && inputs.signing == true
+        uses: aws-actions/configure-aws-credentials@61815dcd50bd041e203e49132bacad1fd04d2708  # v5.1.1
+        with:
+          role-to-assume: ${{ github.ref == 'refs/heads/main' && secrets.WINDOW_SIGNING_ROLE || secrets.WINDOW_SIGNING_ROLE_TAG }}
+          aws-region: us-west-2
+
+      - name: Set up Node.js
+        uses: actions/setup-node@6044e13b5dc448c55e2357c09f80417699197238  # v6.2.0
+        with:
+          node-version: 24.10.0
+
       - name: Cache node_modules
-        uses: actions/cache@2f8e54208210a422b2efd51efaa6bd6d7ca8920f # pin@v3
+        uses: actions/cache@8b402f58fbc84540c8b491a91e594a4576fec3d7  # v5.0.2
         with:
           path: |
             node_modules
             ui/desktop/node_modules
-          key: ${{ runner.os }}-build-desktop-windows-${{ hashFiles('**/package-lock.json') }}
+            .hermit/node/cache
+          key: windows-npm-cache-v1-${{ runner.os }}-node24-${{ hashFiles('**/package-lock.json') }}
           restore-keys: |
-            ${{ runner.os }}-build-desktop-windows-
+            windows-npm-cache-v1-${{ runner.os }}-node24-
 
-      # 5) Install top-level dependencies if a package.json is in root
-      - name: Install top-level deps
-        run: |
-          if (Test-Path package.json) {
-            npm install
-          }
-
-      # 6) Build rust for x86_64-pc-windows-gnu
-      - name: Install MinGW dependencies
-        run: |
-          choco install mingw --version=8.1.0
-          # Debug - check installation paths
-          Write-Host "Checking MinGW installation..."
-          Get-ChildItem -Path "C:\ProgramData\chocolatey\lib\mingw" -Recurse -Filter "*.dll" | ForEach-Object {
-            Write-Host $_.FullName
-          }
-          Get-ChildItem -Path "C:\tools" -Recurse -Filter "*.dll" | ForEach-Object {
-            Write-Host $_.FullName
-          }
-
-      - name: Cargo build for Windows
-        run: |
-          cargo build --release --target x86_64-pc-windows-gnu
-
-      # 7) Check that the compiled goosed.exe exists and copy exe/dll to ui/desktop/src/bin
-      - name: Prepare Windows binary and DLLs
-        run: |
-          if (!(Test-Path .\target\x86_64-pc-windows-gnu\release\goosed.exe)) {
-            Write-Error "Windows binary not found."; exit 1;
-          }
-          Write-Host "Copying Windows binary and DLLs to ui/desktop/src/bin..."
-          if (!(Test-Path ui\desktop\src\bin)) {
-            New-Item -ItemType Directory -Path ui\desktop\src\bin | Out-Null
-          }
-          Copy-Item .\target\x86_64-pc-windows-gnu\release\goosed.exe ui\desktop\src\bin\
-          
-          # Copy MinGW DLLs - try both possible locations
-          $mingwPaths = @(
-            "C:\ProgramData\chocolatey\lib\mingw\tools\install\mingw64\bin",
-            "C:\tools\mingw64\bin"
-          )
-          
-          foreach ($path in $mingwPaths) {
-            if (Test-Path "$path\libstdc++-6.dll") {
-              Write-Host "Found MinGW DLLs in $path"
-              Copy-Item "$path\libstdc++-6.dll" ui\desktop\src\bin\
-              Copy-Item "$path\libgcc_s_seh-1.dll" ui\desktop\src\bin\
-              Copy-Item "$path\libwinpthread-1.dll" ui\desktop\src\bin\
-              break
-            }
-          }
-          
-          # Copy any other DLLs from the release directory
-          ls .\target\x86_64-pc-windows-gnu\release\*.dll | ForEach-Object {
-            Copy-Item $_ ui\desktop\src\bin\
-          }
-
-      # 8) Install & build UI desktop
-      - name: Build desktop UI with npm
-        run: |
-          cd ui\desktop
-          npm install
-          npm run bundle:windows
-
-      # 9) Copy exe/dll to final out/Goose-win32-x64/resources/bin
-      - name: Copy exe/dll to out folder
-        run: |
-          cd ui\desktop
-          if (!(Test-Path .\out\Goose-win32-x64\resources\bin)) {
-            New-Item -ItemType Directory -Path .\out\Goose-win32-x64\resources\bin | Out-Null
-          }
-          Copy-Item .\src\bin\goosed.exe .\out\Goose-win32-x64\resources\bin\
-          ls .\src\bin\*.dll | ForEach-Object {
-            Copy-Item $_ .\out\Goose-win32-x64\resources\bin\
-          }
-
-      # 10) Code signing (if enabled)
-      - name: Sign Windows executable
-        # Skip this step by default - enable when we have a certificate
-        if: inputs.signing && inputs.signing == true
-        env:
-          WINDOWS_CERTIFICATE: ${{ secrets.WINDOWS_CERTIFICATE }}
-          WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
-        run: |
-          # Create a temporary certificate file
-          $certBytes = [Convert]::FromBase64String($env:WINDOWS_CERTIFICATE)
-          $certPath = Join-Path -Path $env:RUNNER_TEMP -ChildPath "certificate.pfx"
-          [IO.File]::WriteAllBytes($certPath, $certBytes)
-          
-          # Sign the main executable
-          $signtool = "C:\Program Files (x86)\Windows Kits\10\bin\10.0.17763.0\x64\signtool.exe"
-          & $signtool sign /f $certPath /p $env:WINDOWS_CERTIFICATE_PASSWORD /tr http://timestamp.digicert.com /td sha256 /fd sha256 "ui\desktop\out\Goose-win32-x64\Goose.exe"
-          
-          # Clean up the certificate
-          Remove-Item -Path $certPath
-
-      # 11) Upload the final Windows build
-      - name: Upload Windows build artifacts
-        uses: actions/upload-artifact@4cec3d8aa04e39d1a68397de0c4cd6fb9dce8ec1 # pin@v4
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
         with:
-          name: desktop-windows-dist
-          path: ui/desktop/out/Goose-win32-x64/
+          key: windows-msvc-desktop
+
+      - name: Setup Rust
+        shell: bash
+        run: |
+          rustup show
+          rustup target add x86_64-pc-windows-msvc
+
+      - name: Build Windows executable
+        shell: bash
+        run: |
+          echo "🚀 Building Windows executable..."
+          cargo build --release --target x86_64-pc-windows-msvc
+
+          # Verify build succeeded
+          if [ ! -f "./target/x86_64-pc-windows-msvc/release/goosed.exe" ]; then
+            echo "❌ Windows binary not found."
+            ls -la ./target/x86_64-pc-windows-msvc/release/ || echo "Release directory doesn't exist"
+            exit 1
+          fi
+
+          echo "✅ Windows binary found!"
+          ls -la ./target/x86_64-pc-windows-msvc/release/goosed.exe
+
+      - name: Prepare Windows binary
+        shell: bash
+        run: |
+          if [ ! -f "./target/x86_64-pc-windows-msvc/release/goosed.exe" ]; then
+            echo "Windows binary not found."
+            exit 1
+          fi
+
+          echo "Cleaning destination directory..."
+          rm -rf ./ui/desktop/src/bin
+          mkdir -p ./ui/desktop/src/bin
+
+          echo "Copying Windows binary..."
+          cp -f ./target/x86_64-pc-windows-msvc/release/goosed.exe ./ui/desktop/src/bin/
+
+          if [ -d "./ui/desktop/src/platform/windows/bin" ]; then
+            echo "Copying Windows platform files..."
+            for file in ./ui/desktop/src/platform/windows/bin/*.{exe,dll,cmd}; do
+              if [ -f "$file" ] && [ "$(basename "$file")" != "goosed.exe" ]; then
+                cp -f "$file" ./ui/desktop/src/bin/
+              fi
+            done
+
+            if [ -d "./ui/desktop/src/platform/windows/bin/goose-npm" ]; then
+              echo "Setting up npm environment..."
+              cp -r ./ui/desktop/src/platform/windows/bin/goose-npm/ ./ui/desktop/src/bin/goose-npm/
+            fi
+            echo "Windows-specific files copied successfully"
+          fi
+
+      - name: Force GitHub HTTPS for npm git dependencies
+        shell: bash
+        run: |
+          git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+          git config --global url."https://github.com/".insteadOf "git@github.com:"
+          git config --global url."https://github.com/".insteadOf "git+ssh://git@github.com/"
+
+      - name: Build desktop UI with npm
+        shell: bash
+        env:
+          ELECTRON_PLATFORM: win32
+        run: |
+          cd ui/desktop
+
+          npm install
+          node scripts/build-main.js
+          node scripts/prepare-platform-binaries.js
+          npm run make -- --platform=win32 --arch=x64
+
+      - name: Copy exe to final out folder and prepare flat distribution
+        shell: bash
+        run: |
+          cd ui/desktop
+          mkdir -p ./out/Goose-win32-x64/resources/bin
+          cp -r src/bin/* out/Goose-win32-x64/resources/bin/
+
+          mkdir -p ./dist-windows
+          cp -r ./out/Goose-win32-x64/* ./dist-windows/
+
+          echo "📋 Final flat distribution structure:"
+          ls -la ./dist-windows/
+          echo "📋 Binary files in resources/bin:"
+          ls -la ./dist-windows/resources/bin/
+
+      - name: Setup Java for signing
+        if: inputs.signing && inputs.signing == true
+        uses: actions/setup-java@c5195efecf7bdfc987ee8bae7a71cb8b11521c00  # v4.7.1
+        with:
+          distribution: 'temurin'
+          java-version: '11'
+
+      - name: Sign Windows executables with jsign + AWS KMS
+        if: inputs.signing && inputs.signing == true
+        shell: bash
+        run: |
+          set -exuo pipefail
+          echo "🔐 Starting Windows code signing with jsign + AWS KMS..."
+
+          echo "📝 Creating certificate file from GitHub secret..."
+          echo "${{ secrets.WINDOWS_CODESIGN_CERTIFICATE }}" > block-codesign-cert.pem
+
+          # Download jsign
+          echo "📥 Downloading jsign..."
+          curl -sL https://github.com/ebourg/jsign/releases/download/6.0/jsign-6.0.jar -o jsign.jar
+          echo "05ca18d4ab7b8c2183289b5378d32860f0ea0f3bdab1f1b8cae5894fb225fa8a  jsign.jar" | sha256sum -c
+
+          echo "🔐 Signing main Electron executable: Goose.exe"
+          cd ui/desktop/dist-windows/
+
+          java -jar ${GITHUB_WORKSPACE}/jsign.jar \
+            --storetype AWS \
+            --keystore us-west-2 \
+            --storepass "${AWS_ACCESS_KEY_ID}|${AWS_SECRET_ACCESS_KEY}|${AWS_SESSION_TOKEN}" \
+            --alias windows-codesign \
+            --certfile "${GITHUB_WORKSPACE}/block-codesign-cert.pem" \
+            --tsaurl "http://timestamp.digicert.com" \
+            --name "Goose" \
+            --url "https://github.com/block/goose" \
+            "Goose.exe"
+
+          echo "✅ Main executable Goose.exe signed successfully"
+
+          echo "🔐 Signing backend executable: goosed.exe"
+          cd resources/bin/
+
+          java -jar ${GITHUB_WORKSPACE}/jsign.jar \
+            --storetype AWS \
+            --keystore us-west-2 \
+            --storepass "${AWS_ACCESS_KEY_ID}|${AWS_SECRET_ACCESS_KEY}|${AWS_SESSION_TOKEN}" \
+            --alias windows-codesign \
+            --certfile "${GITHUB_WORKSPACE}/block-codesign-cert.pem" \
+            --tsaurl "http://timestamp.digicert.com" \
+            --name "Goose Backend" \
+            --url "https://github.com/block/goose" \
+            "goosed.exe"
+
+          echo "✅ Backend executable goosed.exe signed successfully"
+
+          # Show final file status
+          echo "📋 Final signed files:"
+          cd ../../
+          ls -la Goose.exe
+          sha256sum Goose.exe
+          ls -la resources/bin/goosed.exe
+          sha256sum resources/bin/goosed.exe
+
+          rm -f ${GITHUB_WORKSPACE}/block-codesign-cert.pem
+
+      - name: Verify signed executables are in final distribution
+        if: inputs.signing && inputs.signing == true
+        shell: pwsh
+        run: |
+          echo "📋 Verifying both signed executables in final distribution:"
+          echo "Main executable:"
+          Get-Item ui/desktop/dist-windows/Goose.exe
+          $sig = Get-AuthenticodeSignature ui/desktop/dist-windows/Goose.exe
+          if ($sig.Status -ne "Valid") { throw "Main executable signature invalid: $($sig.Status)" }
+          echo "✅ Main executable signature verification passed"
+
+          echo "Backend executable:"
+          Get-Item ui/desktop/dist-windows/resources/bin/goosed.exe
+          $sig = Get-AuthenticodeSignature ui/desktop/dist-windows/resources/bin/goosed.exe
+          if ($sig.Status -ne "Valid") { throw "Backend executable signature invalid: $($sig.Status)" }
+          echo "✅ Backend executable signature verification passed"
+
+      - name: Create Windows zip package
+        shell: bash
+        run: |
+          cd ui/desktop
+          echo "📦 Creating Windows zip package..."
+
+          7z a -tzip "Goose-win32-x64.zip" dist-windows/
+
+          echo "✅ Windows zip package created:"
+          ls -la Goose-win32-x64.zip
+
+          mkdir -p out/Goose-win32-x64/
+          cp Goose-win32-x64.zip out/Goose-win32-x64/
+
+      - name: Upload Windows build artifacts
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f  # v6.0.0
+        with:
+          name: Goose-win32-x64
+          path: ui/desktop/out/Goose-win32-x64/Goose-win32-x64.zip

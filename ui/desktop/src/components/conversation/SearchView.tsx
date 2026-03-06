@@ -1,8 +1,7 @@
-import React, { useState, useEffect, PropsWithChildren, useCallback } from 'react';
+import React, { useState, useEffect, PropsWithChildren, useCallback, useRef } from 'react';
 import SearchBar from './SearchBar';
 import { SearchHighlighter } from '../../utils/searchHighlighter';
-import { debounce } from 'lodash';
-import '../../styles/search.css';
+import debounce from 'lodash/debounce';
 
 /**
  * Props for the SearchView component
@@ -19,6 +18,8 @@ interface SearchViewProps {
     count: number;
     currentIndex: number;
   } | null;
+  /** Placeholder text for the search input */
+  placeholder?: string;
 }
 
 interface SearchContainerElement extends HTMLDivElement {
@@ -36,6 +37,7 @@ export const SearchView: React.FC<PropsWithChildren<SearchViewProps>> = ({
   onSearch,
   onNavigate,
   searchResults,
+  placeholder,
 }) => {
   const [isSearchVisible, setIsSearchVisible] = useState(false);
   const [initialSearchTerm, setInitialSearchTerm] = useState('');
@@ -44,7 +46,9 @@ export const SearchView: React.FC<PropsWithChildren<SearchViewProps>> = ({
     count: number;
   } | null>(null);
 
-  const searchInputRef = React.useRef<HTMLInputElement>(null);
+  const searchInputRef: React.RefObject<HTMLInputElement> = React.useRef<HTMLInputElement>(
+    null
+  ) as React.RefObject<HTMLInputElement>;
   const highlighterRef = React.useRef<SearchHighlighter | null>(null);
   const containerRef = React.useRef<SearchContainerElement | null>(null);
   const lastSearchRef = React.useRef<{ term: string; caseSensitive: boolean }>({
@@ -189,32 +193,76 @@ export const SearchView: React.FC<PropsWithChildren<SearchViewProps>> = ({
     [internalSearchResults, onNavigate]
   );
 
+  // Create stable refs for the handlers to avoid memory leaks
+  const handlersRef = useRef({
+    handleFindCommand: () => {
+      if (isSearchVisible && searchInputRef.current) {
+        searchInputRef.current.focus();
+        searchInputRef.current.select();
+      } else {
+        setIsSearchVisible(true);
+      }
+    },
+    handleFindNext: () => {
+      if (isSearchVisible) {
+        handleNavigate('next');
+      }
+    },
+    handleFindPrevious: () => {
+      if (isSearchVisible) {
+        handleNavigate('prev');
+      }
+    },
+    handleUseSelectionFind: () => {
+      const selection = window.getSelection()?.toString().trim();
+      if (selection) {
+        setInitialSearchTerm(selection);
+      }
+    },
+  });
+
+  // Update the refs with current values
+  useEffect(() => {
+    handlersRef.current.handleFindCommand = () => {
+      if (isSearchVisible && searchInputRef.current) {
+        searchInputRef.current.focus();
+        searchInputRef.current.select();
+      } else {
+        setIsSearchVisible(true);
+      }
+    };
+    handlersRef.current.handleFindNext = () => {
+      if (isSearchVisible) {
+        handleNavigate('next');
+      }
+    };
+    handlersRef.current.handleFindPrevious = () => {
+      if (isSearchVisible) {
+        handleNavigate('prev');
+      }
+    };
+    handlersRef.current.handleUseSelectionFind = () => {
+      const selection = window.getSelection()?.toString().trim();
+      if (selection) {
+        setInitialSearchTerm(selection);
+      }
+    };
+  });
+
   const handleFindCommand = useCallback(() => {
-    if (isSearchVisible && searchInputRef.current) {
-      searchInputRef.current.focus();
-      searchInputRef.current.select();
-    } else {
-      setIsSearchVisible(true);
-    }
-  }, [isSearchVisible]);
+    handlersRef.current.handleFindCommand();
+  }, []);
 
   const handleFindNext = useCallback(() => {
-    if (isSearchVisible) {
-      handleNavigate('next');
-    }
-  }, [isSearchVisible, handleNavigate]);
+    handlersRef.current.handleFindNext();
+  }, []);
 
   const handleFindPrevious = useCallback(() => {
-    if (isSearchVisible) {
-      handleNavigate('prev');
-    }
-  }, [isSearchVisible, handleNavigate]);
+    handlersRef.current.handleFindPrevious();
+  }, []);
 
   const handleUseSelectionFind = useCallback(() => {
-    const selection = window.getSelection()?.toString().trim();
-    if (selection) {
-      setInitialSearchTerm(selection);
-    }
+    handlersRef.current.handleUseSelectionFind();
   }, []);
 
   /**
@@ -231,23 +279,19 @@ export const SearchView: React.FC<PropsWithChildren<SearchViewProps>> = ({
       highlighterRef.current = null;
     }
 
-    // Cancel any pending highlight operations
-    debouncedHighlight.cancel?.();
-
     // Clear search when closing
     onSearch?.('', false);
-  }, [debouncedHighlight, onSearch]);
+  }, [onSearch]);
 
-  // Clean up highlighter and debounced functions on unmount
+  // Clean up highlighter on unmount
   useEffect(() => {
     return () => {
       if (highlighterRef.current) {
         highlighterRef.current.destroy();
         highlighterRef.current = null;
       }
-      debouncedHighlight.cancel?.();
     };
-  }, [debouncedHighlight]);
+  }, []);
 
   // Listen for keyboard events
   useEffect(() => {
@@ -312,13 +356,14 @@ export const SearchView: React.FC<PropsWithChildren<SearchViewProps>> = ({
       window.electron.off('find-previous', handleFindPrevious);
       window.electron.off('use-selection-find', handleUseSelectionFind);
     };
-  }, [handleFindCommand, handleFindNext, handleFindPrevious, handleUseSelectionFind]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []); // Empty dependency array - handlers are stable due to useCallback and useRef
 
   return (
     <div
       ref={(el) => {
         if (el) {
-          containerRef.current = el;
+          containerRef.current = el as SearchContainerElement;
           // Expose the highlighter instance
           containerRef.current._searchHighlighter = highlighterRef.current;
         }
@@ -330,9 +375,10 @@ export const SearchView: React.FC<PropsWithChildren<SearchViewProps>> = ({
           onSearch={handleSearch}
           onClose={handleCloseSearch}
           onNavigate={handleNavigate}
-          searchResults={searchResults || internalSearchResults}
+          searchResults={searchResults || internalSearchResults || undefined}
           inputRef={searchInputRef}
           initialSearchTerm={initialSearchTerm}
+          placeholder={placeholder}
         />
       )}
       {children}

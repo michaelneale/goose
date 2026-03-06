@@ -1,30 +1,24 @@
-use super::utils::verify_secret_key;
+use crate::routes::errors::ErrorResponse;
 use crate::state::AppState;
+#[cfg(test)]
+use axum::http::StatusCode;
 use axum::{
-    extract::State,
-    http::{self, HeaderMap, StatusCode},
+    extract::{DefaultBodyLimit, State},
+    http::{self},
     response::IntoResponse,
     routing::post,
     Json, Router,
 };
 use bytes::Bytes;
 use futures::{stream::StreamExt, Stream};
-use goose::{
-    agents::SessionConfig,
-    message::{Message, MessageContent},
-    permission::permission_confirmation::PrincipalType,
-};
-use goose::{
-    permission::{Permission, PermissionConfirmation},
-    session,
-};
-use mcp_core::{role::Role, Content, ToolResult};
+use goose::agents::{AgentEvent, SessionConfig};
+use goose::conversation::message::{Message, MessageContent, TokenState};
+use goose::conversation::Conversation;
+use goose::session::SessionManager;
+use rmcp::model::ServerNotification;
 use serde::{Deserialize, Serialize};
-use serde_json::json;
-use serde_json::Value;
 use std::{
     convert::Infallible,
-    path::PathBuf,
     pin::Pin,
     sync::Arc,
     task::{Context, Poll},
@@ -33,17 +27,68 @@ use std::{
 use tokio::sync::mpsc;
 use tokio::time::timeout;
 use tokio_stream::wrappers::ReceiverStream;
-use utoipa::ToSchema;
+use tokio_util::sync::CancellationToken;
 
-// Direct message serialization for the chat request
-#[derive(Debug, Deserialize)]
-struct ChatRequest {
-    messages: Vec<Message>,
-    session_id: Option<String>,
-    session_working_dir: String,
+fn track_tool_telemetry(content: &MessageContent, all_messages: &[Message]) {
+    match content {
+        MessageContent::ToolRequest(tool_request) => {
+            if let Ok(tool_call) = &tool_request.tool_call {
+                tracing::info!(monotonic_counter.goose.tool_calls = 1,
+                    tool_name = %tool_call.name,
+                    "Tool call started"
+                );
+            }
+        }
+        MessageContent::ToolResponse(tool_response) => {
+            let tool_name = all_messages
+                .iter()
+                .rev()
+                .find_map(|msg| {
+                    msg.content.iter().find_map(|c| {
+                        if let MessageContent::ToolRequest(req) = c {
+                            if req.id == tool_response.id {
+                                if let Ok(tool_call) = &req.tool_call {
+                                    Some(tool_call.name.clone())
+                                } else {
+                                    None
+                                }
+                            } else {
+                                None
+                            }
+                        } else {
+                            None
+                        }
+                    })
+                })
+                .unwrap_or_else(|| "unknown".to_string().into());
+
+            let success = tool_response.tool_result.is_ok();
+            let result_status = if success { "success" } else { "error" };
+
+            tracing::info!(
+                monotonic_counter.goose.tool_completions = 1,
+                tool_name = %tool_name,
+                result = %result_status,
+                "Tool call completed"
+            );
+        }
+        _ => {}
+    }
 }
 
-// Custom SSE response type for streaming messages
+#[derive(Debug, Deserialize, Serialize, utoipa::ToSchema)]
+pub struct ChatRequest {
+    user_message: Message,
+    /// Override the server's conversation history. Only use this when you need absolute control
+    /// over the conversation state (e.g., administrative tools). For normal operations, the server
+    /// is the source of truth - use truncate/fork endpoints to modify conversation history instead.
+    #[serde(default)]
+    override_conversation: Option<Vec<Message>>,
+    session_id: String,
+    recipe_name: Option<String>,
+    recipe_version: Option<String>,
+}
+
 pub struct SseResponse {
     rx: ReceiverStream<String>,
 }
@@ -78,173 +123,267 @@ impl IntoResponse for SseResponse {
     }
 }
 
-// Message event types for SSE streaming
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, utoipa::ToSchema)]
 #[serde(tag = "type")]
-enum MessageEvent {
-    Message { message: Message },
-    Error { error: String },
-    Finish { reason: String },
+pub enum MessageEvent {
+    Message {
+        message: Message,
+        token_state: TokenState,
+    },
+    Error {
+        error: String,
+    },
+    Finish {
+        reason: String,
+        token_state: TokenState,
+    },
+    ModelChange {
+        model: String,
+        mode: String,
+    },
+    Notification {
+        request_id: String,
+        #[schema(value_type = Object)]
+        message: ServerNotification,
+    },
+    UpdateConversation {
+        conversation: Conversation,
+    },
+    Ping,
 }
 
-// Stream a message as an SSE event
+async fn get_token_state(session_manager: &SessionManager, session_id: &str) -> TokenState {
+    session_manager
+        .get_session(session_id, false)
+        .await
+        .map(|session| TokenState {
+            input_tokens: session.input_tokens.unwrap_or(0),
+            output_tokens: session.output_tokens.unwrap_or(0),
+            total_tokens: session.total_tokens.unwrap_or(0),
+            accumulated_input_tokens: session.accumulated_input_tokens.unwrap_or(0),
+            accumulated_output_tokens: session.accumulated_output_tokens.unwrap_or(0),
+            accumulated_total_tokens: session.accumulated_total_tokens.unwrap_or(0),
+        })
+        .inspect_err(|e| {
+            tracing::warn!(
+                "Failed to fetch session token state for {}: {}",
+                session_id,
+                e
+            );
+        })
+        .unwrap_or_default()
+}
+
 async fn stream_event(
     event: MessageEvent,
     tx: &mpsc::Sender<String>,
-) -> Result<(), mpsc::error::SendError<String>> {
+    cancel_token: &CancellationToken,
+) {
     let json = serde_json::to_string(&event).unwrap_or_else(|e| {
         format!(
             r#"{{"type":"Error","error":"Failed to serialize event: {}"}}"#,
             e
         )
     });
-    tx.send(format!("data: {}\n\n", json)).await
+
+    if tx.send(format!("data: {}\n\n", json)).await.is_err() {
+        tracing::info!("client hung up");
+        cancel_token.cancel();
+    }
 }
 
-async fn handler(
+#[allow(clippy::too_many_lines)]
+#[utoipa::path(
+    post,
+    path = "/reply",
+    request_body = ChatRequest,
+    responses(
+        (status = 200, description = "Streaming response initiated",
+         body = MessageEvent,
+         content_type = "text/event-stream"),
+        (status = 424, description = "Agent not initialized"),
+        (status = 500, description = "Internal server error")
+    )
+)]
+pub async fn reply(
     State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
     Json(request): Json<ChatRequest>,
-) -> Result<SseResponse, StatusCode> {
-    verify_secret_key(&headers, &state)?;
+) -> Result<SseResponse, ErrorResponse> {
+    let session_start = std::time::Instant::now();
 
-    // Create channel for streaming
+    tracing::info!(
+        monotonic_counter.goose.session_starts = 1,
+        session_type = "app",
+        interface = "ui",
+        "Session started"
+    );
+
+    let session_id = request.session_id.clone();
+
+    if let Some(recipe_name) = request.recipe_name.clone() {
+        if state.mark_recipe_run_if_absent(&session_id).await {
+            let recipe_version = request
+                .recipe_version
+                .clone()
+                .unwrap_or_else(|| "unknown".to_string());
+
+            tracing::info!(
+                monotonic_counter.goose.recipe_runs = 1,
+                recipe_name = %recipe_name,
+                recipe_version = %recipe_version,
+                session_type = "app",
+                interface = "ui",
+                "Recipe execution started"
+            );
+        }
+    }
+
     let (tx, rx) = mpsc::channel(100);
     let stream = ReceiverStream::new(rx);
+    let cancel_token = CancellationToken::new();
 
-    let messages = request.messages;
-    let session_working_dir = request.session_working_dir;
+    let user_message = request.user_message;
+    let override_conversation = request.override_conversation;
 
-    // Generate a new session ID if not provided in the request
-    let session_id = request
-        .session_id
-        .unwrap_or_else(session::generate_session_id);
+    let task_cancel = cancel_token.clone();
+    let task_tx = tx.clone();
 
-    // Spawn task to handle streaming
-    tokio::spawn(async move {
-        let agent = state.get_agent().await;
-        let agent = match agent {
-            Ok(agent) => {
-                let provider = agent.provider().await;
-                match provider {
-                    Ok(_) => agent,
-                    Err(_) => {
-                        let _ = stream_event(
-                            MessageEvent::Error {
-                                error: "No provider configured".to_string(),
-                            },
-                            &tx,
-                        )
-                        .await;
-                        let _ = stream_event(
-                            MessageEvent::Finish {
-                                reason: "error".to_string(),
-                            },
-                            &tx,
-                        )
-                        .await;
-                        return;
-                    }
-                }
-            }
-            Err(_) => {
+    drop(tokio::spawn(async move {
+        let agent = match state.get_agent(session_id.clone()).await {
+            Ok(agent) => agent,
+            Err(e) => {
+                tracing::error!("Failed to get session agent: {}", e);
                 let _ = stream_event(
                     MessageEvent::Error {
-                        error: "No agent configured".to_string(),
+                        error: format!("Failed to get session agent: {}", e),
                     },
-                    &tx,
-                )
-                .await;
-                let _ = stream_event(
-                    MessageEvent::Finish {
-                        reason: "error".to_string(),
-                    },
-                    &tx,
+                    &task_tx,
+                    &task_cancel,
                 )
                 .await;
                 return;
             }
         };
 
-        // Get the provider first, before starting the reply stream
-        let provider = agent.provider().await;
+        let session = match state.session_manager().get_session(&session_id, true).await {
+            Ok(metadata) => metadata,
+            Err(e) => {
+                tracing::error!("Failed to read session for {}: {}", session_id, e);
+                let _ = stream_event(
+                    MessageEvent::Error {
+                        error: format!("Failed to read session: {}", e),
+                    },
+                    &task_tx,
+                    &cancel_token,
+                )
+                .await;
+                return;
+            }
+        };
+
+        let session_config = SessionConfig {
+            id: session_id.clone(),
+            schedule_id: session.schedule_id.clone(),
+            max_turns: None,
+            retry_config: None,
+        };
+
+        let mut all_messages = match override_conversation {
+            Some(history) => {
+                let conv = Conversation::new_unvalidated(history);
+                if let Err(e) = state
+                    .session_manager()
+                    .replace_conversation(&session_id, &conv)
+                    .await
+                {
+                    tracing::warn!(
+                        "Failed to replace session conversation for {}: {}",
+                        session_id,
+                        e
+                    );
+                }
+                conv
+            }
+            None => session.conversation.unwrap_or_default(),
+        };
+        all_messages.push(user_message.clone());
 
         let mut stream = match agent
             .reply(
-                &messages,
-                Some(SessionConfig {
-                    id: session::Identifier::Name(session_id.clone()),
-                    working_dir: PathBuf::from(session_working_dir),
-                }),
+                user_message.clone(),
+                session_config,
+                Some(task_cancel.clone()),
             )
             .await
         {
             Ok(stream) => stream,
             Err(e) => {
                 tracing::error!("Failed to start reply stream: {:?}", e);
-                let _ = stream_event(
+                stream_event(
                     MessageEvent::Error {
                         error: e.to_string(),
                     },
-                    &tx,
-                )
-                .await;
-                let _ = stream_event(
-                    MessageEvent::Finish {
-                        reason: "error".to_string(),
-                    },
-                    &tx,
+                    &task_tx,
+                    &cancel_token,
                 )
                 .await;
                 return;
             }
         };
 
-        // Collect all messages for storage
-        let mut all_messages = messages.clone();
-        let session_path = session::get_path(session::Identifier::Name(session_id.clone()));
-
+        let mut heartbeat_interval = tokio::time::interval(Duration::from_millis(500));
         loop {
             tokio::select! {
+                _ = task_cancel.cancelled() => {
+                    tracing::info!("Agent task cancelled");
+                    break;
+                }
+                _ = heartbeat_interval.tick() => {
+                    stream_event(MessageEvent::Ping, &tx, &cancel_token).await;
+                }
                 response = timeout(Duration::from_millis(500), stream.next()) => {
                     match response {
-                        Ok(Some(Ok(message))) => {
-                            all_messages.push(message.clone());
-                            if let Err(e) = stream_event(MessageEvent::Message { message }, &tx).await {
-                                tracing::error!("Error sending message through channel: {}", e);
-                                let _ = stream_event(
-                                    MessageEvent::Error {
-                                        error: e.to_string(),
-                                    },
-                                    &tx,
-                                ).await;
-                                break;
+                        Ok(Some(Ok(AgentEvent::Message(message)))) => {
+                            for content in &message.content {
+                                track_tool_telemetry(content, all_messages.messages());
                             }
 
-                            // Store messages and generate description in background
-                            let session_path = session_path.clone();
-                            let messages = all_messages.clone();
-                            let provider = Arc::clone(provider.as_ref().unwrap());
-                            tokio::spawn(async move {
-                                if let Err(e) = session::persist_messages(&session_path, &messages, Some(provider)).await {
-                                    tracing::error!("Failed to store session history: {:?}", e);
-                                }
-                            });
+                            all_messages.push(message.clone());
+
+                            let token_state = get_token_state(state.session_manager(), &session_id).await;
+
+                            stream_event(MessageEvent::Message { message, token_state }, &tx, &cancel_token).await;
                         }
+                        Ok(Some(Ok(AgentEvent::HistoryReplaced(new_messages)))) => {
+                            all_messages = new_messages.clone();
+                            stream_event(MessageEvent::UpdateConversation {conversation: new_messages}, &tx, &cancel_token).await;
+
+                        }
+                        Ok(Some(Ok(AgentEvent::ModelChange { model, mode }))) => {
+                            stream_event(MessageEvent::ModelChange { model, mode }, &tx, &cancel_token).await;
+                        }
+                        Ok(Some(Ok(AgentEvent::McpNotification((request_id, n))))) => {
+                            stream_event(MessageEvent::Notification{
+                                request_id: request_id.clone(),
+                                message: n,
+                            }, &tx, &cancel_token).await;
+                        }
+
                         Ok(Some(Err(e))) => {
                             tracing::error!("Error processing message: {}", e);
-                            let _ = stream_event(
+                            stream_event(
                                 MessageEvent::Error {
                                     error: e.to_string(),
                                 },
                                 &tx,
+                                &cancel_token,
                             ).await;
                             break;
                         }
                         Ok(None) => {
                             break;
                         }
-                        Err(_) => { // Heartbeat, used to detect disconnected clients
+                        Err(_) => {
                             if tx.is_closed() {
                                 break;
                             }
@@ -255,309 +394,115 @@ async fn handler(
             }
         }
 
-        // Send finish event
+        let session_duration = session_start.elapsed();
+
+        if let Ok(session) = state.session_manager().get_session(&session_id, true).await {
+            let total_tokens = session.total_tokens.unwrap_or(0);
+            tracing::info!(
+                monotonic_counter.goose.session_completions = 1,
+                session_type = "app",
+                interface = "ui",
+                exit_type = "normal",
+                duration_ms = session_duration.as_millis() as u64,
+                total_tokens = total_tokens,
+                message_count = session.message_count,
+                "Session completed"
+            );
+
+            tracing::info!(
+                monotonic_counter.goose.session_duration_ms = session_duration.as_millis() as u64,
+                session_type = "app",
+                interface = "ui",
+                "Session duration"
+            );
+
+            if total_tokens > 0 {
+                tracing::info!(
+                    monotonic_counter.goose.session_tokens = total_tokens,
+                    session_type = "app",
+                    interface = "ui",
+                    "Session tokens"
+                );
+            }
+        } else {
+            tracing::info!(
+                monotonic_counter.goose.session_completions = 1,
+                session_type = "app",
+                interface = "ui",
+                exit_type = "normal",
+                duration_ms = session_duration.as_millis() as u64,
+                total_tokens = 0u64,
+                message_count = all_messages.len(),
+                "Session completed"
+            );
+
+            tracing::info!(
+                monotonic_counter.goose.session_duration_ms = session_duration.as_millis() as u64,
+                session_type = "app",
+                interface = "ui",
+                "Session duration"
+            );
+        }
+
+        let final_token_state = get_token_state(state.session_manager(), &session_id).await;
+
         let _ = stream_event(
             MessageEvent::Finish {
                 reason: "stop".to_string(),
+                token_state: final_token_state,
             },
-            &tx,
+            &task_tx,
+            &cancel_token,
         )
         .await;
-    });
-
+    }));
     Ok(SseResponse::new(stream))
 }
 
-#[derive(Debug, Deserialize, Serialize)]
-struct AskRequest {
-    prompt: String,
-    session_id: Option<String>,
-    session_working_dir: String,
-}
-
-#[derive(Debug, Serialize)]
-struct AskResponse {
-    response: String,
-}
-
-// Simple ask an AI for a response, non streaming
-async fn ask_handler(
-    State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-    Json(request): Json<AskRequest>,
-) -> Result<Json<AskResponse>, StatusCode> {
-    verify_secret_key(&headers, &state)?;
-
-    let session_working_dir = request.session_working_dir;
-
-    // Generate a new session ID if not provided in the request
-    let session_id = request
-        .session_id
-        .unwrap_or_else(session::generate_session_id);
-
-    let agent = state
-        .get_agent()
-        .await
-        .map_err(|_| StatusCode::PRECONDITION_FAILED)?;
-
-    // Get the provider first, before starting the reply stream
-    let provider = agent.provider().await;
-
-    // Create a single message for the prompt
-    let messages = vec![Message::user().with_text(request.prompt)];
-
-    // Get response from agent
-    let mut response_text = String::new();
-    let mut stream = match agent
-        .reply(
-            &messages,
-            Some(SessionConfig {
-                id: session::Identifier::Name(session_id.clone()),
-                working_dir: PathBuf::from(session_working_dir),
-            }),
-        )
-        .await
-    {
-        Ok(stream) => stream,
-        Err(e) => {
-            tracing::error!("Failed to start reply stream: {:?}", e);
-            return Err(StatusCode::INTERNAL_SERVER_ERROR);
-        }
-    };
-
-    // Collect all messages for storage
-    let mut all_messages = messages.clone();
-    let mut response_message = Message::assistant();
-
-    while let Some(response) = stream.next().await {
-        match response {
-            Ok(message) => {
-                if message.role == Role::Assistant {
-                    for content in &message.content {
-                        if let MessageContent::Text(text) = content {
-                            response_text.push_str(&text.text);
-                            response_text.push('\n');
-                        }
-                        response_message.content.push(content.clone());
-                    }
-                }
-            }
-            Err(e) => {
-                tracing::error!("Error processing as_ai message: {}", e);
-                return Err(StatusCode::INTERNAL_SERVER_ERROR);
-            }
-        }
-    }
-
-    // Add the complete response message to the conversation history
-    if !response_message.content.is_empty() {
-        all_messages.push(response_message);
-    }
-
-    // Get the session path - file will be created when needed
-    let session_path = session::get_path(session::Identifier::Name(session_id.clone()));
-
-    // Store messages and generate description in background
-    let session_path = session_path.clone();
-    let messages = all_messages.clone();
-    let provider = Arc::clone(provider.as_ref().unwrap());
-    tokio::spawn(async move {
-        if let Err(e) = session::persist_messages(&session_path, &messages, Some(provider)).await {
-            tracing::error!("Failed to store session history: {:?}", e);
-        }
-    });
-
-    Ok(Json(AskResponse {
-        response: response_text.trim().to_string(),
-    }))
-}
-
-#[derive(Debug, Deserialize, Serialize, ToSchema)]
-pub struct PermissionConfirmationRequest {
-    id: String,
-    #[serde(default = "default_principal_type")]
-    principal_type: PrincipalType,
-    action: String,
-}
-
-fn default_principal_type() -> PrincipalType {
-    PrincipalType::Tool
-}
-
-#[utoipa::path(
-    post,
-    path = "/confirm",
-    request_body = PermissionConfirmationRequest,
-    responses(
-        (status = 200, description = "Permission action is confirmed", body = Value),
-        (status = 401, description = "Unauthorized - invalid secret key"),
-        (status = 500, description = "Internal server error")
-    )
-)]
-pub async fn confirm_permission(
-    State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-    Json(request): Json<PermissionConfirmationRequest>,
-) -> Result<Json<Value>, StatusCode> {
-    verify_secret_key(&headers, &state)?;
-
-    let agent = state
-        .get_agent()
-        .await
-        .map_err(|_| StatusCode::PRECONDITION_FAILED)?;
-
-    let permission = match request.action.as_str() {
-        "always_allow" => Permission::AlwaysAllow,
-        "allow_once" => Permission::AllowOnce,
-        "deny" => Permission::DenyOnce,
-        _ => Permission::DenyOnce,
-    };
-
-    agent
-        .handle_confirmation(
-            request.id.clone(),
-            PermissionConfirmation {
-                principal_type: request.principal_type,
-                permission,
-            },
-        )
-        .await;
-    Ok(Json(Value::Object(serde_json::Map::new())))
-}
-
-#[derive(Debug, Deserialize)]
-struct ToolResultRequest {
-    id: String,
-    result: ToolResult<Vec<Content>>,
-}
-
-async fn submit_tool_result(
-    State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-    raw: axum::extract::Json<serde_json::Value>,
-) -> Result<Json<Value>, StatusCode> {
-    verify_secret_key(&headers, &state)?;
-
-    // Log the raw request for debugging
-    tracing::info!(
-        "Received tool result request: {}",
-        serde_json::to_string_pretty(&raw.0).unwrap()
-    );
-
-    // Try to parse into our struct
-    let payload: ToolResultRequest = match serde_json::from_value(raw.0.clone()) {
-        Ok(req) => req,
-        Err(e) => {
-            tracing::error!("Failed to parse tool result request: {}", e);
-            tracing::error!(
-                "Raw request was: {}",
-                serde_json::to_string_pretty(&raw.0).unwrap()
-            );
-            return Err(StatusCode::UNPROCESSABLE_ENTITY);
-        }
-    };
-
-    let agent = state
-        .get_agent()
-        .await
-        .map_err(|_| StatusCode::PRECONDITION_FAILED)?;
-    agent.handle_tool_result(payload.id, payload.result).await;
-    Ok(Json(json!({"status": "ok"})))
-}
-
-// Configure routes for this module
 pub fn routes(state: Arc<AppState>) -> Router {
     Router::new()
-        .route("/reply", post(handler))
-        .route("/ask", post(ask_handler))
-        .route("/confirm", post(confirm_permission))
-        .route("/tool_result", post(submit_tool_result))
+        .route(
+            "/reply",
+            post(reply).layer(DefaultBodyLimit::max(50 * 1024 * 1024)),
+        )
         .with_state(state)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use goose::{
-        agents::Agent,
-        model::ModelConfig,
-        providers::{
-            base::{Provider, ProviderUsage, Usage},
-            errors::ProviderError,
-        },
-    };
-    use mcp_core::tool::Tool;
-
-    // Mock Provider implementation for testing
-    #[derive(Clone)]
-    struct MockProvider {
-        model_config: ModelConfig,
-    }
-
-    #[async_trait::async_trait]
-    impl Provider for MockProvider {
-        fn metadata() -> goose::providers::base::ProviderMetadata {
-            goose::providers::base::ProviderMetadata::empty()
-        }
-
-        fn get_model_config(&self) -> ModelConfig {
-            self.model_config.clone()
-        }
-
-        async fn complete(
-            &self,
-            _system: &str,
-            _messages: &[Message],
-            _tools: &[Tool],
-        ) -> anyhow::Result<(Message, ProviderUsage), ProviderError> {
-            Ok((
-                Message::assistant().with_text("Mock response"),
-                ProviderUsage::new("mock".to_string(), Usage::default()),
-            ))
-        }
-    }
 
     mod integration_tests {
         use super::*;
         use axum::{body::Body, http::Request};
-        use std::sync::Arc;
+        use goose::conversation::message::Message;
         use tower::ServiceExt;
 
-        // This test requires tokio runtime
-        #[tokio::test]
-        async fn test_ask_endpoint() {
-            // Create a mock app state with mock provider
-            let mock_model_config = ModelConfig::new("test-model".to_string());
-            let mock_provider = Arc::new(MockProvider {
-                model_config: mock_model_config,
-            });
-            let agent = Agent::new();
-            let _ = agent.update_provider(mock_provider).await;
-            let state = AppState::new(Arc::new(agent), "test-secret".to_string()).await;
+        #[tokio::test(flavor = "multi_thread")]
+        async fn test_reply_endpoint() {
+            let state = AppState::new().await.unwrap();
 
-            // Build router
             let app = routes(state);
 
-            // Create request
             let request = Request::builder()
-                .uri("/ask")
+                .uri("/reply")
                 .method("POST")
                 .header("content-type", "application/json")
                 .header("x-secret-key", "test-secret")
                 .body(Body::from(
-                    serde_json::to_string(&AskRequest {
-                        prompt: "test prompt".to_string(),
-                        session_id: Some("test-session".to_string()),
-                        session_working_dir: "test-working-dir".to_string(),
+                    serde_json::to_string(&ChatRequest {
+                        user_message: Message::user().with_text("test message"),
+                        override_conversation: None,
+                        session_id: "test-session".to_string(),
+                        recipe_name: None,
+                        recipe_version: None,
                     })
                     .unwrap(),
                 ))
                 .unwrap();
 
-            // Send request
             let response = app.oneshot(request).await.unwrap();
 
-            // Assert response status
             assert_eq!(response.status(), StatusCode::OK);
         }
     }

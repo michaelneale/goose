@@ -1,72 +1,232 @@
+import type { OpenDialogOptions, OpenDialogReturnValue } from 'electron';
 import {
   app,
-  session,
+  App,
   BrowserWindow,
   dialog,
+  globalShortcut,
   ipcMain,
   Menu,
   MenuItem,
+  net,
   Notification,
   powerSaveBlocker,
+  screen,
+  session,
+  shell,
   Tray,
-  App,
-  globalShortcut,
 } from 'electron';
+import { pathToFileURL, format as formatUrl, URLSearchParams } from 'node:url';
 import { Buffer } from 'node:buffer';
+import fs from 'node:fs/promises';
+import fsSync from 'node:fs';
 import started from 'electron-squirrel-startup';
 import path from 'node:path';
+import os from 'node:os';
 import { spawn } from 'child_process';
 import 'dotenv/config';
+import { checkServerStatus } from './goosed';
 import { startGoosed } from './goosed';
-import { getBinaryPath } from './utils/binaryPath';
-import { loadShellEnv } from './utils/loadEnv';
+import { createClient, createConfig } from './api/client';
+import { expandTilde } from './utils/pathUtils';
 import log from './utils/logger';
+import { ensureWinShims } from './utils/winShims';
 import { addRecentDir, loadRecentDirs } from './utils/recentDirs';
-import {
-  createEnvironmentMenu,
-  EnvToggles,
-  loadSettings,
-  saveSettings,
-  updateEnvironmentVariables,
-} from './utils/settings';
+import { formatAppName, errorMessage, formatErrorForLogging } from './utils/conversionUtils';
+import type { Settings, SettingKey } from './utils/settings';
+import { defaultSettings, getKeyboardShortcuts } from './utils/settings';
 import * as crypto from 'crypto';
-import * as electron from 'electron';
 import * as yaml from 'yaml';
+import windowStateKeeper from 'electron-window-state';
+import {
+  getUpdateAvailable,
+  registerUpdateIpcHandlers,
+  setTrayRef,
+  setupAutoUpdater,
+  updateTrayMenu,
+} from './utils/autoUpdater';
+import { UPDATES_ENABLED } from './updates';
+import './utils/recipeHash';
+import { Client } from './api/client';
+import { GooseApp } from './api';
+import installExtension, { REACT_DEVELOPER_TOOLS } from 'electron-devtools-installer';
+import { BLOCKED_PROTOCOLS, WEB_PROTOCOLS } from './utils/urlSecurity';
+
+function shouldSetupUpdater(): boolean {
+  // Setup updater if either the flag is enabled OR dev updates are enabled
+  return UPDATES_ENABLED || process.env.ENABLE_DEV_UPDATES === 'true';
+}
+
+// Settings management
+const SETTINGS_FILE = path.join(app.getPath('userData'), 'settings.json');
+
+function getSettings(): Settings {
+  if (fsSync.existsSync(SETTINGS_FILE)) {
+    const data = fsSync.readFileSync(SETTINGS_FILE, 'utf8');
+    const stored = JSON.parse(data) as Partial<Settings>;
+    // Deep merge to ensure nested objects get their defaults too
+    return {
+      ...defaultSettings,
+      ...stored,
+      externalGoosed: {
+        ...defaultSettings.externalGoosed,
+        ...(stored.externalGoosed ?? {}),
+      },
+      keyboardShortcuts: {
+        ...defaultSettings.keyboardShortcuts,
+        ...(stored.keyboardShortcuts ?? {}),
+      },
+      sessionSharing: {
+        ...defaultSettings.sessionSharing,
+        ...(stored.sessionSharing ?? {}),
+      },
+    };
+  }
+  return defaultSettings;
+}
+
+function updateSettings(modifier: (settings: Settings) => void): void {
+  const settings = getSettings();
+  modifier(settings);
+  fsSync.writeFileSync(SETTINGS_FILE, JSON.stringify(settings, null, 2));
+}
+
+async function configureProxy() {
+  const httpsProxy = process.env.HTTPS_PROXY || process.env.https_proxy;
+  const httpProxy = process.env.HTTP_PROXY || process.env.http_proxy;
+  const noProxy = process.env.NO_PROXY || process.env.no_proxy || '';
+
+  const proxyUrl = httpsProxy || httpProxy;
+
+  if (proxyUrl) {
+    console.log('[Main] Configuring proxy');
+    await session.defaultSession.setProxy({
+      proxyRules: proxyUrl,
+      proxyBypassRules: noProxy,
+    });
+    console.log('[Main] Proxy configured successfully');
+  }
+}
 
 if (started) app.quit();
 
-app.setAsDefaultProtocolClient('goose');
+// Accept self-signed certificates from the local goosed server.
+// Both certificate-error (renderer) and setCertificateVerifyProc (main-process
+// net.fetch) pin to the exact cert fingerprint emitted by goosed at startup.
+// Before the fingerprint is available (during the health-check bootstrap
+// window) any localhost cert is accepted so the server can come up.
+let pinnedCertFingerprint: string | null = null;
 
-// Only apply single instance lock on Windows where it's needed for deep links
+function isLocalhost(hostname: string): boolean {
+  return hostname === '127.0.0.1' || hostname === 'localhost';
+}
+
+function normalizeFingerprint(fp: string): string {
+  if (fp.startsWith('sha256/')) {
+    const b64 = fp.slice('sha256/'.length);
+    const buf = Buffer.from(b64, 'base64');
+    return Array.from(buf)
+      .map((b) => b.toString(16).padStart(2, '0'))
+      .join(':')
+      .toUpperCase();
+  }
+  return fp.toUpperCase();
+}
+
+// Renderer requests: pin to the exact cert goosed generated once known.
+// Before the fingerprint is available (during the health-check bootstrap
+// window) any localhost cert is accepted so the server can come up.
+app.on('certificate-error', (event, _webContents, url, _error, certificate, callback) => {
+  const parsed = new URL(url);
+  if (!isLocalhost(parsed.hostname)) {
+    callback(false);
+    return;
+  }
+  if (pinnedCertFingerprint) {
+    const match =
+      normalizeFingerprint(certificate.fingerprint) === pinnedCertFingerprint.toUpperCase();
+    event.preventDefault();
+    callback(match);
+  } else {
+    event.preventDefault();
+    callback(true);
+  }
+});
+
+// Main-process net.fetch: pin to the exact cert goosed generated.
+app.whenReady().then(() => {
+  session.defaultSession.setCertificateVerifyProc((request, callback) => {
+    if (!isLocalhost(request.hostname)) {
+      callback(-3);
+      return;
+    }
+    if (!pinnedCertFingerprint) {
+      callback(0);
+      return;
+    }
+    const match =
+      normalizeFingerprint(request.certificate.fingerprint) === pinnedCertFingerprint.toUpperCase();
+    callback(match ? 0 : -3);
+  });
+});
+
+if (process.env.ENABLE_PLAYWRIGHT) {
+  const debugPort = process.env.PLAYWRIGHT_DEBUG_PORT || '9222';
+  console.log(`[Main] Enabling Playwright remote debugging on port ${debugPort}`);
+  app.commandLine.appendSwitch('remote-debugging-port', debugPort);
+}
+
+// In development mode, force registration as the default protocol client
+// In production, register normally
+if (MAIN_WINDOW_VITE_DEV_SERVER_URL) {
+  // Development mode - force registration
+  console.log('[Main] Development mode: Forcing protocol registration for goose://');
+  app.setAsDefaultProtocolClient('goose');
+
+  if (process.platform === 'darwin') {
+    try {
+      // Reset the default handler to ensure dev version takes precedence
+      spawn('open', ['-a', process.execPath, '--args', '--reset-protocol-handler', 'goose'], {
+        detached: true,
+        stdio: 'ignore',
+      });
+    } catch {
+      console.warn('[Main] Could not reset protocol handler');
+    }
+  }
+} else {
+  // Production mode - normal registration
+  app.setAsDefaultProtocolClient('goose');
+}
+
+// Apply single instance lock on Windows and Linux where it's needed for deep links
+// macOS uses the 'open-url' event instead
 let gotTheLock = true;
-if (process.platform === 'win32') {
+if (process.platform !== 'darwin') {
   gotTheLock = app.requestSingleInstanceLock();
 
   if (!gotTheLock) {
     app.quit();
   } else {
-    app.on('second-instance', (event, commandLine) => {
+    app.on('second-instance', (_event, commandLine) => {
       const protocolUrl = commandLine.find((arg) => arg.startsWith('goose://'));
       if (protocolUrl) {
         const parsedUrl = new URL(protocolUrl);
-
         // If it's a bot/recipe URL, handle it directly by creating a new window
         if (parsedUrl.hostname === 'bot' || parsedUrl.hostname === 'recipe') {
-          app.whenReady().then(() => {
+          app.whenReady().then(async () => {
             const recentDirs = loadRecentDirs();
             const openDir = recentDirs.length > 0 ? recentDirs[0] : null;
 
-            let recipeConfig = null;
-            const configParam = parsedUrl.searchParams.get('config');
-            if (configParam) {
-              try {
-                recipeConfig = JSON.parse(Buffer.from(configParam, 'base64').toString('utf-8'));
-              } catch (e) {
-                console.error('Failed to parse bot config:', e);
-              }
-            }
+            const deeplinkData = parseRecipeDeeplink(protocolUrl);
+            const scheduledJobId = parsedUrl.searchParams.get('scheduledJob');
 
-            createChat(app, undefined, openDir, undefined, undefined, recipeConfig);
+            await createChat(app, {
+              dir: openDir || undefined,
+              recipeDeeplink: deeplinkData?.config,
+              scheduledJobId: scheduledJobId || undefined,
+              recipeParameters: deeplinkData?.parameters,
+            });
           });
           return; // Skip the rest of the handler
         }
@@ -87,7 +247,7 @@ if (process.platform === 'win32') {
     });
   }
 
-  // Handle protocol URLs on Windows startup
+  // Handle protocol URLs on Windows and Linux startup
   const protocolUrl = process.argv.find((arg) => arg.startsWith('goose://'));
   if (protocolUrl) {
     app.whenReady().then(() => {
@@ -97,7 +257,8 @@ if (process.platform === 'win32') {
 }
 
 let firstOpenWindow: BrowserWindow;
-let pendingDeepLink = null;
+let pendingDeepLink: string | null = null;
+let openUrlHandledLaunch = false;
 
 async function handleProtocolUrl(url: string) {
   if (!url) return;
@@ -109,9 +270,13 @@ async function handleProtocolUrl(url: string) {
   const openDir = recentDirs.length > 0 ? recentDirs[0] : null;
 
   if (parsedUrl.hostname === 'bot' || parsedUrl.hostname === 'recipe') {
-    // For bot/recipe URLs, skip existing window processing
-    // and let processProtocolUrl handle it entirely
-    processProtocolUrl(parsedUrl, null);
+    // For bot/recipe URLs, get existing window or create new one
+    const existingWindows = BrowserWindow.getAllWindows();
+    const targetWindow =
+      existingWindows.length > 0
+        ? existingWindows[0]
+        : await createChat(app, { dir: openDir || undefined });
+    await processProtocolUrl(parsedUrl, targetWindow);
   } else {
     // For other URL types, reuse existing window if available
     const existingWindows = BrowserWindow.getAllWindows();
@@ -122,23 +287,23 @@ async function handleProtocolUrl(url: string) {
       }
       firstOpenWindow.focus();
     } else {
-      firstOpenWindow = await createChat(app, undefined, openDir);
+      firstOpenWindow = await createChat(app, { dir: openDir || undefined });
     }
 
     if (firstOpenWindow) {
       const webContents = firstOpenWindow.webContents;
       if (webContents.isLoadingMainFrame()) {
-        webContents.once('did-finish-load', () => {
-          processProtocolUrl(parsedUrl, firstOpenWindow);
+        webContents.once('did-finish-load', async () => {
+          await processProtocolUrl(parsedUrl, firstOpenWindow);
         });
       } else {
-        processProtocolUrl(parsedUrl, firstOpenWindow);
+        await processProtocolUrl(parsedUrl, firstOpenWindow);
       }
     }
   }
 }
 
-function processProtocolUrl(parsedUrl: URL, window: BrowserWindow) {
+async function processProtocolUrl(parsedUrl: URL, window: BrowserWindow) {
   const recentDirs = loadRecentDirs();
   const openDir = recentDirs.length > 0 ? recentDirs[0] : null;
 
@@ -147,75 +312,156 @@ function processProtocolUrl(parsedUrl: URL, window: BrowserWindow) {
   } else if (parsedUrl.hostname === 'sessions') {
     window.webContents.send('open-shared-session', pendingDeepLink);
   } else if (parsedUrl.hostname === 'bot' || parsedUrl.hostname === 'recipe') {
-    let recipeConfig = null;
-    const configParam = parsedUrl.searchParams.get('config');
-    if (configParam) {
-      try {
-        recipeConfig = JSON.parse(Buffer.from(configParam, 'base64').toString('utf-8'));
-      } catch (e) {
-        console.error('Failed to parse bot config:', e);
-      }
-    }
+    const deeplinkData = parseRecipeDeeplink(pendingDeepLink ?? parsedUrl.toString());
+    const scheduledJobId = parsedUrl.searchParams.get('scheduledJob');
+
     // Create a new window and ignore the passed-in window
-    createChat(app, undefined, openDir, undefined, undefined, recipeConfig);
+    await createChat(app, {
+      dir: openDir || undefined,
+      recipeDeeplink: deeplinkData?.config,
+      scheduledJobId: scheduledJobId || undefined,
+      recipeParameters: deeplinkData?.parameters,
+    });
+    pendingDeepLink = null;
   }
-  pendingDeepLink = null;
 }
 
-app.on('open-url', async (event, url) => {
+let windowDeeplinkURL: string | null = null;
+
+app.on('open-url', async (_event, url) => {
   if (process.platform !== 'win32') {
     const parsedUrl = new URL(url);
+
+    log.info('[Main] Received open-url event:', url);
+
+    await app.whenReady();
+
     const recentDirs = loadRecentDirs();
     const openDir = recentDirs.length > 0 ? recentDirs[0] : null;
 
     // Handle bot/recipe URLs by directly creating a new window
     if (parsedUrl.hostname === 'bot' || parsedUrl.hostname === 'recipe') {
-      let recipeConfig = null;
-      const configParam = parsedUrl.searchParams.get('config');
-      if (configParam) {
-        try {
-          recipeConfig = JSON.parse(Buffer.from(configParam, 'base64').toString('utf-8'));
-        } catch (e) {
-          console.error('Failed to parse bot config:', e);
-        }
+      log.info('[Main] Detected bot/recipe URL, creating new chat window');
+      openUrlHandledLaunch = true;
+      const deeplinkData = parseRecipeDeeplink(url);
+      if (deeplinkData) {
+        windowDeeplinkURL = url;
       }
+      const scheduledJobId = parsedUrl.searchParams.get('scheduledJob');
 
-      // Create a new window directly
-      await createChat(app, undefined, openDir, undefined, undefined, recipeConfig);
-      return; // Skip the rest of the handler
+      await createChat(app, {
+        dir: openDir || undefined,
+        recipeDeeplink: deeplinkData?.config,
+        scheduledJobId: scheduledJobId || undefined,
+        recipeParameters: deeplinkData?.parameters,
+      });
+      windowDeeplinkURL = null;
+      return;
     }
 
-    // For non-bot URLs, continue with normal handling
+    // For extension/session URLs, store the deep link for processing after React is ready
     pendingDeepLink = url;
+    log.info('[Main] Stored pending deep link for processing after React ready:', url);
 
     const existingWindows = BrowserWindow.getAllWindows();
     if (existingWindows.length > 0) {
       firstOpenWindow = existingWindows[0];
       if (firstOpenWindow.isMinimized()) firstOpenWindow.restore();
       firstOpenWindow.focus();
+      if (parsedUrl.hostname === 'extension') {
+        firstOpenWindow.webContents.send('add-extension', pendingDeepLink);
+        pendingDeepLink = null;
+      } else if (parsedUrl.hostname === 'sessions') {
+        firstOpenWindow.webContents.send('open-shared-session', pendingDeepLink);
+        pendingDeepLink = null;
+      }
     } else {
-      firstOpenWindow = await createChat(app, undefined, openDir);
-    }
-
-    if (parsedUrl.hostname === 'extension') {
-      firstOpenWindow.webContents.send('add-extension', pendingDeepLink);
-    } else if (parsedUrl.hostname === 'sessions') {
-      firstOpenWindow.webContents.send('open-shared-session', pendingDeepLink);
+      openUrlHandledLaunch = true;
+      firstOpenWindow = await createChat(app, { dir: openDir || undefined });
     }
   }
 });
 
+// Handle macOS drag-and-drop onto dock icon
+app.on('will-finish-launching', () => {
+  if (process.platform === 'darwin') {
+    app.setAboutPanelOptions({
+      applicationName: 'Goose',
+      applicationVersion: app.getVersion(),
+    });
+  }
+});
+
+// Handle drag-and-drop onto dock icon
+app.on('open-file', async (event, filePath) => {
+  event.preventDefault();
+  await handleFileOpen(filePath);
+});
+
+// Handle multiple files/folders (macOS only)
+if (process.platform === 'darwin') {
+  // Use type assertion for non-standard Electron event
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  app.on('open-files' as any, async (event: any, filePaths: string[]) => {
+    event.preventDefault();
+    for (const filePath of filePaths) {
+      await handleFileOpen(filePath);
+    }
+  });
+}
+
+async function handleFileOpen(filePath: string) {
+  try {
+    if (!filePath || typeof filePath !== 'string') {
+      return;
+    }
+
+    const stats = fsSync.lstatSync(filePath);
+    let targetDir = filePath;
+
+    // If it's a file, use its parent directory
+    if (stats.isFile()) {
+      targetDir = path.dirname(filePath);
+    }
+
+    // Add to recent directories
+    addRecentDir(targetDir);
+
+    // Create new window for the directory
+    const newWindow = await createChat(app, { dir: targetDir });
+
+    // Focus the new window
+    if (newWindow) {
+      newWindow.show();
+      newWindow.focus();
+      newWindow.moveTop();
+    }
+  } catch (error) {
+    console.error('Failed to handle file open:', error);
+
+    // Show user-friendly error notification
+    new Notification({
+      title: 'Goose',
+      body: `Could not open directory: ${path.basename(filePath)}`,
+    }).show();
+  }
+}
+
 declare var MAIN_WINDOW_VITE_DEV_SERVER_URL: string;
 declare var MAIN_WINDOW_VITE_NAME: string;
 
-// State for environment variable toggles
-let envToggles: EnvToggles = loadSettings().envToggles;
+function getAppUrl(): URL {
+  return MAIN_WINDOW_VITE_DEV_SERVER_URL
+    ? new URL(MAIN_WINDOW_VITE_DEV_SERVER_URL)
+    : pathToFileURL(path.join(__dirname, `../renderer/${MAIN_WINDOW_VITE_NAME}/index.html`));
+}
 
 // Parse command line arguments
 const parseArgs = () => {
-  const args = process.argv.slice(2); // Remove first two elements (electron and script path)
   let dirPath = null;
 
+  // Remove first two elements in dev mode (electron and script path)
+  const args = !dirPath && app.isPackaged ? process.argv : process.argv.slice(2);
   for (let i = 0; i < args.length; i++) {
     if (args[i] === '--dir' && i + 1 < args.length) {
       dirPath = args[i + 1];
@@ -226,249 +472,350 @@ const parseArgs = () => {
   return { dirPath };
 };
 
-const getGooseProvider = () => {
-  loadShellEnv(app.isPackaged);
+interface BundledConfig {
+  defaultProvider?: string;
+  defaultModel?: string;
+  predefinedModels?: string;
+  baseUrlShare?: string;
+  version?: string;
+}
+
+const getBundledConfig = (): BundledConfig => {
   //{env-macro-start}//
   //needed when goose is bundled for a specific provider
   //{env-macro-end}//
-  return [process.env.GOOSE_DEFAULT_PROVIDER, process.env.GOOSE_DEFAULT_MODEL];
+  return {
+    defaultProvider: process.env.GOOSE_DEFAULT_PROVIDER,
+    defaultModel: process.env.GOOSE_DEFAULT_MODEL,
+    predefinedModels: process.env.GOOSE_PREDEFINED_MODELS,
+    baseUrlShare: process.env.GOOSE_BASE_URL_SHARE,
+    version: process.env.GOOSE_VERSION,
+  };
 };
 
-const generateSecretKey = () => {
-  const key = crypto.randomBytes(32).toString('hex');
-  process.env.GOOSE_SERVER__SECRET_KEY = key;
-  return key;
+const { defaultProvider, defaultModel, predefinedModels, baseUrlShare, version } =
+  getBundledConfig();
+
+const GENERATED_SECRET = crypto.randomBytes(32).toString('hex');
+
+const getServerSecret = (settings: Settings): string => {
+  if (settings.externalGoosed?.enabled && settings.externalGoosed.secret) {
+    return settings.externalGoosed.secret;
+  }
+  if (process.env.GOOSE_EXTERNAL_BACKEND) {
+    return 'test';
+  }
+  return GENERATED_SECRET;
 };
-
-const getSharingUrl = () => {
-  // checks app env for sharing url
-  loadShellEnv(app.isPackaged); // will try to take it from the zshrc file
-  // if GOOSE_BASE_URL_SHARE is found, we will set process.env.GOOSE_BASE_URL_SHARE, otherwise we return what it is set
-  // to in the env at bundle time
-  return process.env.GOOSE_BASE_URL_SHARE;
-};
-
-const getVersion = () => {
-  // checks app env for sharing url
-  loadShellEnv(app.isPackaged); // will try to take it from the zshrc file
-  // to in the env at bundle time
-  return process.env.GOOSE_VERSION;
-};
-
-let [provider, model] = getGooseProvider();
-console.log('[main] Got provider and model:', { provider, model });
-
-let sharingUrl = getSharingUrl();
-
-let gooseVersion = getVersion();
 
 let appConfig = {
-  GOOSE_DEFAULT_PROVIDER: provider,
-  GOOSE_DEFAULT_MODEL: model,
-  GOOSE_API_HOST: 'http://127.0.0.1',
-  GOOSE_PORT: 0,
+  GOOSE_DEFAULT_PROVIDER: defaultProvider,
+  GOOSE_DEFAULT_MODEL: defaultModel,
+  GOOSE_PREDEFINED_MODELS: predefinedModels,
+  GOOSE_API_HOST: 'https://localhost',
   GOOSE_WORKING_DIR: '',
   // If GOOSE_ALLOWLIST_WARNING env var is not set, defaults to false (strict blocking mode)
   GOOSE_ALLOWLIST_WARNING: process.env.GOOSE_ALLOWLIST_WARNING === 'true',
-  secretKey: generateSecretKey(),
 };
 
-console.log('[main] Created appConfig:', appConfig);
-
-// Track windows by ID
-let windowCounter = 0;
 const windowMap = new Map<number, BrowserWindow>();
+const goosedClients = new Map<number, Client>();
+const appWindows = new Map<string, BrowserWindow>();
 
-interface RecipeConfig {
-  id: string;
-  title: string;
-  description: string;
-  instructions: string;
-  activities: string[];
-  prompt: string;
+const windowPowerSaveBlockers = new Map<number, number>(); // windowId -> blockerId
+// Track pending initial messages per window
+const pendingInitialMessages = new Map<number, string>(); // windowId -> initialMessage
+
+interface CreateChatOptions {
+  initialMessage?: string;
+  dir?: string;
+  resumeSessionId?: string;
+  viewType?: string;
+  recipeDeeplink?: string;
+  recipeId?: string;
+  scheduledJobId?: string;
+  recipeParameters?: Record<string, string>;
 }
 
-const createChat = async (
-  app: App,
-  query?: string,
-  dir?: string,
-  version?: string,
-  resumeSessionId?: string,
-  recipeConfig?: RecipeConfig, // Bot configuration
-  viewType?: string // View type
-) => {
-  // Initialize variables for process and configuration
-  let port = 0;
-  let working_dir = '';
-  let goosedProcess = null;
+const createChat = async (app: App, options: CreateChatOptions = {}) => {
+  const {
+    initialMessage,
+    dir,
+    resumeSessionId,
+    viewType,
+    recipeDeeplink,
+    recipeId,
+    scheduledJobId,
+    recipeParameters,
+  } = options;
+  const settings = getSettings();
+  const serverSecret = getServerSecret(settings);
 
-  if (viewType === 'recipeEditor') {
-    // For recipeEditor, get the port from existing windows' config
-    const existingWindows = BrowserWindow.getAllWindows();
-    if (existingWindows.length > 0) {
-      // Get the config from localStorage through an existing window
-      try {
-        const config = await existingWindows[0].webContents.executeJavaScript(
-          `window.electron.getConfig()`
-        );
-        if (config) {
-          port = config.GOOSE_PORT;
-          working_dir = config.GOOSE_WORKING_DIR;
-        }
-      } catch (e) {
-        console.error('Failed to get config from localStorage:', e);
-      }
-    }
-    if (port === 0) {
-      console.error('No existing Goose process found for recipeEditor');
-      throw new Error('Cannot create recipeEditor window: No existing Goose process found');
-    }
-  } else {
-    // Apply current environment settings before creating chat
-    updateEnvironmentVariables(envToggles);
-    // Start new Goosed process for regular windows
-    [port, working_dir, goosedProcess] = await startGoosed(app, dir);
+  const goosedResult = await startGoosed({
+    serverSecret,
+    dir: dir || os.homedir(),
+    env: { GOOSE_PATH_ROOT: process.env.GOOSE_PATH_ROOT },
+    externalGoosed: settings.externalGoosed,
+    isPackaged: app.isPackaged,
+    resourcesPath: app.isPackaged ? process.resourcesPath : undefined,
+    logger: log,
+  });
+
+  // Pin the certificate fingerprint so the cert handlers above only accept
+  // the exact cert that *this* goosed instance generated.
+  if (goosedResult.certFingerprint) {
+    pinnedCertFingerprint = goosedResult.certFingerprint;
   }
+
+  app.on('will-quit', async () => {
+    log.info('App quitting, terminating goosed server');
+    await goosedResult.cleanup();
+  });
+
+  const { baseUrl, workingDir, process: goosedProcess, errorLog } = goosedResult;
+
+  const mainWindowState = windowStateKeeper({
+    defaultWidth: 940,
+    defaultHeight: 800,
+  });
 
   const mainWindow = new BrowserWindow({
     titleBarStyle: process.platform === 'darwin' ? 'hidden' : 'default',
-    trafficLightPosition: process.platform === 'darwin' ? { x: 16, y: 20 } : undefined,
+    trafficLightPosition: process.platform === 'darwin' ? { x: 20, y: 16 } : undefined,
     vibrancy: process.platform === 'darwin' ? 'window' : undefined,
-    frame: process.platform === 'darwin' ? false : true,
-    width: 750,
-    height: 800,
-    minWidth: 650,
+    frame: process.platform !== 'darwin',
+    x: mainWindowState.x,
+    y: mainWindowState.y,
+    width: mainWindowState.width,
+    height: mainWindowState.height,
+    minWidth: 450,
     resizable: true,
-    transparent: false,
     useContentSize: true,
-    icon: path.join(__dirname, '../images/icon'),
+    icon: path.join(__dirname, '../images/icon.icns'),
     webPreferences: {
-      spellcheck: true,
+      spellcheck: settings.spellcheckEnabled ?? true,
       preload: path.join(__dirname, 'preload.js'),
+      webSecurity: true,
+      nodeIntegration: false,
+      contextIsolation: true,
       additionalArguments: [
         JSON.stringify({
           ...appConfig,
-          GOOSE_PORT: port,
-          GOOSE_WORKING_DIR: working_dir,
+          GOOSE_API_HOST: baseUrl,
+          GOOSE_WORKING_DIR: workingDir,
           REQUEST_DIR: dir,
-          GOOSE_BASE_URL_SHARE: sharingUrl,
-          GOOSE_VERSION: gooseVersion,
-          recipeConfig: recipeConfig,
+          GOOSE_BASE_URL_SHARE: baseUrlShare,
+          GOOSE_VERSION: version,
+          recipeDeeplink: recipeDeeplink,
+          recipeId: recipeId,
+          recipeParameters: recipeParameters,
+          scheduledJobId: scheduledJobId,
+          SECURITY_ML_MODEL_MAPPING: process.env.SECURITY_ML_MODEL_MAPPING,
         }),
       ],
-      partition: 'persist:goose', // Add this line to ensure persistence
+      partition: 'persist:goose',
     },
   });
 
-  // Enable spellcheck / right and ctrl + click on mispelled word
-  //
-  // NOTE: We could use webContents.session.availableSpellCheckerLanguages to include
-  // all languages in the list of spell checked words, but it diminishes the times you
-  // get red squigglies back for mispelled english words. Given the rest of Goose only
-  // renders in english right now, this feels like the correct set of language codes
-  // for the moment.
-  //
-  // TODO: Load language codes from a setting if we ever have i18n/l10n
+  if (!app.isPackaged) {
+    installExtension(REACT_DEVELOPER_TOOLS, {
+      loadExtensionOptions: { allowFileAccess: true },
+      session: mainWindow.webContents.session,
+    })
+      .then(() => log.info('added react dev tools'))
+      .catch((err) => log.info('failed to install react dev tools:', err));
+  }
+
+  // Re-create the client with Electron's net.fetch so requests to the local
+  // self-signed HTTPS server go through the session's certificate handling.
+  const goosedClient = createClient(
+    createConfig({
+      baseUrl,
+      fetch: net.fetch as unknown as typeof globalThis.fetch,
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Secret-Key': serverSecret,
+      },
+    })
+  );
+  goosedClients.set(mainWindow.id, goosedClient);
+
+  const serverReady = await checkServerStatus(goosedClient, errorLog);
+  if (!serverReady) {
+    const isUsingExternalBackend = settings.externalGoosed?.enabled;
+
+    if (isUsingExternalBackend) {
+      const response = dialog.showMessageBoxSync({
+        type: 'error',
+        title: 'External Backend Unreachable',
+        message: `Could not connect to external backend at ${settings.externalGoosed?.url}`,
+        detail: 'The external goosed server may not be running.',
+        buttons: ['Disable External Backend & Retry', 'Quit'],
+        defaultId: 0,
+        cancelId: 1,
+      });
+
+      if (response === 0) {
+        updateSettings((s) => {
+          if (s.externalGoosed) {
+            s.externalGoosed.enabled = false;
+          }
+        });
+        mainWindow.destroy();
+        return createChat(app, { initialMessage, dir });
+      }
+    } else {
+      dialog.showMessageBoxSync({
+        type: 'error',
+        title: 'Goose Failed to Start',
+        message: 'The backend server failed to start.',
+        detail: errorLog.join('\n'),
+        buttons: ['OK'],
+      });
+    }
+    app.quit();
+  }
+
+  // Let windowStateKeeper manage the window
+  mainWindowState.manage(mainWindow);
+
   mainWindow.webContents.session.setSpellCheckerLanguages(['en-US', 'en-GB']);
-  mainWindow.webContents.on('context-menu', (event, params) => {
+  mainWindow.webContents.on('context-menu', (_event, params) => {
     const menu = new Menu();
+    const hasSpellingSuggestions = params.dictionarySuggestions.length > 0 || params.misspelledWord;
 
-    // Add each spelling suggestion
-    for (const suggestion of params.dictionarySuggestions) {
+    if (hasSpellingSuggestions) {
+      for (const suggestion of params.dictionarySuggestions) {
+        menu.append(
+          new MenuItem({
+            label: suggestion,
+            click: () => mainWindow.webContents.replaceMisspelling(suggestion),
+          })
+        );
+      }
+
+      if (params.misspelledWord) {
+        menu.append(
+          new MenuItem({
+            label: 'Add to dictionary',
+            click: () =>
+              mainWindow.webContents.session.addWordToSpellCheckerDictionary(params.misspelledWord),
+          })
+        );
+      }
+
+      if (params.selectionText) {
+        menu.append(new MenuItem({ type: 'separator' }));
+      }
+    }
+    if (params.selectionText) {
       menu.append(
         new MenuItem({
-          label: suggestion,
-          click: () => mainWindow.webContents.replaceMisspelling(suggestion),
+          label: 'Cut',
+          accelerator: 'CmdOrCtrl+X',
+          role: 'cut',
+        })
+      );
+      menu.append(
+        new MenuItem({
+          label: 'Copy',
+          accelerator: 'CmdOrCtrl+C',
+          role: 'copy',
         })
       );
     }
 
-    // Allow users to add the misspelled word to the dictionary
-    if (params.misspelledWord) {
+    // Only show paste in editable fields (text inputs)
+    if (params.isEditable) {
       menu.append(
         new MenuItem({
-          label: 'Add to dictionary',
-          click: () =>
-            mainWindow.webContents.session.addWordToSpellCheckerDictionary(params.misspelledWord),
+          label: 'Paste',
+          accelerator: 'CmdOrCtrl+V',
+          role: 'paste',
         })
       );
     }
 
-    menu.popup();
+    if (menu.items.length > 0) {
+      menu.popup();
+    }
   });
 
-  // Store config in localStorage for future windows
-  const windowConfig = {
-    ...appConfig,
-    GOOSE_PORT: port,
-    GOOSE_WORKING_DIR: working_dir,
-    REQUEST_DIR: dir,
-    GOOSE_BASE_URL_SHARE: sharingUrl,
-    recipeConfig: recipeConfig,
-  };
-
-  // We need to wait for the window to load before we can access localStorage
-  mainWindow.webContents.on('did-finish-load', () => {
-    const configStr = JSON.stringify(windowConfig).replace(/'/g, "\\'");
-    mainWindow.webContents.executeJavaScript(`
-      localStorage.setItem('gooseConfig', '${configStr}')
-    `);
-  });
-
-  console.log('[main] Creating window with config:', windowConfig);
-
-  // Handle new window creation for links
+  // Handle new window creation for links (fallback for any links not handled by onClick)
   mainWindow.webContents.setWindowOpenHandler(({ url }) => {
-    // Open all links in external browser
-    if (url.startsWith('http:') || url.startsWith('https:')) {
-      electron.shell.openExternal(url);
+    try {
+      const protocol = new URL(url).protocol;
+      if (BLOCKED_PROTOCOLS.includes(protocol)) {
+        return { action: 'deny' };
+      }
+    } catch {
       return { action: 'deny' };
     }
-    return { action: 'allow' };
+
+    shell.openExternal(url);
+    return { action: 'deny' };
   });
 
-  // Load the index.html of the app.
-  let queryParams = '';
-  if (query) {
-    queryParams = `?initialQuery=${encodeURIComponent(query)}`;
-  }
+  // Handle new-window events (alternative approach for external links)
+  // Use type assertion for non-standard Electron event
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  mainWindow.webContents.on('new-window' as any, function (event: any, url: string) {
+    event.preventDefault();
+    try {
+      const protocol = new URL(url).protocol;
+      if (BLOCKED_PROTOCOLS.includes(protocol)) {
+        return;
+      }
+    } catch {
+      return;
+    }
+    shell.openExternal(url);
+  });
 
-  // Add resumeSessionId to query params if provided
-  if (resumeSessionId) {
-    queryParams = queryParams
-      ? `${queryParams}&resumeSessionId=${encodeURIComponent(resumeSessionId)}`
-      : `?resumeSessionId=${encodeURIComponent(resumeSessionId)}`;
-  }
+  const windowId = mainWindow.id;
+  const url = getAppUrl();
 
-  // Add view type to query params if provided
+  let appPath = '/';
+  const routeMap: Record<string, string> = {
+    chat: '/',
+    pair: '/pair',
+    settings: '/settings',
+    sessions: '/sessions',
+    schedules: '/schedules',
+    recipes: '/recipes',
+    permission: '/permission',
+    ConfigureProviders: '/configure-providers',
+    sharedSession: '/shared-session',
+    welcome: '/welcome',
+  };
+
   if (viewType) {
-    queryParams = queryParams
-      ? `${queryParams}&view=${encodeURIComponent(viewType)}`
-      : `?view=${encodeURIComponent(viewType)}`;
+    appPath = routeMap[viewType] || '/';
+  }
+  if (
+    appPath === '/' &&
+    (recipeDeeplink !== undefined || recipeId !== undefined || initialMessage)
+  ) {
+    appPath = '/pair';
   }
 
-  const primaryDisplay = electron.screen.getPrimaryDisplay();
-  const { width } = primaryDisplay.workAreaSize;
+  let searchParams = new URLSearchParams();
+  if (resumeSessionId) {
+    searchParams.set('resumeSessionId', resumeSessionId);
+    if (appPath === '/') {
+      appPath = '/pair';
+    }
+  }
 
-  // Increment window counter to track number of windows
-  const windowId = ++windowCounter;
-  const direction = windowId % 2 === 0 ? 1 : -1; // Alternate direction
-  const initialOffset = 50;
+  // Goose's react app uses HashRouter, so the path + search params follow a #/
+  url.hash = `${appPath}?${searchParams.toString()}`;
+  let formattedUrl = formatUrl(url);
+  log.info('Opening URL: ', formattedUrl);
+  mainWindow.loadURL(formattedUrl);
 
-  // Set window position with alternating offset strategy
-  const baseXPosition = Math.round(width / 2 - mainWindow.getSize()[0] / 2);
-  const xOffset = direction * initialOffset * Math.floor(windowId / 2);
-  mainWindow.setPosition(baseXPosition + xOffset, 100);
-
-  if (MAIN_WINDOW_VITE_DEV_SERVER_URL) {
-    mainWindow.loadURL(`${MAIN_WINDOW_VITE_DEV_SERVER_URL}${queryParams}`);
-  } else {
-    // In production, we need to use a proper file protocol URL with correct base path
-    const indexPath = path.join(__dirname, `../renderer/${MAIN_WINDOW_VITE_NAME}/index.html`);
-    console.log('Loading production path:', indexPath);
-    mainWindow.loadFile(indexPath, {
-      search: queryParams ? queryParams.slice(1) : undefined,
-    });
+  // If we have an initial message, store it to send after React is ready
+  if (initialMessage) {
+    pendingInitialMessages.set(mainWindow.id, initialMessage);
   }
 
   // Set up local keyboard shortcuts that only work when the window is focused
@@ -484,44 +831,171 @@ const createChat = async (
     }
   });
 
+  mainWindow.on('app-command', (e, cmd) => {
+    if (cmd === 'browser-backward') {
+      mainWindow.webContents.send('mouse-back-button-clicked');
+      e.preventDefault();
+    }
+  });
+
+  // Handle mouse back button (button 3)
+  // Use type assertion for non-standard Electron event
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  mainWindow.webContents.on('mouse-up' as any, function (_event: any, mouseButton: number) {
+    // MouseButton 3 is the back button.
+    if (mouseButton === 3) {
+      mainWindow.webContents.send('mouse-back-button-clicked');
+    }
+  });
+
   windowMap.set(windowId, mainWindow);
+
   // Handle window closure
   mainWindow.on('closed', () => {
     windowMap.delete(windowId);
-    if (goosedProcess) {
+
+    // Clean up pending initial message
+    pendingInitialMessages.delete(windowId);
+
+    if (windowPowerSaveBlockers.has(windowId)) {
+      const blockerId = windowPowerSaveBlockers.get(windowId)!;
+      try {
+        powerSaveBlocker.stop(blockerId);
+        console.log(
+          `[Main] Stopped power save blocker ${blockerId} for closing window ${windowId}`
+        );
+      } catch (error) {
+        console.error(
+          `[Main] Failed to stop power save blocker ${blockerId} for window ${windowId}:`,
+          error
+        );
+      }
+      windowPowerSaveBlockers.delete(windowId);
+    }
+
+    if (goosedProcess && typeof goosedProcess === 'object' && 'kill' in goosedProcess) {
       goosedProcess.kill();
     }
   });
   return mainWindow;
 };
 
+let activeLauncherWindow: BrowserWindow | null = null;
+
+const createLauncher = () => {
+  if (activeLauncherWindow && !activeLauncherWindow.isDestroyed()) {
+    activeLauncherWindow.focus();
+    return activeLauncherWindow;
+  }
+
+  const launcherWindow = new BrowserWindow({
+    width: 600,
+    height: 80,
+    frame: false,
+    transparent: process.platform === 'darwin',
+    backgroundColor: process.platform === 'darwin' ? '#00000000' : '#ffffff',
+    webPreferences: {
+      preload: path.join(__dirname, 'preload.js'),
+      nodeIntegration: false,
+      contextIsolation: true,
+      additionalArguments: [JSON.stringify(appConfig)],
+      partition: 'persist:goose',
+    },
+    skipTaskbar: true,
+    alwaysOnTop: true,
+    resizable: false,
+    movable: true,
+    minimizable: false,
+    maximizable: false,
+    fullscreenable: false,
+    hasShadow: true,
+    vibrancy: process.platform === 'darwin' ? 'window' : undefined,
+  });
+
+  // Center on screen
+  const primaryDisplay = screen.getPrimaryDisplay();
+  const { width, height } = primaryDisplay.workAreaSize;
+  const windowBounds = launcherWindow.getBounds();
+
+  launcherWindow.setPosition(
+    Math.round(width / 2 - windowBounds.width / 2),
+    Math.round(height / 3 - windowBounds.height / 2)
+  );
+
+  // Load launcher window content
+  const url = getAppUrl();
+
+  url.hash = '/launcher';
+  launcherWindow.loadURL(formatUrl(url));
+  activeLauncherWindow = launcherWindow;
+
+  launcherWindow.on('closed', () => {
+    activeLauncherWindow = null;
+  });
+
+  // Destroy window when it loses focus
+  launcherWindow.on('blur', () => {
+    launcherWindow.destroy();
+  });
+
+  // Also destroy on escape key
+  launcherWindow.webContents.on('before-input-event', (event, input) => {
+    if (input.key === 'Escape') {
+      launcherWindow.destroy();
+      event.preventDefault();
+    }
+  });
+
+  return launcherWindow;
+};
+
 // Track tray instance
 let tray: Tray | null = null;
 
-const createTray = () => {
-  const isDev = process.env.NODE_ENV === 'development';
-  let iconPath: string;
+const destroyTray = () => {
+  if (tray) {
+    tray.destroy();
+    tray = null;
+  }
+};
 
-  if (isDev) {
-    iconPath = path.join(process.cwd(), 'src', 'images', 'iconTemplate.png');
-  } else {
-    iconPath = path.join(process.resourcesPath, 'images', 'iconTemplate.png');
+const disableTray = () => {
+  updateSettings((s) => {
+    s.showMenuBarIcon = false;
+  });
+};
+
+const createTray = () => {
+  destroyTray();
+
+  const possiblePaths = [
+    path.join(process.resourcesPath, 'images', 'iconTemplate.png'),
+    path.join(process.cwd(), 'src', 'images', 'iconTemplate.png'),
+    path.join(__dirname, '..', 'images', 'iconTemplate.png'),
+    path.join(__dirname, 'images', 'iconTemplate.png'),
+    path.join(process.cwd(), 'images', 'iconTemplate.png'),
+  ];
+
+  const iconPath = possiblePaths.find((p) => fsSync.existsSync(p));
+
+  if (!iconPath) {
+    console.warn('[Main] Tray icon not found. App will continue without system tray.');
+    disableTray();
+    return;
   }
 
-  tray = new Tray(iconPath);
+  try {
+    tray = new Tray(iconPath);
+    setTrayRef(tray);
+    updateTrayMenu(getUpdateAvailable());
 
-  const contextMenu = Menu.buildFromTemplate([
-    { label: 'Show Window', click: showWindow },
-    { type: 'separator' },
-    { label: 'Quit', click: () => app.quit() },
-  ]);
-
-  tray.setToolTip('Goose');
-  tray.setContextMenu(contextMenu);
-
-  // On Windows, clicking the tray icon should show the window
-  if (process.platform === 'win32') {
-    tray.on('click', showWindow);
+    if (process.platform === 'win32') {
+      tray.on('click', showWindow);
+    }
+  } catch (error) {
+    console.error('[Main] Tray creation failed. App will continue without system tray.', error);
+    disableTray();
+    tray = null;
   }
 };
 
@@ -532,11 +1006,10 @@ const showWindow = async () => {
     log.info('No windows are open, creating a new one...');
     const recentDirs = loadRecentDirs();
     const openDir = recentDirs.length > 0 ? recentDirs[0] : null;
-    await createChat(app, undefined, openDir);
+    await createChat(app, { dir: openDir || undefined });
     return;
   }
 
-  // Define the initial offset values
   const initialOffsetX = 30;
   const initialOffsetY = 30;
 
@@ -565,27 +1038,156 @@ const buildRecentFilesMenu = () => {
   const recentDirs = loadRecentDirs();
   return recentDirs.map((dir) => ({
     label: dir,
-    click: () => {
-      createChat(app, undefined, dir);
+    click: async () => {
+      await createChat(app, { dir });
     },
   }));
 };
 
-const openDirectoryDialog = async (replaceWindow: boolean = false) => {
-  const result = await dialog.showOpenDialog({
-    properties: ['openFile', 'openDirectory'],
-  });
+const openDirectoryDialog = async (): Promise<OpenDialogReturnValue> => {
+  // Get the current working directory from the focused window
+  let defaultPath: string | undefined;
+  const currentWindow = BrowserWindow.getFocusedWindow();
+
+  if (currentWindow) {
+    try {
+      const currentWorkingDir = await currentWindow.webContents.executeJavaScript(
+        `window.appConfig ? window.appConfig.get('GOOSE_WORKING_DIR') : null`
+      );
+
+      if (currentWorkingDir && typeof currentWorkingDir === 'string') {
+        // Verify the directory exists before using it as default
+        try {
+          const stats = fsSync.lstatSync(currentWorkingDir);
+          if (stats.isDirectory()) {
+            defaultPath = currentWorkingDir;
+          }
+        } catch (error) {
+          if (error && typeof error === 'object' && 'code' in error) {
+            const fsError = error as { code?: string; message?: string };
+            if (
+              fsError.code === 'ENOENT' ||
+              fsError.code === 'EACCES' ||
+              fsError.code === 'EPERM'
+            ) {
+              console.warn(
+                `Current working directory not accessible (${fsError.code}): ${currentWorkingDir}, falling back to home directory`
+              );
+              defaultPath = os.homedir();
+            } else {
+              console.warn(
+                `Unexpected filesystem error (${fsError.code}) for directory ${currentWorkingDir}:`,
+                fsError.message
+              );
+              defaultPath = os.homedir();
+            }
+          } else {
+            console.warn(`Unexpected error checking directory ${currentWorkingDir}:`, error);
+            defaultPath = os.homedir();
+          }
+        }
+      }
+    } catch (error) {
+      console.warn('Failed to get current working directory from window:', error);
+    }
+  }
+
+  if (!defaultPath) {
+    defaultPath = os.homedir();
+  }
+
+  const result = (await dialog.showOpenDialog({
+    properties: ['openFile', 'openDirectory', 'createDirectory'],
+    defaultPath: defaultPath,
+  })) as unknown as OpenDialogReturnValue;
 
   if (!result.canceled && result.filePaths.length > 0) {
-    addRecentDir(result.filePaths[0]);
-    const currentWindow = BrowserWindow.getFocusedWindow();
-    await createChat(app, undefined, result.filePaths[0]);
-    if (replaceWindow) {
-      currentWindow.close();
+    const selectedPath = result.filePaths[0];
+
+    // If a file was selected, use its parent directory
+    let dirToAdd = selectedPath;
+    try {
+      const stats = fsSync.lstatSync(selectedPath);
+
+      // Reject symlinks for security
+      if (stats.isSymbolicLink()) {
+        console.warn(`Selected path is a symlink, using parent directory for security`);
+        dirToAdd = path.dirname(selectedPath);
+      } else if (stats.isFile()) {
+        dirToAdd = path.dirname(selectedPath);
+      }
+    } catch {
+      console.warn(`Could not stat selected path, using parent directory`);
+      dirToAdd = path.dirname(selectedPath); // Fallback to parent directory
     }
+
+    addRecentDir(dirToAdd);
+
+    let deeplinkData: RecipeDeeplinkData | undefined = undefined;
+    if (windowDeeplinkURL) {
+      deeplinkData = parseRecipeDeeplink(windowDeeplinkURL);
+    }
+    await createChat(app, {
+      dir: dirToAdd,
+      recipeDeeplink: deeplinkData?.config,
+      recipeParameters: deeplinkData?.parameters,
+    });
   }
   return result;
 };
+
+interface RecipeDeeplinkData {
+  config: string;
+  parameters?: Record<string, string>;
+}
+
+function parseRecipeDeeplink(url: string): RecipeDeeplinkData | undefined {
+  const parsedUrl = new URL(url);
+  let recipeDeeplink = parsedUrl.searchParams.get('config');
+  if (recipeDeeplink && !url.includes(recipeDeeplink)) {
+    // URLSearchParams decodes + as space, which can break encoded configs
+    // Parse raw query to preserve "+" characters in values like config
+    const search = parsedUrl.search || '';
+    const configMatch = search.match(/(?:[?&])config=([^&]*)/);
+    let recipeDeeplinkTmp = configMatch ? configMatch[1] : null;
+    if (recipeDeeplinkTmp) {
+      try {
+        recipeDeeplink = decodeURIComponent(recipeDeeplinkTmp);
+      } catch (error) {
+        console.error('[Main] parseRecipeDeeplink - Failed to decode:', errorMessage(error));
+        return undefined;
+      }
+    }
+  }
+  if (!recipeDeeplink) {
+    return undefined;
+  }
+
+  // Extract all query parameters except 'config' and 'scheduledJob' as recipe parameters
+  // Use raw query string parsing to preserve '+' characters (consistent with config handling)
+  const parameters: Record<string, string> = {};
+  const search = parsedUrl.search || '';
+  const paramMatches = search.matchAll(/[?&]([^=&]+)=([^&]*)/g);
+
+  for (const match of paramMatches) {
+    const key = match[1];
+    const rawValue = match[2];
+
+    if (key !== 'config' && key !== 'scheduledJob') {
+      try {
+        parameters[key] = decodeURIComponent(rawValue);
+      } catch {
+        // If decoding fails, use raw value
+        parameters[key] = rawValue;
+      }
+    }
+  }
+
+  return {
+    config: recipeDeeplink,
+    parameters: Object.keys(parameters).length > 0 ? parameters : undefined,
+  };
+}
 
 // Global error handler
 const handleFatalError = (error: Error) => {
@@ -596,40 +1198,330 @@ const handleFatalError = (error: Error) => {
 };
 
 process.on('uncaughtException', (error) => {
-  console.error('Uncaught Exception:', error);
+  console.error('Uncaught Exception:', formatErrorForLogging(error));
   handleFatalError(error);
 });
 
 process.on('unhandledRejection', (error) => {
-  console.error('Unhandled Rejection:', error);
+  console.error('Unhandled Rejection:', formatErrorForLogging(error));
   handleFatalError(error instanceof Error ? error : new Error(String(error)));
 });
 
-ipcMain.on('react-ready', () => {
-  console.log('React ready event received');
+ipcMain.on('react-ready', (event) => {
+  log.info('React ready event received');
 
-  if (pendingDeepLink) {
-    console.log('Processing pending deep link:', pendingDeepLink);
-    handleProtocolUrl(pendingDeepLink);
-  } else {
-    console.log('No pending deep link to process');
+  // Get the window that sent the react-ready event
+  const window = BrowserWindow.fromWebContents(event.sender);
+  const windowId = window?.id;
+
+  // Send any pending initial message for this window
+  if (windowId && pendingInitialMessages.has(windowId)) {
+    const initialMessage = pendingInitialMessages.get(windowId)!;
+    log.info('Sending pending initial message to window:', initialMessage);
+    window.webContents.send('set-initial-message', initialMessage);
+    pendingInitialMessages.delete(windowId);
   }
 
-  // We don't need to handle pending deep links here anymore
-  // since we're handling them in the window creation flow
-  console.log('[main] React ready - window is prepared for deep links');
+  if (pendingDeepLink && window) {
+    log.info('Processing pending deep link:', pendingDeepLink);
+    try {
+      const parsedUrl = new URL(pendingDeepLink);
+      if (parsedUrl.hostname === 'extension') {
+        log.info('Sending add-extension IPC to ready window');
+        window.webContents.send('add-extension', pendingDeepLink);
+      } else if (parsedUrl.hostname === 'sessions') {
+        log.info('Sending open-shared-session IPC to ready window');
+        window.webContents.send('open-shared-session', pendingDeepLink);
+      }
+      pendingDeepLink = null;
+    } catch (error) {
+      log.error('Error processing pending deep link:', error);
+      pendingDeepLink = null;
+    }
+  } else {
+    log.info('No pending deep link to process');
+  }
+
+  log.info('React ready - window is prepared for deep links');
 });
 
-// Handle directory chooser
-ipcMain.handle('directory-chooser', (_event, replace: boolean = false) => {
-  return openDirectoryDialog(replace);
+ipcMain.handle('open-external', async (_event, url: string) => {
+  const parsedUrl = new URL(url);
+
+  if (BLOCKED_PROTOCOLS.includes(parsedUrl.protocol)) {
+    console.warn(`[Main] Blocked dangerous protocol: ${parsedUrl.protocol}`);
+    return;
+  }
+
+  await shell.openExternal(url);
+});
+
+ipcMain.handle('directory-chooser', async () => {
+  return dialog.showOpenDialog({
+    properties: ['openDirectory', 'createDirectory'],
+    defaultPath: os.homedir(),
+  });
+});
+
+ipcMain.handle('add-recent-dir', (_event, dir: string) => {
+  if (dir) {
+    addRecentDir(dir);
+  }
+});
+
+ipcMain.handle('get-setting', (_event, key: SettingKey) => {
+  const settings = getSettings();
+  return settings[key];
+});
+
+// Valid setting keys for runtime validation
+const validSettingKeys: Set<string> = new Set([
+  'showMenuBarIcon',
+  'showDockIcon',
+  'enableWakelock',
+  'spellcheckEnabled',
+  'externalGoosed',
+  'globalShortcut',
+  'keyboardShortcuts',
+  'theme',
+  'useSystemTheme',
+  'responseStyle',
+  'showPricing',
+  'sessionSharing',
+  'seenAnnouncementIds',
+]);
+
+ipcMain.handle('set-setting', (_event, key: SettingKey, value: unknown) => {
+  // Validate key at runtime to prevent prototype pollution
+  if (!validSettingKeys.has(key)) {
+    console.error(`Invalid setting key rejected: ${key}`);
+    return;
+  }
+
+  const settings = getSettings();
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  (settings as any)[key] = value;
+  fsSync.writeFileSync(SETTINGS_FILE, JSON.stringify(settings, null, 2));
+
+  // Re-register shortcuts if keyboard shortcuts changed
+  if (key === 'keyboardShortcuts') {
+    registerGlobalShortcuts();
+  }
+});
+
+ipcMain.handle('get-secret-key', () => {
+  const settings = getSettings();
+  return getServerSecret(settings);
+});
+
+ipcMain.handle('get-goosed-host-port', async (event) => {
+  const windowId = BrowserWindow.fromWebContents(event.sender)?.id;
+  if (!windowId) {
+    return null;
+  }
+  const client = goosedClients.get(windowId);
+  if (!client) {
+    return null;
+  }
+  return client.getConfig().baseUrl || null;
+});
+
+// Handle menu bar icon visibility
+ipcMain.handle('set-menu-bar-icon', async (_event, show: boolean) => {
+  updateSettings((s) => {
+    s.showMenuBarIcon = show;
+  });
+
+  if (show) {
+    createTray();
+  } else {
+    destroyTray();
+  }
+  return true;
+});
+
+ipcMain.handle('get-menu-bar-icon-state', () => {
+  try {
+    const settings = getSettings();
+    return settings.showMenuBarIcon ?? true;
+  } catch (error) {
+    console.error('Error getting menu bar icon state:', error);
+    return true;
+  }
+});
+
+// Handle dock icon visibility (macOS only)
+ipcMain.handle('set-dock-icon', async (_event, show: boolean) => {
+  if (process.platform !== 'darwin') return false;
+
+  const settings = getSettings();
+  updateSettings((s) => {
+    s.showDockIcon = show;
+  });
+
+  if (show) {
+    app.dock?.show();
+  } else {
+    // Only hide the dock if we have a menu bar icon to maintain accessibility
+    if (settings.showMenuBarIcon) {
+      app.dock?.hide();
+      setTimeout(() => {
+        focusWindow();
+      }, 50);
+    }
+  }
+  return true;
+});
+
+ipcMain.handle('get-dock-icon-state', () => {
+  try {
+    if (process.platform !== 'darwin') return true;
+    const settings = getSettings();
+    return settings.showDockIcon ?? true;
+  } catch (error) {
+    console.error('Error getting dock icon state:', error);
+    return true;
+  }
+});
+
+// Handle opening system notifications preferences
+ipcMain.handle('open-notifications-settings', async () => {
+  try {
+    if (process.platform === 'darwin') {
+      spawn('open', ['x-apple.systempreferences:com.apple.preference.notifications']);
+      return true;
+    } else if (process.platform === 'win32') {
+      // Windows: Open notification settings in Settings app
+      spawn('ms-settings:notifications', { shell: true });
+      return true;
+    } else if (process.platform === 'linux') {
+      // Linux: Try different desktop environments
+      // GNOME
+      try {
+        spawn('gnome-control-center', ['notifications']);
+        return true;
+      } catch {
+        console.log('GNOME control center not found, trying other options');
+      }
+
+      // KDE Plasma
+      try {
+        spawn('systemsettings5', ['kcm_notifications']);
+        return true;
+      } catch {
+        console.log('KDE systemsettings5 not found, trying other options');
+      }
+
+      // XFCE
+      try {
+        spawn('xfce4-settings-manager', ['--socket-id=notifications']);
+        return true;
+      } catch {
+        console.log('XFCE settings manager not found, trying other options');
+      }
+
+      // Fallback: Try to open general settings
+      try {
+        spawn('gnome-control-center');
+        return true;
+      } catch {
+        console.warn('Could not find a suitable settings application for Linux');
+        return false;
+      }
+    } else {
+      console.warn(
+        `Opening notification settings is not supported on platform: ${process.platform}`
+      );
+      return false;
+    }
+  } catch (error) {
+    console.error('Error opening notification settings:', error);
+    return false;
+  }
+});
+
+// Handle wakelock setting
+ipcMain.handle('set-wakelock', async (_event, enable: boolean) => {
+  updateSettings((s) => {
+    s.enableWakelock = enable;
+  });
+
+  // Stop all existing power save blockers when disabling the setting
+  if (!enable) {
+    for (const [windowId, blockerId] of windowPowerSaveBlockers.entries()) {
+      try {
+        powerSaveBlocker.stop(blockerId);
+        console.log(
+          `[Main] Stopped power save blocker ${blockerId} for window ${windowId} due to wakelock setting disabled`
+        );
+      } catch (error) {
+        console.error(
+          `[Main] Failed to stop power save blocker ${blockerId} for window ${windowId}:`,
+          error
+        );
+      }
+    }
+    windowPowerSaveBlockers.clear();
+  }
+
+  return true;
+});
+
+ipcMain.handle('get-wakelock-state', () => {
+  try {
+    const settings = getSettings();
+    return settings.enableWakelock ?? false;
+  } catch (error) {
+    console.error('Error getting wakelock state:', error);
+    return false;
+  }
+});
+
+ipcMain.handle('set-spellcheck', async (_event, enable: boolean) => {
+  updateSettings((s) => {
+    s.spellcheckEnabled = enable;
+  });
+  return true;
+});
+
+ipcMain.handle('get-spellcheck-state', () => {
+  try {
+    const settings = getSettings();
+    return settings.spellcheckEnabled ?? true;
+  } catch (error) {
+    console.error('Error getting spellcheck state:', error);
+    return true;
+  }
 });
 
 // Add file/directory selection handler
-ipcMain.handle('select-file-or-directory', async () => {
-  const result = await dialog.showOpenDialog({
+ipcMain.handle('select-file-or-directory', async (_event, defaultPath?: string) => {
+  const dialogOptions: OpenDialogOptions = {
     properties: process.platform === 'darwin' ? ['openFile', 'openDirectory'] : ['openFile'],
-  });
+  };
+
+  // Set default path if provided
+  if (defaultPath) {
+    // Expand tilde to home directory
+    const expandedPath = expandTilde(defaultPath);
+
+    // Check if the path exists
+    try {
+      const stats = await fs.stat(expandedPath);
+      if (stats.isDirectory()) {
+        dialogOptions.defaultPath = expandedPath;
+      } else {
+        dialogOptions.defaultPath = path.dirname(expandedPath);
+      }
+      // eslint-disable-next-line @typescript-eslint/no-unused-vars
+    } catch (error) {
+      // If path doesn't exist, fall back to home directory and log error
+      console.error(`Default path does not exist: ${expandedPath}, falling back to home directory`);
+      dialogOptions.defaultPath = os.homedir();
+    }
+  }
+
+  const result = (await dialog.showOpenDialog(dialogOptions)) as unknown as OpenDialogReturnValue;
 
   if (!result.canceled && result.filePaths.length > 0) {
     return result.filePaths[0];
@@ -694,71 +1586,104 @@ ipcMain.handle('check-ollama', async () => {
   }
 });
 
-// Handle binary path requests
-ipcMain.handle('get-binary-path', (_event, binaryName) => {
-  return getBinaryPath(app, binaryName);
-});
-
-ipcMain.handle('read-file', (_event, filePath) => {
-  return new Promise((resolve) => {
-    const cat = spawn('cat', [filePath]);
-    let output = '';
-    let errorOutput = '';
-
-    cat.stdout.on('data', (data) => {
-      output += data.toString();
-    });
-
-    cat.stderr.on('data', (data) => {
-      errorOutput += data.toString();
-    });
-
-    cat.on('close', (code) => {
-      if (code !== 0) {
-        // File not found or error
-        resolve({ file: '', filePath, error: errorOutput || null, found: false });
-        return;
-      }
-      resolve({ file: output, filePath, error: null, found: true });
-    });
-
-    cat.on('error', (error) => {
-      console.error('Error reading file:', error);
-      resolve({ file: '', filePath, error, found: false });
-    });
-  });
-});
-
-ipcMain.handle('write-file', (_event, filePath, content) => {
-  return new Promise((resolve) => {
-    // Create a write stream to the file
-    // eslint-disable-next-line @typescript-eslint/no-var-requires
-    const fs = require('fs');
-    try {
-      fs.writeFileSync(filePath, content, { encoding: 'utf8' });
-      resolve(true);
-    } catch (error) {
-      console.error('Error writing to file:', error);
-      resolve(false);
-    }
-  });
-});
-
-// Handle allowed extensions list fetching
-ipcMain.handle('get-allowed-extensions', async () => {
+ipcMain.handle('read-file', async (_event, filePath) => {
   try {
-    const allowList = await getAllowList();
-    return allowList;
+    const expandedPath = expandTilde(filePath);
+    if (process.platform === 'win32') {
+      const buffer = await fs.readFile(expandedPath);
+      return { file: buffer.toString('utf8'), filePath: expandedPath, error: null, found: true };
+    }
+    // Non-Windows: keep previous behavior via cat for parity
+    return await new Promise((resolve) => {
+      const cat = spawn('cat', [expandedPath]);
+      let output = '';
+      let errorOutput = '';
+
+      cat.stdout.on('data', (data) => {
+        output += data.toString();
+      });
+
+      cat.stderr.on('data', (data) => {
+        errorOutput += data.toString();
+      });
+
+      cat.on('close', (code) => {
+        if (code !== 0) {
+          resolve({ file: '', filePath: expandedPath, error: errorOutput || null, found: false });
+          return;
+        }
+        resolve({ file: output, filePath: expandedPath, error: null, found: true });
+      });
+
+      cat.on('error', (error) => {
+        console.error('Error reading file:', error);
+        resolve({ file: '', filePath: expandedPath, error, found: false });
+      });
+    });
   } catch (error) {
-    console.error('Error fetching allowed extensions:', error);
-    throw error;
+    console.error('Error reading file:', error);
+    return { file: '', filePath: expandTilde(filePath), error, found: false };
   }
+});
+
+ipcMain.handle('write-file', async (_event, filePath, content) => {
+  try {
+    // Expand tilde to home directory
+    const expandedPath = expandTilde(filePath);
+    await fs.writeFile(expandedPath, content, { encoding: 'utf8' });
+    return true;
+  } catch (error) {
+    console.error('Error writing to file:', error);
+    return false;
+  }
+});
+
+// Enhanced file operations
+ipcMain.handle('ensure-directory', async (_event, dirPath) => {
+  try {
+    // Expand tilde to home directory
+    const expandedPath = expandTilde(dirPath);
+
+    await fs.mkdir(expandedPath, { recursive: true });
+    return true;
+  } catch (error) {
+    console.error('Error creating directory:', error);
+    return false;
+  }
+});
+
+ipcMain.handle('list-files', async (_event, dirPath, extension) => {
+  try {
+    // Expand tilde to home directory
+    const expandedPath = expandTilde(dirPath);
+
+    const files = await fs.readdir(expandedPath);
+    if (extension) {
+      return files.filter((file) => file.endsWith(extension));
+    }
+    return files;
+  } catch (error) {
+    console.error('Error listing files:', error);
+    return [];
+  }
+});
+
+ipcMain.handle('show-message-box', async (_event, options) => {
+  return dialog.showMessageBox(options);
+});
+
+ipcMain.handle('show-save-dialog', async (_event, options) => {
+  return dialog.showSaveDialog(options);
+});
+
+ipcMain.handle('get-allowed-extensions', async () => {
+  return await getAllowList();
 });
 
 const createNewWindow = async (app: App, dir?: string | null) => {
   const recentDirs = loadRecentDirs();
   const openDir = dir || (recentDirs.length > 0 ? recentDirs[0] : undefined);
-  createChat(app, undefined, openDir);
+  return await createChat(app, { dir: openDir });
 };
 
 const focusWindow = () => {
@@ -773,121 +1698,190 @@ const focusWindow = () => {
   }
 };
 
-const registerGlobalHotkey = (accelerator: string) => {
-  // Unregister any existing shortcuts first
+const registerGlobalShortcuts = () => {
   globalShortcut.unregisterAll();
 
-  try {
-    const ret = globalShortcut.register(accelerator, () => {
-      focusWindow();
-    });
+  const settings = getSettings();
+  const shortcuts = getKeyboardShortcuts(settings);
 
-    if (!ret) {
-      console.error('Failed to register global hotkey');
-      return false;
+  if (shortcuts.focusWindow) {
+    try {
+      globalShortcut.register(shortcuts.focusWindow, () => {
+        focusWindow();
+      });
+    } catch (e) {
+      console.error('Error registering focus window hotkey:', e);
     }
-    return true;
-  } catch (e) {
-    console.error('Error registering global hotkey:', e);
-    return false;
+  }
+
+  if (shortcuts.quickLauncher) {
+    try {
+      globalShortcut.register(shortcuts.quickLauncher, () => {
+        createLauncher();
+      });
+    } catch (e) {
+      console.error('Error registering launcher hotkey:', e);
+    }
   }
 };
 
-app.whenReady().then(async () => {
+async function appMain() {
+  await configureProxy();
+
+  // Ensure Windows shims are available before any MCP processes are spawned
+  await ensureWinShims();
+
+  registerUpdateIpcHandlers();
+
+  // Handle microphone permission requests
+  session.defaultSession.setPermissionRequestHandler((_webContents, permission, callback) => {
+    console.log('Permission requested:', permission);
+    // Allow microphone and media access
+    if (permission === 'media') {
+      callback(true);
+    } else {
+      // Default behavior for other permissions
+      callback(true);
+    }
+  });
+
+  const buildConnectSrc = (): string => {
+    const sources = [
+      "'self'",
+      'http://127.0.0.1:*',
+      'https://127.0.0.1:*',
+      'http://localhost:*',
+      'https://localhost:*',
+      'https://api.github.com',
+      'https://github.com',
+      'https://objects.githubusercontent.com',
+    ];
+
+    const settings = getSettings();
+    if (settings.externalGoosed?.enabled && settings.externalGoosed.url) {
+      try {
+        const externalUrl = new URL(settings.externalGoosed.url);
+        sources.push(externalUrl.origin);
+      } catch {
+        console.warn('Invalid external goosed URL in settings, skipping CSP entry');
+      }
+    }
+
+    return sources.join(' ');
+  };
+
   // Add CSP headers to all sessions
   session.defaultSession.webRequest.onHeadersReceived((details, callback) => {
     callback({
       responseHeaders: {
         ...details.responseHeaders,
-        'Content-Security-Policy': [
+        'Content-Security-Policy':
           "default-src 'self';" +
-            // Allow inline styles since we use them in our React components
-            "style-src 'self' 'unsafe-inline';" +
-            // Scripts only from our app
-            "script-src 'self';" +
-            // Images from our app and data: URLs (for base64 images)
-            "img-src 'self' data: https:;" +
-            // Connect to our local API and specific external services
-            "connect-src 'self' http://127.0.0.1:*" +
-            // Don't allow any plugins
-            "object-src 'none';" +
-            // Don't allow any frames
-            "frame-src 'none';" +
-            // Font sources
-            "font-src 'self';" +
-            // Media sources
-            "media-src 'none';" +
-            // Form actions
-            "form-action 'none';" +
-            // Base URI restriction
-            "base-uri 'self';" +
-            // Manifest files
-            "manifest-src 'self';" +
-            // Worker sources
-            "worker-src 'self';" +
-            // Upgrade insecure requests
-            'upgrade-insecure-requests;',
-        ],
+          "style-src 'self' 'unsafe-inline';" +
+          "script-src 'self' 'unsafe-inline';" +
+          "img-src 'self' data: https:;" +
+          `connect-src ${buildConnectSrc()};` +
+          "object-src 'none';" +
+          "frame-src 'self' https: http:;" +
+          "font-src 'self' data: https:;" +
+          "media-src 'self' mediastream:;" +
+          "form-action 'none';" +
+          "base-uri 'self';" +
+          "manifest-src 'self';" +
+          "worker-src 'self';" +
+          'upgrade-insecure-requests;',
       },
     });
   });
 
-  // Register the default global hotkey
-  registerGlobalHotkey('CommandOrControl+Alt+Shift+G');
+  // Migrate old settings format if needed (one-time migration)
+  const settings = getSettings();
+  if (!settings.keyboardShortcuts && settings.globalShortcut !== undefined) {
+    updateSettings((s) => {
+      s.keyboardShortcuts = getKeyboardShortcuts(s);
+      delete s.globalShortcut;
+    });
+  }
+
+  // Register global shortcuts based on settings
+  registerGlobalShortcuts();
 
   session.defaultSession.webRequest.onBeforeSendHeaders((details, callback) => {
     details.requestHeaders['Origin'] = 'http://localhost:5173';
     callback({ cancel: false, requestHeaders: details.requestHeaders });
   });
 
-  // Test error feature - only enabled with GOOSE_TEST_ERROR=true
-  if (process.env.GOOSE_TEST_ERROR === 'true') {
-    console.log('Test error feature enabled, will throw error in 5 seconds');
-    setTimeout(() => {
-      console.log('Throwing test error now...');
-      throw new Error('Test error: This is a simulated fatal error after 5 seconds');
-    }, 5000);
+  if (settings.showMenuBarIcon) {
+    createTray();
   }
 
-  // Parse command line arguments
+  if (process.platform === 'darwin' && !settings.showDockIcon && settings.showMenuBarIcon) {
+    app.dock?.hide();
+  }
+
   const { dirPath } = parseArgs();
 
-  createTray();
-  createNewWindow(app, dirPath);
+  if (!openUrlHandledLaunch) {
+    await createNewWindow(app, dirPath);
+  } else {
+    log.info('[Main] Skipping window creation in appMain - open-url already handled launch');
+  }
 
-  // Get the existing menu
+  // Setup auto-updater AFTER window is created and displayed (with delay to avoid blocking)
+  setTimeout(() => {
+    if (shouldSetupUpdater()) {
+      log.info('Setting up auto-updater after window creation...');
+      try {
+        setupAutoUpdater();
+      } catch (error) {
+        log.error('Error setting up auto-updater:', error);
+      }
+    }
+  }, 2000);
+
+  if (process.platform === 'darwin') {
+    const dockMenu = Menu.buildFromTemplate([
+      {
+        label: 'New Window',
+        click: () => {
+          createNewWindow(app);
+        },
+      },
+    ]);
+    app.dock?.setMenu(dockMenu);
+  }
+
   const menu = Menu.getApplicationMenu();
 
-  // App menu
+  const shortcuts = getKeyboardShortcuts(settings);
+
   const appMenu = menu?.items.find((item) => item.label === 'Goose');
   if (appMenu?.submenu) {
-    // add Settings to app menu after About
     appMenu.submenu.insert(1, new MenuItem({ type: 'separator' }));
-    appMenu.submenu.insert(
-      1,
-      new MenuItem({
-        label: 'Settings',
-        accelerator: 'CmdOrCtrl+,',
-        click() {
-          const focusedWindow = BrowserWindow.getFocusedWindow();
-          if (focusedWindow) focusedWindow.webContents.send('set-view', 'settings');
-        },
-      })
-    );
+    if (shortcuts.settings) {
+      appMenu.submenu.insert(
+        1,
+        new MenuItem({
+          label: 'Settings',
+          accelerator: shortcuts.settings,
+          click() {
+            const focusedWindow = BrowserWindow.getFocusedWindow();
+            if (focusedWindow) focusedWindow.webContents.send('set-view', 'settings');
+          },
+        })
+      );
+    }
     appMenu.submenu.insert(1, new MenuItem({ type: 'separator' }));
   }
 
-  // Add Find submenu to Edit menu
   const editMenu = menu?.items.find((item) => item.label === 'Edit');
   if (editMenu?.submenu) {
-    // Find the index of Select All to insert after it
     const selectAllIndex = editMenu.submenu.items.findIndex((item) => item.label === 'Select All');
 
-    // Create Find submenu
     const findSubmenu = Menu.buildFromTemplate([
       {
         label: 'Find…',
-        accelerator: process.platform === 'darwin' ? 'Command+F' : 'Control+F',
+        accelerator: shortcuts.find || undefined,
         click() {
           const focusedWindow = BrowserWindow.getFocusedWindow();
           if (focusedWindow) focusedWindow.webContents.send('find-command');
@@ -895,7 +1889,7 @@ app.whenReady().then(async () => {
       },
       {
         label: 'Find Next',
-        accelerator: process.platform === 'darwin' ? 'Command+G' : 'Control+G',
+        accelerator: shortcuts.findNext || undefined,
         click() {
           const focusedWindow = BrowserWindow.getFocusedWindow();
           if (focusedWindow) focusedWindow.webContents.send('find-next');
@@ -903,7 +1897,7 @@ app.whenReady().then(async () => {
       },
       {
         label: 'Find Previous',
-        accelerator: process.platform === 'darwin' ? 'Shift+Command+G' : 'Shift+Control+G',
+        accelerator: shortcuts.findPrevious || undefined,
         click() {
           const focusedWindow = BrowserWindow.getFocusedWindow();
           if (focusedWindow) focusedWindow.webContents.send('find-previous');
@@ -911,7 +1905,7 @@ app.whenReady().then(async () => {
       },
       {
         label: 'Use Selection for Find',
-        accelerator: process.platform === 'darwin' ? 'Command+E' : null,
+        accelerator: process.platform === 'darwin' ? 'Command+E' : undefined,
         click() {
           const focusedWindow = BrowserWindow.getFocusedWindow();
           if (focusedWindow) focusedWindow.webContents.send('use-selection-find');
@@ -920,7 +1914,6 @@ app.whenReady().then(async () => {
       },
     ]);
 
-    // Add Find submenu to Edit menu
     editMenu.submenu.insert(
       selectAllIndex + 1,
       new MenuItem({
@@ -930,53 +1923,54 @@ app.whenReady().then(async () => {
     );
   }
 
-  // Add Environment menu items to View menu
-  const viewMenu = menu?.items.find((item) => item.label === 'View');
-  if (viewMenu?.submenu) {
-    viewMenu.submenu.append(new MenuItem({ type: 'separator' }));
-    viewMenu.submenu.append(
-      new MenuItem({
-        label: 'Environment',
-        submenu: Menu.buildFromTemplate(
-          createEnvironmentMenu(envToggles, (newToggles) => {
-            envToggles = newToggles;
-            saveSettings({ envToggles: newToggles });
-            updateEnvironmentVariables(newToggles);
-          })
-        ),
-      })
-    );
-  }
-
   const fileMenu = menu?.items.find((item) => item.label === 'File');
 
   if (fileMenu?.submenu) {
-    fileMenu.submenu.insert(
-      0,
-      new MenuItem({
-        label: 'New Chat Window',
-        accelerator: process.platform === 'darwin' ? 'Cmd+N' : 'Ctrl+N',
-        click() {
-          ipcMain.emit('create-chat-window');
-        },
-      })
-    );
+    // Use a counter to track the actual insertion index
+    let menuIndex = 0;
 
-    // Open goose to specific dir and set that as its working space
-    fileMenu.submenu.insert(
-      1,
-      new MenuItem({
-        label: 'Open Directory...',
-        accelerator: 'CmdOrCtrl+O',
-        click: () => openDirectoryDialog(),
-      })
-    );
+    if (shortcuts.newChat) {
+      fileMenu.submenu.insert(
+        menuIndex++,
+        new MenuItem({
+          label: 'New Chat',
+          accelerator: shortcuts.newChat,
+          click() {
+            const focusedWindow = BrowserWindow.getFocusedWindow();
+            if (focusedWindow) focusedWindow.webContents.send('new-chat');
+          },
+        })
+      );
+    }
 
-    // Add Recent Files submenu
+    if (shortcuts.newChatWindow) {
+      fileMenu.submenu.insert(
+        menuIndex++,
+        new MenuItem({
+          label: 'New Chat Window',
+          accelerator: shortcuts.newChatWindow,
+          click() {
+            ipcMain.emit('create-chat-window');
+          },
+        })
+      );
+    }
+
+    if (shortcuts.openDirectory) {
+      fileMenu.submenu.insert(
+        menuIndex++,
+        new MenuItem({
+          label: 'Open Directory...',
+          accelerator: shortcuts.openDirectory,
+          click: () => openDirectoryDialog(),
+        })
+      );
+    }
+
     const recentFilesSubmenu = buildRecentFilesMenu();
     if (recentFilesSubmenu.length > 0) {
       fileMenu.submenu.insert(
-        2,
+        menuIndex++,
         new MenuItem({
           label: 'Recent Directories',
           submenu: recentFilesSubmenu,
@@ -984,20 +1978,94 @@ app.whenReady().then(async () => {
       );
     }
 
-    fileMenu.submenu.insert(3, new MenuItem({ type: 'separator' }));
+    fileMenu.submenu.insert(menuIndex++, new MenuItem({ type: 'separator' }));
 
-    // The Close Window item is here.
+    if (shortcuts.focusWindow) {
+      fileMenu.submenu.append(
+        new MenuItem({
+          label: 'Focus Goose Window',
+          accelerator: shortcuts.focusWindow,
+          click() {
+            focusWindow();
+          },
+        })
+      );
+    }
 
-    // Add menu item to tell the user about the keyboard shortcut
-    fileMenu.submenu.append(
-      new MenuItem({
-        label: 'Focus Goose Window',
-        accelerator: 'CmdOrCtrl+Alt+Shift+G',
-        click() {
-          focusWindow();
-        },
-      })
-    );
+    if (shortcuts.quickLauncher) {
+      fileMenu.submenu.append(
+        new MenuItem({
+          label: 'Quick Launcher',
+          accelerator: shortcuts.quickLauncher,
+          click() {
+            createLauncher();
+          },
+        })
+      );
+    }
+  }
+
+  if (menu) {
+    let windowMenu = menu.items.find((item) => item.label === 'Window');
+
+    if (!windowMenu) {
+      windowMenu = new MenuItem({
+        label: 'Window',
+        submenu: Menu.buildFromTemplate([]),
+      });
+
+      const helpMenuIndex = menu.items.findIndex((item) => item.label === 'Help');
+      if (helpMenuIndex >= 0) {
+        menu.items.splice(helpMenuIndex, 0, windowMenu);
+      } else {
+        menu.items.push(windowMenu);
+      }
+    }
+
+    if (windowMenu.submenu) {
+      if (shortcuts.alwaysOnTop) {
+        windowMenu.submenu.append(
+          new MenuItem({
+            label: 'Always on Top',
+            type: 'checkbox',
+            accelerator: shortcuts.alwaysOnTop,
+            click(menuItem) {
+              const focusedWindow = BrowserWindow.getFocusedWindow();
+              if (focusedWindow) {
+                const isAlwaysOnTop = menuItem.checked;
+
+                if (process.platform === 'darwin') {
+                  focusedWindow.setAlwaysOnTop(isAlwaysOnTop, 'floating');
+                } else {
+                  focusedWindow.setAlwaysOnTop(isAlwaysOnTop);
+                }
+
+                console.log(
+                  `[Main] Set always-on-top to ${isAlwaysOnTop} for window ${focusedWindow.id}`
+                );
+              }
+            },
+          })
+        );
+      }
+    }
+
+    const viewMenu = menu.items.find((item) => item.label === 'View');
+    if (viewMenu?.submenu && shortcuts.toggleNavigation) {
+      viewMenu.submenu.append(new MenuItem({ type: 'separator' }));
+      viewMenu.submenu.append(
+        new MenuItem({
+          label: 'Toggle Navigation',
+          accelerator: shortcuts.toggleNavigation,
+          click() {
+            const focusedWindow = BrowserWindow.getFocusedWindow();
+            if (focusedWindow) {
+              focusedWindow.webContents.send('toggle-navigation');
+            }
+          },
+        })
+      );
+    }
   }
 
   // on macOS, the topbar is hidden
@@ -1032,7 +2100,7 @@ app.whenReady().then(async () => {
       if (aboutGooseMenuItem.submenu) {
         aboutGooseMenuItem.submenu.append(
           new MenuItem({
-            label: `Version ${gooseVersion || app.getVersion()}`,
+            label: `Version ${version || app.getVersion()}`,
             enabled: false,
           })
         );
@@ -1048,27 +2116,56 @@ app.whenReady().then(async () => {
 
   app.on('activate', () => {
     if (BrowserWindow.getAllWindows().length === 0) {
-      createChat(app);
+      createNewWindow(app);
     }
   });
 
-  ipcMain.on(
-    'create-chat-window',
-    (_, query, dir, version, resumeSessionId, recipeConfig, viewType) => {
-      if (!dir?.trim()) {
-        const recentDirs = loadRecentDirs();
-        dir = recentDirs.length > 0 ? recentDirs[0] : null;
-      }
+  ipcMain.on('create-chat-window', (event, options = {}) => {
+    const { query, dir, resumeSessionId, viewType, recipeId } = options;
 
-      // Log the recipeConfig for debugging
-      console.log('Creating chat window with recipeConfig:', recipeConfig);
-
-      // Pass recipeConfig as part of viewOptions when viewType is recipeEditor
-      createChat(app, query, dir, version, resumeSessionId, recipeConfig, viewType);
+    let resolvedDir = dir;
+    if (!resolvedDir?.trim()) {
+      const recentDirs = loadRecentDirs();
+      resolvedDir = recentDirs.length > 0 ? recentDirs[0] : undefined;
     }
-  );
 
-  ipcMain.on('notify', (_event, data) => {
+    const isFromLauncher = query && !resumeSessionId && !viewType && !recipeId;
+
+    if (isFromLauncher) {
+      const senderWindow = BrowserWindow.fromWebContents(event.sender);
+      const launcherWindowId = senderWindow?.id;
+      const allWindows = BrowserWindow.getAllWindows();
+
+      const existingWindows = allWindows.filter(
+        (win) => !win.isDestroyed() && win.id !== launcherWindowId
+      );
+
+      if (existingWindows.length > 0) {
+        const targetWindow = existingWindows[0];
+        targetWindow.show();
+        targetWindow.focus();
+        targetWindow.webContents.send('set-initial-message', query);
+        return;
+      }
+    }
+
+    createChat(app, {
+      initialMessage: query,
+      dir: resolvedDir,
+      resumeSessionId,
+      viewType,
+      recipeId,
+    });
+  });
+
+  ipcMain.on('close-window', (event) => {
+    const window = BrowserWindow.fromWebContents(event.sender);
+    if (window && !window.isDestroyed()) {
+      window.close();
+    }
+  });
+
+  ipcMain.on('notify', (event, data) => {
     try {
       // Validate notification data
       if (!data || typeof data !== 'object') {
@@ -1093,10 +2190,24 @@ app.whenReady().then(async () => {
       const sanitizeText = (text: string) => text.replace(/<[^>]*>/g, '');
 
       console.log('NOTIFY', data);
-      new Notification({
+      const notification = new Notification({
         title: sanitizeText(data.title),
         body: sanitizeText(data.body),
-      }).show();
+      });
+
+      // Add click handler to focus the window
+      notification.on('click', () => {
+        const window = BrowserWindow.fromWebContents(event.sender);
+        if (window) {
+          if (window.isMinimized()) {
+            window.restore();
+          }
+          window.show();
+          window.focus();
+        }
+      });
+
+      notification.show();
     } catch (error) {
       console.error('Error showing notification:', error);
     }
@@ -1127,6 +2238,17 @@ app.whenReady().then(async () => {
     }
   });
 
+  ipcMain.on('broadcast-theme-change', (event, themeData) => {
+    const senderWindow = BrowserWindow.fromWebContents(event.sender);
+    const allWindows = BrowserWindow.getAllWindows();
+
+    allWindows.forEach((window) => {
+      if (window.id !== senderWindow?.id) {
+        window.webContents.send('theme-changed', themeData);
+      }
+    });
+  });
+
   ipcMain.on('reload-app', (event) => {
     // Get the window that sent the event
     const window = BrowserWindow.fromWebContents(event.sender);
@@ -1135,42 +2257,14 @@ app.whenReady().then(async () => {
     }
   });
 
-  let powerSaveBlockerId: number | null = null;
-
-  ipcMain.handle('start-power-save-blocker', () => {
-    log.info('Starting power save blocker...');
-    if (powerSaveBlockerId === null) {
-      powerSaveBlockerId = powerSaveBlocker.start('prevent-display-sleep');
-      log.info('Started power save blocker');
-      return true;
-    }
-    return false;
-  });
-
-  ipcMain.handle('stop-power-save-blocker', () => {
-    log.info('Stopping power save blocker...');
-    if (powerSaveBlockerId !== null) {
-      powerSaveBlocker.stop(powerSaveBlockerId);
-      powerSaveBlockerId = null;
-      log.info('Stopped power save blocker');
-      return true;
-    }
-    return false;
-  });
-
-  // Handle binary path requests
-  ipcMain.handle('get-binary-path', (_event, binaryName) => {
-    return getBinaryPath(app, binaryName);
-  });
-
   // Handle metadata fetching from main process
   ipcMain.handle('fetch-metadata', async (_event, url) => {
     try {
       // Validate URL
       const parsedUrl = new URL(url);
 
-      // Only allow http and https protocols
-      if (!['http:', 'https:'].includes(parsedUrl.protocol)) {
+      // Only allow http and https protocols for fetching web content
+      if (!WEB_PROTOCOLS.includes(parsedUrl.protocol)) {
         throw new Error('Invalid URL protocol. Only HTTP and HTTPS are allowed.');
       }
 
@@ -1208,8 +2302,8 @@ app.whenReady().then(async () => {
       // Validate URL
       const parsedUrl = new URL(url);
 
-      // Only allow http and https protocols
-      if (!['http:', 'https:'].includes(parsedUrl.protocol)) {
+      // Only allow http and https protocols for browser URLs
+      if (!WEB_PROTOCOLS.includes(parsedUrl.protocol)) {
         console.error('Invalid URL protocol. Only HTTP and HTTPS are allowed.');
         return;
       }
@@ -1225,71 +2319,183 @@ app.whenReady().then(async () => {
         spawn('xdg-open', [url]);
       }
     } catch (error) {
-      console.error('Error opening URL in Chrome:', error);
+      console.error('Error opening URL in browser:', error);
     }
   });
+
+  // Handle app restart
+  ipcMain.on('restart-app', () => {
+    app.relaunch();
+    app.exit(0);
+  });
+
+  // Handler for getting app version
+  ipcMain.on('get-app-version', (event) => {
+    event.returnValue = app.getVersion();
+  });
+
+  ipcMain.handle('open-directory-in-explorer', async (_event, path: string) => {
+    try {
+      return !!(await shell.openPath(path));
+    } catch (error) {
+      console.error('Error opening directory in explorer:', error);
+      return false;
+    }
+  });
+
+  ipcMain.handle('launch-app', async (event, gooseApp: GooseApp) => {
+    try {
+      const launchingWindow = BrowserWindow.fromWebContents(event.sender);
+      if (!launchingWindow) {
+        throw new Error('Could not find launching window');
+      }
+
+      const launchingWindowId = launchingWindow.id;
+      const launchingClient = goosedClients.get(launchingWindowId);
+      if (!launchingClient) {
+        throw new Error('No client found for launching window');
+      }
+
+      const appWindow = new BrowserWindow({
+        title: formatAppName(gooseApp.name),
+        width: gooseApp.width ?? 800,
+        height: gooseApp.height ?? 600,
+        resizable: gooseApp.resizable ?? true,
+        useContentSize: true,
+        webPreferences: {
+          preload: path.join(__dirname, 'preload.js'),
+          nodeIntegration: false,
+          contextIsolation: true,
+          webSecurity: true,
+          partition: 'persist:goose',
+        },
+      });
+
+      goosedClients.set(appWindow.id, launchingClient);
+      appWindows.set(gooseApp.name, appWindow);
+
+      appWindow.on('close', () => {
+        goosedClients.delete(appWindow.id);
+        appWindows.delete(gooseApp.name);
+      });
+
+      const workingDir = app.getPath('home');
+      const extensionName = gooseApp.mcpServers?.[0] ?? '';
+
+      const url = getAppUrl();
+
+      const searchParams = new URLSearchParams();
+      searchParams.set('resourceUri', gooseApp.uri);
+      searchParams.set('extensionName', extensionName);
+      searchParams.set('appName', gooseApp.name);
+      searchParams.set('workingDir', workingDir);
+
+      url.hash = `/standalone-app?${searchParams.toString()}`;
+      await appWindow.loadURL(formatUrl(url));
+      appWindow.show();
+    } catch (error) {
+      console.error('Failed to launch app:', error);
+      throw error;
+    }
+  });
+
+  ipcMain.handle('refresh-app', async (_event, gooseApp: GooseApp) => {
+    try {
+      const appWindow = appWindows.get(gooseApp.name);
+      if (!appWindow || appWindow.isDestroyed()) {
+        console.log(`App window for '${gooseApp.name}' not found or destroyed, skipping refresh`);
+        return;
+      }
+
+      // Bring to front first
+      if (appWindow.isMinimized()) {
+        appWindow.restore();
+      }
+      appWindow.show();
+      appWindow.focus();
+
+      // Then reload
+      await appWindow.webContents.reload();
+    } catch (error) {
+      console.error('Failed to refresh app:', error);
+      throw error;
+    }
+  });
+
+  ipcMain.handle('close-app', async (_event, appName: string) => {
+    try {
+      const appWindow = appWindows.get(appName);
+      if (!appWindow || appWindow.isDestroyed()) {
+        console.log(`App window for '${appName}' not found or destroyed, skipping close`);
+        return;
+      }
+
+      appWindow.close();
+    } catch (error) {
+      console.error('Failed to close app:', error);
+      throw error;
+    }
+  });
+}
+
+app.whenReady().then(async () => {
+  try {
+    await appMain();
+  } catch (error) {
+    dialog.showErrorBox('Goose Error', `Failed to create main window: ${error}`);
+    app.quit();
+  }
 });
 
-/**
- * Fetches the allowed extensions list from the remote YAML file if GOOSE_ALLOWLIST is set.
- * If the ALLOWLIST is not set, any are allowed. If one is set, it will warn if the deeplink
- * doesn't match a command from the list.
- * If it fails to load, then it will return an empty list.
- * If the format is incorrect, it will return an empty list.
- * Format of yaml is:
- *
- ```yaml:
- extensions:
-  - id: slack
-    command: uvx mcp_slack
-  - id: knowledge_graph_memory
-    command: npx -y @modelcontextprotocol/server-memory
-  ```
- *
- * @returns A promise that resolves to an array of extension commands that are allowed.
- */
 async function getAllowList(): Promise<string[]> {
   if (!process.env.GOOSE_ALLOWLIST) {
     return [];
   }
 
-  try {
-    // Fetch the YAML file
-    const response = await fetch(process.env.GOOSE_ALLOWLIST);
+  const response = await fetch(process.env.GOOSE_ALLOWLIST);
 
-    if (!response.ok) {
-      throw new Error(
-        `Failed to fetch allowed extensions: ${response.status} ${response.statusText}`
-      );
-    }
+  if (!response.ok) {
+    throw new Error(
+      `Failed to fetch allowed extensions: ${response.status} ${response.statusText}`
+    );
+  }
 
-    // Parse the YAML content
-    const yamlContent = await response.text();
-    const parsedYaml = yaml.parse(yamlContent);
+  // Parse the YAML content
+  const yamlContent = await response.text();
+  const parsedYaml = yaml.parse(yamlContent);
 
-    // Extract the commands from the extensions array
-    if (parsedYaml && parsedYaml.extensions && Array.isArray(parsedYaml.extensions)) {
-      const commands = parsedYaml.extensions.map(
-        (ext: { id: string; command: string }) => ext.command
-      );
-      console.log(`Fetched ${commands.length} allowed extension commands`);
-      return commands;
-    } else {
-      console.error('Invalid YAML structure:', parsedYaml);
-      return [];
-    }
-  } catch (error) {
-    console.error('Error in getAllowList:', error);
-    throw error;
+  // Extract the commands from the extensions array
+  if (parsedYaml && parsedYaml.extensions && Array.isArray(parsedYaml.extensions)) {
+    const commands = parsedYaml.extensions.map(
+      (ext: { id: string; command: string }) => ext.command
+    );
+    console.log(`Fetched ${commands.length} allowed extension commands`);
+    return commands;
+  } else {
+    console.error('Invalid YAML structure:', parsedYaml);
+    return [];
   }
 }
 
-app.on('will-quit', () => {
-  // Unregister all shortcuts when quitting
+app.on('will-quit', async () => {
+  for (const [windowId, blockerId] of windowPowerSaveBlockers.entries()) {
+    try {
+      powerSaveBlocker.stop(blockerId);
+      console.log(
+        `[Main] Stopped power save blocker ${blockerId} for window ${windowId} during app quit`
+      );
+    } catch (error) {
+      console.error(
+        `[Main] Failed to stop power save blocker ${blockerId} for window ${windowId}:`,
+        error
+      );
+    }
+  }
+  windowPowerSaveBlockers.clear();
+
   globalShortcut.unregisterAll();
 });
 
-// Quit when all windows are closed, except on macOS or if we have a tray icon.
 app.on('window-all-closed', () => {
   // Only quit if we're not on macOS or don't have a tray icon
   if (process.platform !== 'darwin' || !tray) {

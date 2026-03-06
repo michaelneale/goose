@@ -1,8 +1,11 @@
 use super::completion::GooseCompleter;
+use super::{CompletionCache, HintStatus};
 use anyhow::Result;
+use goose::config::Config;
 use rustyline::Editor;
 use shlex;
 use std::collections::HashMap;
+use std::sync::Arc;
 
 #[derive(Debug)]
 pub enum InputResult {
@@ -11,14 +14,17 @@ pub enum InputResult {
     AddExtension(String),
     AddBuiltin(String),
     ToggleTheme,
+    SelectTheme(String),
     Retry,
     ListPrompts(Option<String>),
     PromptCommand(PromptCommandOptions),
     GooseMode(String),
     Plan(PlanCommandOptions),
     EndPlan,
+    Clear,
     Recipe(Option<String>),
-    Summarize,
+    Compact,
+    ToggleFullToolOutput,
 }
 
 #[derive(Debug)]
@@ -33,20 +39,159 @@ pub struct PlanCommandOptions {
     pub message_text: String,
 }
 
+struct CtrlCHandler {
+    completion_cache: Arc<std::sync::RwLock<CompletionCache>>,
+}
+
+impl CtrlCHandler {
+    fn new(completion_cache: Arc<std::sync::RwLock<CompletionCache>>) -> Self {
+        Self { completion_cache }
+    }
+}
+
+impl rustyline::ConditionalEventHandler for CtrlCHandler {
+    /// Handle Ctrl+C to clear the line if text is entered, otherwise check if we should exit.
+    fn handle(
+        &self,
+        _event: &rustyline::Event,
+        _n: usize,
+        _positive: bool,
+        ctx: &rustyline::EventContext,
+    ) -> Option<rustyline::Cmd> {
+        if !ctx.line().is_empty() {
+            // Clear the line if there's text
+            let mut cache = self.completion_cache.write().unwrap();
+            cache.hint_status = HintStatus::Default;
+            Some(rustyline::Cmd::Kill(rustyline::Movement::WholeBuffer))
+        } else {
+            let mut cache = self.completion_cache.write().unwrap();
+
+            if cache.hint_status == HintStatus::MaybeExit {
+                return Some(rustyline::Cmd::Interrupt);
+            }
+
+            cache.hint_status = HintStatus::MaybeExit;
+            drop(cache);
+
+            Some(rustyline::Cmd::Repaint)
+        }
+    }
+}
+
+pub fn get_newline_key() -> char {
+    Config::global()
+        .get_param::<String>("GOOSE_CLI_NEWLINE_KEY")
+        .ok()
+        .and_then(|s| s.chars().next())
+        .map(|c| c.to_ascii_lowercase())
+        .unwrap_or('j')
+}
+
 pub fn get_input(
     editor: &mut Editor<GooseCompleter, rustyline::history::DefaultHistory>,
+    conversation_messages: Option<&Vec<String>>,
 ) -> Result<InputResult> {
-    // Ensure Ctrl-J binding is set for newlines
+    let config = Config::global();
+    if let Ok(Some(editor_cmd)) = config.get_goose_prompt_editor() {
+        let messages = extract_recent_messages(conversation_messages);
+        let message_refs: Vec<&str> = messages.iter().map(|s| s.as_str()).collect();
+        let (message, has_meaningful_content) =
+            crate::session::editor::get_editor_input(&editor_cmd, &message_refs)?;
+
+        if !has_meaningful_content {
+            return get_regular_input(editor);
+        }
+        editor.add_history_entry(message.as_str())?;
+        return Ok(InputResult::Message(message));
+    }
+
+    let completion_cache = editor
+        .helper()
+        .map(|h| h.completion_cache.clone())
+        .ok_or_else(|| anyhow::anyhow!("Editor helper not set"))?;
+
+    let newline_key = get_newline_key();
     editor.bind_sequence(
-        rustyline::KeyEvent(rustyline::KeyCode::Char('j'), rustyline::Modifiers::CTRL),
+        rustyline::KeyEvent(
+            rustyline::KeyCode::Char(newline_key),
+            rustyline::Modifiers::CTRL,
+        ),
         rustyline::EventHandler::Simple(rustyline::Cmd::Newline),
     );
 
-    let prompt = format!("{} ", console::style("( O)>").cyan().bold());
+    editor.bind_sequence(
+        rustyline::KeyEvent(rustyline::KeyCode::Char('c'), rustyline::Modifiers::CTRL),
+        rustyline::EventHandler::Conditional(Box::new(CtrlCHandler::new(completion_cache))),
+    );
+
+    let prompt = get_input_prompt_string();
+
     let input = match editor.readline(&prompt) {
         Ok(text) => text,
         Err(e) => match e {
             rustyline::error::ReadlineError::Interrupted => return Ok(InputResult::Exit),
+            rustyline::error::ReadlineError::Eof => return Ok(InputResult::Exit),
+            _ => return Err(e.into()),
+        },
+    };
+
+    // Add valid input to history (history saving to file is handled in the Session::interactive method)
+    if !input.trim().is_empty() {
+        editor.add_history_entry(input.as_str())?;
+    }
+
+    // Handle non-slash commands first
+    if !input.starts_with('/') {
+        let trimmed = input.trim();
+        if trimmed.is_empty()
+            || trimmed.eq_ignore_ascii_case("exit")
+            || trimmed.eq_ignore_ascii_case("quit")
+        {
+            return Ok(if trimmed.is_empty() {
+                InputResult::Retry
+            } else {
+                InputResult::Exit
+            });
+        }
+        return Ok(InputResult::Message(trimmed.to_string()));
+    }
+
+    // Handle slash commands
+    match handle_slash_command(&input) {
+        Some(result) => Ok(result),
+        None => Ok(InputResult::Message(input.trim().to_string())),
+    }
+}
+
+fn get_regular_input(
+    editor: &mut Editor<GooseCompleter, rustyline::history::DefaultHistory>,
+) -> Result<InputResult> {
+    let completion_cache = editor
+        .helper()
+        .map(|h| h.completion_cache.clone())
+        .ok_or_else(|| anyhow::anyhow!("Editor helper not set"))?;
+
+    let newline_key = get_newline_key();
+    editor.bind_sequence(
+        rustyline::KeyEvent(
+            rustyline::KeyCode::Char(newline_key),
+            rustyline::Modifiers::CTRL,
+        ),
+        rustyline::EventHandler::Simple(rustyline::Cmd::Newline),
+    );
+
+    editor.bind_sequence(
+        rustyline::KeyEvent(rustyline::KeyCode::Char('c'), rustyline::Modifiers::CTRL),
+        rustyline::EventHandler::Conditional(Box::new(CtrlCHandler::new(completion_cache))),
+    );
+
+    let prompt = get_input_prompt_string();
+
+    let input = match editor.readline(&prompt) {
+        Ok(text) => text,
+        Err(e) => match e {
+            rustyline::error::ReadlineError::Interrupted => return Ok(InputResult::Exit),
+            rustyline::error::ReadlineError::Eof => return Ok(InputResult::Exit),
             _ => return Err(e.into()),
         },
     };
@@ -91,16 +236,35 @@ fn handle_slash_command(input: &str) -> Option<InputResult> {
     const CMD_MODE: &str = "/mode ";
     const CMD_PLAN: &str = "/plan";
     const CMD_ENDPLAN: &str = "/endplan";
+    const CMD_CLEAR: &str = "/clear";
     const CMD_RECIPE: &str = "/recipe";
-    const CMD_SUMMARIZE: &str = "/summarize";
+    const CMD_COMPACT: &str = "/compact";
+    const CMD_SUMMARIZE_DEPRECATED: &str = "/summarize";
 
     match input {
         "/exit" | "/quit" => Some(InputResult::Exit),
         "/?" | "/help" => {
             print_help();
+            print_editor_help();
             Some(InputResult::Retry)
         }
         "/t" => Some(InputResult::ToggleTheme),
+        s if s.starts_with("/t ") => {
+            let t = s
+                .strip_prefix("/t ")
+                .unwrap_or_default()
+                .trim()
+                .to_lowercase();
+            if ["light", "dark", "ansi"].contains(&t.as_str()) {
+                Some(InputResult::SelectTheme(t))
+            } else {
+                println!(
+                    "Theme Unavailable: {} Available themes are: light, dark, ansi",
+                    t
+                );
+                Some(InputResult::Retry)
+            }
+        }
         "/prompts" => Some(InputResult::ListPrompts(None)),
         s if s.starts_with(CMD_PROMPTS) => {
             // Parse arguments for /prompts command
@@ -124,18 +288,26 @@ fn handle_slash_command(input: &str) -> Option<InputResult> {
             }
         }
         s if s.starts_with(CMD_EXTENSION) => Some(InputResult::AddExtension(
-            s[CMD_EXTENSION.len()..].to_string(),
+            s.get(CMD_EXTENSION.len()..).unwrap_or("").to_string(),
         )),
-        s if s.starts_with(CMD_BUILTIN) => {
-            Some(InputResult::AddBuiltin(s[CMD_BUILTIN.len()..].to_string()))
+        s if s.starts_with(CMD_BUILTIN) => Some(InputResult::AddBuiltin(
+            s.get(CMD_BUILTIN.len()..).unwrap_or("").to_string(),
+        )),
+        s if s.starts_with(CMD_MODE) => Some(InputResult::GooseMode(
+            s.get(CMD_MODE.len()..).unwrap_or("").to_string(),
+        )),
+        s if s.starts_with(CMD_PLAN) => {
+            parse_plan_command(s.get(CMD_PLAN.len()..).unwrap_or("").trim().to_string())
         }
-        s if s.starts_with(CMD_MODE) => {
-            Some(InputResult::GooseMode(s[CMD_MODE.len()..].to_string()))
-        }
-        s if s.starts_with(CMD_PLAN) => parse_plan_command(s[CMD_PLAN.len()..].trim().to_string()),
         s if s == CMD_ENDPLAN => Some(InputResult::EndPlan),
+        s if s == CMD_CLEAR => Some(InputResult::Clear),
         s if s.starts_with(CMD_RECIPE) => parse_recipe_command(s),
-        s if s == CMD_SUMMARIZE => Some(InputResult::Summarize),
+        s if s == CMD_COMPACT => Some(InputResult::Compact),
+        s if s == CMD_SUMMARIZE_DEPRECATED => {
+            println!("{}", console::style("⚠️  Note: /summarize has been renamed to /compact and will be removed in a future release.").yellow());
+            Some(InputResult::Compact)
+        }
+        "/r" => Some(InputResult::ToggleFullToolOutput),
         _ => None,
     }
 }
@@ -149,7 +321,7 @@ fn parse_recipe_command(s: &str) -> Option<InputResult> {
     }
 
     // Extract the filepath from the command
-    let filepath = s[CMD_RECIPE.len()..].trim();
+    let filepath = s.get(CMD_RECIPE.len()..).unwrap_or("").trim();
 
     if filepath.is_empty() {
         return Some(InputResult::Recipe(None));
@@ -226,16 +398,28 @@ fn parse_plan_command(input: String) -> Option<InputResult> {
     Some(InputResult::Plan(options))
 }
 
+fn get_input_prompt_string() -> String {
+    let goose = "🪿";
+    if cfg!(target_os = "windows") {
+        format!("{goose} ")
+    } else {
+        format!("{} ", console::style(goose))
+    }
+}
+
 fn print_help() {
+    let newline_key = get_newline_key().to_ascii_uppercase();
     println!(
         "Available commands:
 /exit or /quit - Exit the session
 /t - Toggle Light/Dark/Ansi theme
+/t <name> - Set theme directly (light, dark, ansi)
+/r - Toggle full tool output display (show complete tool parameters without truncation)
 /extension <command> - Add a stdio extension (format: ENV1=val1 command args...)
 /builtin <names> - Add builtin extensions by name (comma-separated)
 /prompts [--extension <name>] - List all available prompts, optionally filtered by extension
 /prompt <n> [--info] [key=value...] - Get prompt info or execute a prompt
-/mode <name> - Set the goose mode to use ('auto', 'approve', 'chat')
+/mode <name> - Set the goose mode to use ('auto', 'approve', 'chat', 'smart_approve')
 /plan <message_text> -  Enters 'plan' mode with optional message. Create a plan based on the current messages and asks user if they want to act on it.
                         If user acts on the plan, goose mode is set to 'auto' and returns to 'normal' goose mode.
                         To warm up goose before using '/plan', we recommend setting '/mode approve' & putting appropriate context into goose.
@@ -244,13 +428,35 @@ fn print_help() {
 /endplan - Exit plan mode and return to 'normal' goose mode.
 /recipe [filepath] - Generate a recipe from the current conversation and save it to the specified filepath (must end with .yaml).
                        If no filepath is provided, it will be saved to ./recipe.yaml.
-/summarize - Summarize the current conversation to reduce context length while preserving key information.
+/compact - Compact the current conversation to reduce context length while preserving key information.
 /? or /help - Display this help message
+/clear - Clears the current chat history
 
 Navigation:
-Ctrl+C - Interrupt goose (resets the interaction to before the interrupted user request)
-Ctrl+J - Add a newline
+Ctrl+C - Clear current line if text is entered, otherwise exit the session
+Ctrl+{newline_key} - Add a newline (configurable via GOOSE_CLI_NEWLINE_KEY)
 Up/Down arrows - Navigate through command history"
+    );
+}
+
+/// Extract recent messages for editor context
+fn extract_recent_messages(conversation_messages: Option<&Vec<String>>) -> Vec<String> {
+    match conversation_messages {
+        Some(messages) => {
+            // Return the messages in reverse chronological order (newest first)
+            messages.clone()
+        }
+        None => Vec::new(),
+    }
+}
+
+/// Print help information about editor input
+fn print_editor_help() {
+    println!(
+        "Editor Input:
+When goose_prompt_editor is configured, prompts will open in your editor instead of the CLI.
+Previous conversation is included as markdown headings for context.
+Configure with: goose configure set goose_prompt_editor \"vim\""
     );
 }
 
@@ -284,6 +490,12 @@ mod tests {
         assert!(matches!(
             handle_slash_command("/t"),
             Some(InputResult::ToggleTheme)
+        ));
+
+        // Test full tool output toggle
+        assert!(matches!(
+            handle_slash_command("/r"),
+            Some(InputResult::ToggleFullToolOutput)
         ));
 
         // Test extension command
@@ -480,13 +692,18 @@ mod tests {
     }
 
     #[test]
-    fn test_summarize_command() {
-        // Test the summarize command
-        let result = handle_slash_command("/summarize");
-        assert!(matches!(result, Some(InputResult::Summarize)));
+    fn test_get_input_prompt_string() {
+        let prompt = get_input_prompt_string();
 
-        // Test with whitespace
-        let result = handle_slash_command("  /summarize  ");
-        assert!(matches!(result, Some(InputResult::Summarize)));
+        // Prompt should always end with a space
+        assert!(prompt.ends_with(' '));
+
+        // Prompt should contain the goose emoji
+        assert!(prompt.contains("🪿"));
+
+        #[cfg(target_os = "windows")]
+        {
+            assert_eq!(prompt, "🪿 ");
+        }
     }
 }

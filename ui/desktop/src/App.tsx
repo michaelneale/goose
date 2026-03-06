@@ -1,228 +1,415 @@
-import React, { useEffect, useRef, useState } from 'react';
+import { useEffect, useState, useRef } from 'react';
 import { IpcRendererEvent } from 'electron';
+import {
+  HashRouter,
+  Routes,
+  Route,
+  useNavigate,
+  useLocation,
+  useSearchParams,
+} from 'react-router-dom';
 import { openSharedSessionFromDeepLink } from './sessionLinks';
-import { initializeSystem } from './utils/providerUtils';
+import { type SharedSessionDetails } from './sharedSessions';
 import { ErrorUI } from './components/ErrorBoundary';
-import { ConfirmationModal } from './components/ui/ConfirmationModal';
+import { ExtensionInstallModal } from './components/ExtensionInstallModal';
 import { ToastContainer } from 'react-toastify';
-import { toastService } from './toasts';
-import { extractExtensionName } from './components/settings/extensions/utils';
-import { GoosehintsModal } from './components/GoosehintsModal';
-import { SessionDetails } from './sessions';
+import AnnouncementModal from './components/AnnouncementModal';
+import TelemetryOptOutModal from './components/TelemetryOptOutModal';
+import ProviderGuard from './components/ProviderGuard';
+import { createSession } from './sessions';
 
-import ChatView from './components/ChatView';
-import SuspenseLoader from './suspense-loader';
-import { type SettingsViewOptions } from './components/settings/SettingsView';
-import SettingsViewV2 from './components/settings_v2/SettingsView';
-import MoreModelsView from './components/settings/models/MoreModelsView';
-import ConfigureProvidersView from './components/settings/providers/ConfigureProvidersView';
+import { ChatType } from './types/chat';
+import Hub from './components/Hub';
+import { UserInput } from './types/message';
+
+interface PairRouteState {
+  resumeSessionId?: string;
+  initialMessage?: UserInput;
+}
+import SettingsView, { SettingsViewOptions } from './components/settings/SettingsView';
 import SessionsView from './components/sessions/SessionsView';
 import SharedSessionView from './components/sessions/SharedSessionView';
-import ProviderSettings from './components/settings_v2/providers/ProviderSettingsPage';
-import RecipeEditor from './components/RecipeEditor';
-import { useChat } from './hooks/useChat';
+import SchedulesView from './components/schedule/SchedulesView';
+import ProviderSettings from './components/settings/providers/ProviderSettingsPage';
+import { AppLayout } from './components/Layout/AppLayout';
+import { ChatProvider, DEFAULT_CHAT_TITLE } from './contexts/ChatContext';
+import LauncherView from './components/LauncherView';
 
 import 'react-toastify/dist/ReactToastify.css';
-import { useConfig, MalformedConfigError } from './components/ConfigContext';
-import { addExtensionFromDeepLink as addExtensionFromDeepLinkV2 } from './components/settings_v2/extensions';
-import { backupConfig, initConfig, readAllConfig } from './api/sdk.gen';
-import PermissionSettingsView from './components/settings_v2/permission/PermissionSetting';
+import { useConfig } from './components/ConfigContext';
+import { ModelAndProviderProvider } from './components/ModelAndProviderContext';
+import { ThemeProvider } from './contexts/ThemeContext';
+import PermissionSettingsView from './components/settings/permission/PermissionSetting';
 
-// Views and their options
-export type View =
-  | 'welcome'
-  | 'chat'
-  | 'settings'
-  | 'moreModels'
-  | 'configureProviders'
-  | 'configPage'
-  | 'ConfigureProviders'
-  | 'settingsV2'
-  | 'sessions'
-  | 'sharedSession'
-  | 'loading'
-  | 'recipeEditor'
-  | 'permission';
+import ExtensionsView, { ExtensionsViewOptions } from './components/extensions/ExtensionsView';
+import RecipesView from './components/recipes/RecipesView';
+import AppsView from './components/apps/AppsView';
+import StandaloneAppView from './components/apps/StandaloneAppView';
+import { View, ViewOptions } from './utils/navigationUtils';
 
-export type ViewOptions =
-  | SettingsViewOptions
-  | { resumedSession?: SessionDetails }
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  | Record<string, any>;
+import { useNavigation } from './hooks/useNavigation';
+import { errorMessage } from './utils/conversionUtils';
+import { getInitialWorkingDir } from './utils/workingDir';
+import { usePageViewTracking } from './hooks/useAnalytics';
+import { trackOnboardingCompleted, trackErrorWithContext } from './utils/analytics';
+import { AppEvents } from './constants/events';
+import { registerPlatformEventHandlers } from './utils/platform_events';
 
-export type ViewConfig = {
-  view: View;
-  viewOptions?: ViewOptions;
+function PageViewTracker() {
+  usePageViewTracking();
+  return null;
+}
+
+// Route Components
+const HubRouteWrapper = () => {
+  const setView = useNavigation();
+  return <Hub setView={setView} />;
 };
 
-const getInitialView = (): ViewConfig => {
-  const urlParams = new URLSearchParams(window.location.search);
-  const viewFromUrl = urlParams.get('view');
-  const windowConfig = window.electron.getConfig();
+const PairRouteWrapper = ({
+  activeSessions,
+}: {
+  activeSessions: Array<{
+    sessionId: string;
+    initialMessage?: UserInput;
+  }>;
+  setActiveSessions: (sessions: Array<{ sessionId: string; initialMessage?: UserInput }>) => void;
+}) => {
+  const { extensionsList } = useConfig();
+  const location = useLocation();
+  const routeState =
+    (location.state as PairRouteState) || (window.history.state as PairRouteState) || {};
+  const [searchParams, setSearchParams] = useSearchParams();
+  const [isCreatingSession, setIsCreatingSession] = useState(false);
 
-  if (viewFromUrl === 'recipeEditor' && windowConfig?.recipeConfig) {
-    return {
-      view: 'recipeEditor',
-      viewOptions: {
-        config: windowConfig.recipeConfig,
-      },
-    };
-  }
+  const resumeSessionId = searchParams.get('resumeSessionId') ?? undefined;
+  const recipeDeeplinkFromConfig = window.appConfig?.get('recipeDeeplink') as string | undefined;
+  const recipeIdFromConfig = window.appConfig?.get('recipeId') as string | undefined;
+  const initialMessage = routeState.initialMessage;
 
-  // Any other URL-specified view
-  if (viewFromUrl) {
-    return {
-      view: viewFromUrl as View,
-      viewOptions: {},
-    };
-  }
+  // Create session if we have an initialMessage, recipeDeeplink, or recipeId but no sessionId
+  useEffect(() => {
+    if (
+      (initialMessage || recipeDeeplinkFromConfig || recipeIdFromConfig) &&
+      !resumeSessionId &&
+      !isCreatingSession
+    ) {
+      setIsCreatingSession(true);
 
-  // Default case
-  return {
-    view: 'loading',
-    viewOptions: {},
-  };
+      (async () => {
+        try {
+          const newSession = await createSession(getInitialWorkingDir(), {
+            recipeDeeplink: recipeDeeplinkFromConfig,
+            recipeId: recipeIdFromConfig,
+            allExtensions: extensionsList,
+          });
+
+          window.dispatchEvent(
+            new CustomEvent(AppEvents.ADD_ACTIVE_SESSION, {
+              detail: {
+                sessionId: newSession.id,
+                initialMessage,
+              },
+            })
+          );
+
+          setSearchParams((prev) => {
+            prev.set('resumeSessionId', newSession.id);
+            return prev;
+          });
+        } catch (error) {
+          console.error('Failed to create session:', error);
+          trackErrorWithContext(error, {
+            component: 'PairRouteWrapper',
+            action: 'create_session',
+            recoverable: true,
+          });
+        } finally {
+          setIsCreatingSession(false);
+        }
+      })();
+    }
+    // Note: isCreatingSession is intentionally NOT in the dependency array
+    // It's only used as a guard to prevent concurrent session creation
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [
+    initialMessage,
+    recipeDeeplinkFromConfig,
+    recipeIdFromConfig,
+    resumeSessionId,
+    setSearchParams,
+    extensionsList,
+  ]);
+
+  // Add resumed session to active sessions if not already there
+  useEffect(() => {
+    if (resumeSessionId && !activeSessions.some((s) => s.sessionId === resumeSessionId)) {
+      window.dispatchEvent(
+        new CustomEvent(AppEvents.ADD_ACTIVE_SESSION, {
+          detail: {
+            sessionId: resumeSessionId,
+            initialMessage: initialMessage,
+          },
+        })
+      );
+    }
+  }, [resumeSessionId, activeSessions, initialMessage]);
+
+  return null;
 };
 
-export default function App() {
+const SettingsRoute = () => {
+  const location = useLocation();
+  const navigate = useNavigate();
+  const [searchParams] = useSearchParams();
+  const setView = useNavigation();
+
+  // Get viewOptions from location.state, history.state, or URL search params
+  const viewOptions =
+    (location.state as SettingsViewOptions) || (window.history.state as SettingsViewOptions) || {};
+
+  // If section is provided via URL search params, add it to viewOptions
+  const sectionFromUrl = searchParams.get('section');
+  if (sectionFromUrl) {
+    viewOptions.section = sectionFromUrl;
+  }
+
+  return <SettingsView onClose={() => navigate('/')} setView={setView} viewOptions={viewOptions} />;
+};
+
+const SessionsRoute = () => {
+  return <SessionsView />;
+};
+
+const SchedulesRoute = () => {
+  const navigate = useNavigate();
+  return <SchedulesView onClose={() => navigate('/')} />;
+};
+
+const RecipesRoute = () => {
+  return <RecipesView />;
+};
+
+const PermissionRoute = () => {
+  const location = useLocation();
+  const navigate = useNavigate();
+  const parentView = location.state?.parentView as View;
+  const parentViewOptions = location.state?.parentViewOptions as ViewOptions;
+
+  return (
+    <PermissionSettingsView
+      onClose={() => {
+        // Navigate back to parent view with options
+        switch (parentView) {
+          case 'chat':
+            navigate('/');
+            break;
+          case 'pair':
+            navigate('/pair');
+            break;
+          case 'settings':
+            navigate('/settings', { state: parentViewOptions });
+            break;
+          case 'sessions':
+            navigate('/sessions');
+            break;
+          case 'schedules':
+            navigate('/schedules');
+            break;
+          case 'recipes':
+            navigate('/recipes');
+            break;
+          default:
+            navigate('/');
+        }
+      }}
+    />
+  );
+};
+
+const ConfigureProvidersRoute = () => {
+  const navigate = useNavigate();
+
+  return (
+    <div className="w-screen h-screen bg-background-primary">
+      <ProviderSettings
+        onClose={() => navigate('/settings', { state: { section: 'models' } })}
+        isOnboarding={false}
+      />
+    </div>
+  );
+};
+
+interface WelcomeRouteProps {
+  onSelectProvider: () => void;
+}
+
+const WelcomeRoute = ({ onSelectProvider }: WelcomeRouteProps) => {
+  const navigate = useNavigate();
+
+  return (
+    <div className="w-screen h-screen bg-background-primary">
+      <ProviderSettings
+        onClose={() => {
+          navigate('/', { replace: true });
+        }}
+        isOnboarding={true}
+        onProviderLaunched={(model?: string) => {
+          trackOnboardingCompleted('other', model);
+          onSelectProvider();
+          navigate('/', { replace: true });
+        }}
+      />
+    </div>
+  );
+};
+
+// Wrapper component for SharedSessionRoute to access parent state
+const SharedSessionRouteWrapper = ({
+  isLoadingSharedSession,
+  setIsLoadingSharedSession,
+  sharedSessionError,
+}: {
+  isLoadingSharedSession: boolean;
+  setIsLoadingSharedSession: (loading: boolean) => void;
+  sharedSessionError: string | null;
+}) => {
+  const location = useLocation();
+  const setView = useNavigation();
+
+  const historyState = window.history.state;
+  const sessionDetails = (location.state?.sessionDetails ||
+    historyState?.sessionDetails) as SharedSessionDetails | null;
+  const error = location.state?.error || historyState?.error || sharedSessionError;
+  const shareToken = location.state?.shareToken || historyState?.shareToken;
+  const baseUrl = location.state?.baseUrl || historyState?.baseUrl;
+
+  return (
+    <SharedSessionView
+      session={sessionDetails}
+      isLoading={isLoadingSharedSession}
+      error={error}
+      onRetry={async () => {
+        if (shareToken && baseUrl) {
+          setIsLoadingSharedSession(true);
+          try {
+            await openSharedSessionFromDeepLink(`goose://sessions/${shareToken}`, setView, baseUrl);
+          } catch (error) {
+            console.error('Failed to retry loading shared session:', error);
+          } finally {
+            setIsLoadingSharedSession(false);
+          }
+        }
+      }}
+    />
+  );
+};
+
+const ExtensionsRoute = () => {
+  const navigate = useNavigate();
+  const location = useLocation();
+
+  // Get viewOptions from location.state or history.state (for deep link extensions)
+  const viewOptions =
+    (location.state as ExtensionsViewOptions) ||
+    (window.history.state as ExtensionsViewOptions) ||
+    {};
+
+  return (
+    <ExtensionsView
+      onClose={() => navigate(-1)}
+      setView={(view, options) => {
+        switch (view) {
+          case 'chat':
+            navigate('/');
+            break;
+          case 'pair':
+            navigate('/pair', { state: options });
+            break;
+          case 'settings':
+            navigate('/settings', { state: options });
+            break;
+          default:
+            navigate('/');
+        }
+      }}
+      viewOptions={viewOptions}
+    />
+  );
+};
+
+export function AppInner() {
   const [fatalError, setFatalError] = useState<string | null>(null);
-  const [modalVisible, setModalVisible] = useState(false);
-  const [appInitialized, setAppInitialized] = useState(false);
-  const [pendingLink, setPendingLink] = useState<string | null>(null);
-  const [modalMessage, setModalMessage] = useState<string>('');
-  const [extensionConfirmLabel, setExtensionConfirmLabel] = useState<string>('');
-  const [extensionConfirmTitle, setExtensionConfirmTitle] = useState<string>('');
-  const [{ view, viewOptions }, setInternalView] = useState<ViewConfig>(getInitialView());
-  const { getExtensions, addExtension, read } = useConfig();
-  const initAttemptedRef = useRef(false);
+  const [isLoadingSharedSession, setIsLoadingSharedSession] = useState(false);
+  const [sharedSessionError, setSharedSessionError] = useState<string | null>(null);
+  const [didSelectProvider, setDidSelectProvider] = useState<boolean>(false);
 
-  // Utility function to extract the command from the link
-  function extractCommand(link: string): string {
-    const url = new URL(link);
-    const cmd = url.searchParams.get('cmd') || 'Unknown Command';
-    const args = url.searchParams.getAll('arg').map(decodeURIComponent);
-    return `${cmd} ${args.join(' ')}`.trim();
-  }
+  const navigate = useNavigate();
+  const setView = useNavigation();
 
-  // Utility function to extract the remote url from the link
-  function extractRemoteUrl(link: string): string {
-    const url = new URL(link);
-    return url.searchParams.get('url');
-  }
+  const [chat, setChat] = useState<ChatType>({
+    sessionId: '',
+    name: DEFAULT_CHAT_TITLE,
+    messages: [],
+    recipe: null,
+  });
 
-  const setView = (view: View, viewOptions: ViewOptions = {}) => {
-    console.log(`Setting view to: ${view}`, viewOptions);
-    setInternalView({ view, viewOptions });
-  };
+  const MAX_ACTIVE_SESSIONS = 10;
+
+  const [activeSessions, setActiveSessions] = useState<
+    Array<{ sessionId: string; initialMessage?: UserInput }>
+  >([]);
 
   useEffect(() => {
-    // Guard against multiple initialization attempts
-    if (initAttemptedRef.current) {
-      console.log('Initialization already attempted, skipping...');
-      return;
-    }
-    initAttemptedRef.current = true;
+    const handleAddActiveSession = (event: Event) => {
+      const { sessionId, initialMessage } = (
+        event as CustomEvent<{
+          sessionId: string;
+          initialMessage?: UserInput;
+        }>
+      ).detail;
 
-    console.log(`Initializing app with settings v2`);
+      setActiveSessions((prev) => {
+        const existingIndex = prev.findIndex((s) => s.sessionId === sessionId);
 
-    const urlParams = new URLSearchParams(window.location.search);
-    const viewType = urlParams.get('view');
-    const recipeConfig = window.appConfig.get('recipeConfig');
-
-    // If we have a specific view type in the URL, use that and skip provider detection
-    if (viewType) {
-      if (viewType === 'recipeEditor' && recipeConfig) {
-        console.log('Setting view to recipeEditor with config:', recipeConfig);
-        setView('recipeEditor', { config: recipeConfig });
-      } else {
-        setView(viewType as View);
-      }
-      return;
-    }
-
-    const initializeApp = async () => {
-      try {
-        // checks if there is a config, and if not creates it
-        await initConfig();
-
-        // now try to read config, if we fail and are migrating backup, then re-init config
-        try {
-          await readAllConfig({ throwOnError: true });
-        } catch (error) {
-          // NOTE: we do this check here and in providerUtils.ts, be sure to clean up both in the future
-          const configVersion = localStorage.getItem('configVersion');
-          const shouldMigrateExtensions = !configVersion || parseInt(configVersion, 10) < 3;
-          if (shouldMigrateExtensions) {
-            await backupConfig({ throwOnError: true });
-            await initConfig();
-          } else {
-            // if we've migrated throw this back up
-            throw new Error('Unable to read config file, it may be malformed');
-          }
+        if (existingIndex !== -1) {
+          // Session exists - move to end of LRU list (most recently used)
+          const existing = prev[existingIndex];
+          return [...prev.slice(0, existingIndex), ...prev.slice(existingIndex + 1), existing];
         }
 
-        // note: if in a non recipe session, recipeConfig is undefined, otherwise null if error
-        if (recipeConfig === null) {
-          setFatalError('Cannot read recipe config. Please check the deeplink and try again.');
-          return;
+        // New session - add to end with LRU eviction if needed
+        const newSession = { sessionId, initialMessage };
+        const updated = [...prev, newSession];
+        if (updated.length > MAX_ACTIVE_SESSIONS) {
+          return updated.slice(updated.length - MAX_ACTIVE_SESSIONS);
         }
-
-        const config = window.electron.getConfig();
-
-        const provider = (await read('GOOSE_PROVIDER', false)) ?? config.GOOSE_DEFAULT_PROVIDER;
-        const model = (await read('GOOSE_MODEL', false)) ?? config.GOOSE_DEFAULT_MODEL;
-
-        if (provider && model) {
-          setView('chat');
-
-          try {
-            await initializeSystem(provider, model, {
-              getExtensions,
-              addExtension,
-            });
-          } catch (error) {
-            console.error('Error in initialization:', error);
-
-            // propagate the error upward so the global ErrorUI shows in cases
-            // where going through welcome/onboarding wouldn't address the issue
-            if (error instanceof MalformedConfigError) {
-              throw error;
-            }
-
-            setView('welcome');
-          }
-        } else {
-          console.log('Missing required configuration, showing onboarding');
-          setView('welcome');
-        }
-      } catch (error) {
-        setFatalError(
-          `Initialization failed: ${error instanceof Error ? error.message : 'Unknown error'}`
-        );
-        setView('welcome');
-      }
-
-      // Reset toast service after initialization
-      toastService.configure({ silent: false });
+        return updated;
+      });
     };
 
-    (async () => {
-      try {
-        await initializeApp();
-        setAppInitialized(true);
-      } catch (error) {
-        console.error('Unhandled error in initialization:', error);
-        setFatalError(`${error instanceof Error ? error.message : 'Unknown error'}`);
-      }
-    })();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []); // Empty dependency array since we only want this to run once
+    const handleClearInitialMessage = (event: Event) => {
+      const { sessionId } = (event as CustomEvent<{ sessionId: string }>).detail;
 
-  const [isGoosehintsModalOpen, setIsGoosehintsModalOpen] = useState(false);
-  const [isLoadingSession, setIsLoadingSession] = useState(false);
-  const [sharedSessionError, setSharedSessionError] = useState<string | null>(null);
-  const [isLoadingSharedSession, setIsLoadingSharedSession] = useState(false);
-  const { chat, setChat } = useChat({ setView, setIsLoadingSession });
+      setActiveSessions((prev) => {
+        return prev.map((session) => {
+          if (session.sessionId === sessionId) {
+            return { ...session, initialMessage: undefined };
+          }
+          return session;
+        });
+      });
+    };
+
+    window.addEventListener(AppEvents.ADD_ACTIVE_SESSION, handleAddActiveSession);
+    window.addEventListener(AppEvents.CLEAR_INITIAL_MESSAGE, handleClearInitialMessage);
+    return () => {
+      window.removeEventListener(AppEvents.ADD_ACTIVE_SESSION, handleAddActiveSession);
+      window.removeEventListener(AppEvents.CLEAR_INITIAL_MESSAGE, handleClearInitialMessage);
+    };
+  }, []);
+
+  const { addExtension } = useConfig();
 
   useEffect(() => {
     console.log('Sending reactReady signal to Electron');
@@ -230,38 +417,45 @@ export default function App() {
       window.electron.reactReady();
     } catch (error) {
       console.error('Error sending reactReady:', error);
-      setFatalError(
-        `React ready notification failed: ${error instanceof Error ? error.message : 'Unknown error'}`
-      );
+      setFatalError(`React ready notification failed: ${errorMessage(error, 'Unknown error')}`);
     }
   }, []);
 
-  // Handle shared session deep links
   useEffect(() => {
-    const handleOpenSharedSession = async (_event: IpcRendererEvent, link: string) => {
+    const handleOpenSharedSession = async (_event: IpcRendererEvent, ...args: unknown[]) => {
+      const link = args[0] as string;
       window.electron.logInfo(`Opening shared session from deep link ${link}`);
       setIsLoadingSharedSession(true);
       setSharedSessionError(null);
-
       try {
-        await openSharedSessionFromDeepLink(link, setView);
-        // No need to handle errors here as openSharedSessionFromDeepLink now handles them internally
+        await openSharedSessionFromDeepLink(link, (_view: View, options?: ViewOptions) => {
+          navigate('/shared-session', { state: options });
+        });
       } catch (error) {
-        // This should not happen, but just in case
         console.error('Unexpected error opening shared session:', error);
-        setView('sessions'); // Fallback to sessions view
+        trackErrorWithContext(error, {
+          component: 'AppInner',
+          action: 'open_shared_session',
+          recoverable: true,
+        });
+        // Navigate to shared session view with error
+        const shareToken = link.replace('goose://sessions/', '');
+        const options = {
+          sessionDetails: null,
+          error: errorMessage(error, 'Unknown error'),
+          shareToken,
+        };
+        navigate('/shared-session', { state: options });
       } finally {
         setIsLoadingSharedSession(false);
       }
     };
-
     window.electron.on('open-shared-session', handleOpenSharedSession);
     return () => {
       window.electron.off('open-shared-session', handleOpenSharedSession);
     };
-  }, []);
+  }, [navigate]);
 
-  // Keyboard shortcut handler
   useEffect(() => {
     console.log('Setting up keyboard shortcuts');
     const handleKeyDown = (event: KeyboardEvent) => {
@@ -269,182 +463,106 @@ export default function App() {
       if ((isMac ? event.metaKey : event.ctrlKey) && event.key === 'n') {
         event.preventDefault();
         try {
-          const workingDir = window.appConfig.get('GOOSE_WORKING_DIR');
-          console.log(`Creating new chat window with working dir: ${workingDir}`);
-          window.electron.createChatWindow(undefined, workingDir as string);
+          window.electron.createChatWindow({ dir: getInitialWorkingDir() });
         } catch (error) {
           console.error('Error creating new window:', error);
         }
       }
     };
-
     window.addEventListener('keydown', handleKeyDown);
     return () => {
       window.removeEventListener('keydown', handleKeyDown);
     };
   }, []);
 
+  // Prevent default drag and drop behavior globally to avoid opening files in new windows
+  // but allow our React components to handle drops in designated areas
   useEffect(() => {
-    console.log('Setting up fatal error handler');
-    const handleFatalError = (_event: IpcRendererEvent, errorMessage: string) => {
-      console.error('Encountered a fatal error: ', errorMessage);
-      // Log additional context that might help diagnose the issue
-      console.error('Current view:', view);
-      console.error('Is loading session:', isLoadingSession);
-      setFatalError(errorMessage);
+    const preventDefaults = (e: globalThis.DragEvent) => {
+      // Only prevent default if we're not over a designated drop zone
+      const target = e.target as HTMLElement;
+      const isOverDropZone = target.closest('[data-drop-zone="true"]') !== null;
+
+      if (!isOverDropZone) {
+        e.preventDefault();
+        e.stopPropagation();
+      }
     };
 
+    const handleDragOver = (e: globalThis.DragEvent) => {
+      // Always prevent default for dragover to allow dropping
+      e.preventDefault();
+      e.stopPropagation();
+    };
+
+    const handleDrop = (e: globalThis.DragEvent) => {
+      // Only prevent default if we're not over a designated drop zone
+      const target = e.target as HTMLElement;
+      const isOverDropZone = target.closest('[data-drop-zone="true"]') !== null;
+
+      if (!isOverDropZone) {
+        e.preventDefault();
+        e.stopPropagation();
+      }
+    };
+
+    // Add event listeners to document to catch drag events
+    document.addEventListener('dragenter', preventDefaults, false);
+    document.addEventListener('dragleave', preventDefaults, false);
+    document.addEventListener('dragover', handleDragOver, false);
+    document.addEventListener('drop', handleDrop, false);
+
+    return () => {
+      document.removeEventListener('dragenter', preventDefaults, false);
+      document.removeEventListener('dragleave', preventDefaults, false);
+      document.removeEventListener('dragover', handleDragOver, false);
+      document.removeEventListener('drop', handleDrop, false);
+    };
+  }, []);
+
+  useEffect(() => {
+    const handleFatalError = (_event: IpcRendererEvent, ...args: unknown[]) => {
+      const errorMessage = args[0] as string;
+      console.error('Encountered a fatal error:', errorMessage);
+      setFatalError(errorMessage);
+    };
     window.electron.on('fatal-error', handleFatalError);
     return () => {
       window.electron.off('fatal-error', handleFatalError);
     };
-  }, [view, isLoadingSession]); // Add dependencies to provide context in error logs
+  }, []);
 
   useEffect(() => {
-    console.log('Setting up view change handler');
-    const handleSetView = (_event: IpcRendererEvent, newView: View) => {
-      console.log(`Received view change request to: ${newView}`);
-      setView(newView);
-    };
+    const handleSetView = (_event: IpcRendererEvent, ...args: unknown[]) => {
+      const newView = args[0] as View;
+      const section = args[1] as string | undefined;
+      console.log(
+        `Received view change request to: ${newView}${section ? `, section: ${section}` : ''}`
+      );
 
-    // Get initial view and config
-    const urlParams = new URLSearchParams(window.location.search);
-    const viewFromUrl = urlParams.get('view');
-    if (viewFromUrl) {
-      // Get the config from the electron window config
-      const windowConfig = window.electron.getConfig();
-
-      if (viewFromUrl === 'recipeEditor') {
-        const initialViewOptions = {
-          recipeConfig: windowConfig?.recipeConfig,
-          view: viewFromUrl,
-        };
-        setView(viewFromUrl, initialViewOptions);
+      if (section && newView === 'settings') {
+        navigate(`/settings?section=${section}`);
       } else {
-        setView(viewFromUrl);
+        navigate(`/${newView}`);
       }
-    }
+    };
 
     window.electron.on('set-view', handleSetView);
     return () => window.electron.off('set-view', handleSetView);
+  }, [navigate]);
+
+  useEffect(() => {
+    const handleNewChat = (_event: IpcRendererEvent, ..._args: unknown[]) => {
+      console.log('Received new-chat event from keyboard shortcut');
+      window.dispatchEvent(new CustomEvent(AppEvents.TRIGGER_NEW_CHAT));
+    };
+
+    window.electron.on('new-chat', handleNewChat);
+    return () => window.electron.off('new-chat', handleNewChat);
   }, []);
 
-  // Add cleanup for session states when view changes
   useEffect(() => {
-    console.log(`View changed to: ${view}`);
-    if (view !== 'chat' && view !== 'recipeEditor') {
-      console.log('Not in chat view, clearing loading session state');
-      setIsLoadingSession(false);
-    }
-  }, [view]);
-
-  // Configuration for extension security
-  const config = window.electron.getConfig();
-  // If GOOSE_ALLOWLIST_WARNING is true, use warning-only mode (STRICT_ALLOWLIST=false)
-  // If GOOSE_ALLOWLIST_WARNING is not set or false, use strict blocking mode (STRICT_ALLOWLIST=true)
-  const STRICT_ALLOWLIST = config.GOOSE_ALLOWLIST_WARNING === true ? false : true;
-
-  useEffect(() => {
-    console.log('Setting up extension handler');
-    const handleAddExtension = async (_event: IpcRendererEvent, link: string) => {
-      try {
-        console.log(`Received add-extension event with link: ${link}`);
-        const command = extractCommand(link);
-        const remoteUrl = extractRemoteUrl(link);
-        const extName = extractExtensionName(link);
-        window.electron.logInfo(`Adding extension from deep link ${link}`);
-        setPendingLink(link);
-
-        // Default values for confirmation dialog
-        let warningMessage = '';
-        let label = 'OK';
-        let title = 'Confirm Extension Installation';
-        let isBlocked = false;
-        let useDetailedMessage = false;
-
-        // For SSE extensions (with remoteUrl), always use detailed message
-        if (remoteUrl) {
-          useDetailedMessage = true;
-        } else {
-          // For command-based extensions, check against allowlist
-          try {
-            const allowedCommands = await window.electron.getAllowedExtensions();
-
-            // Only check and show warning if we have a non-empty allowlist
-            if (allowedCommands && allowedCommands.length > 0) {
-              const isCommandAllowed = allowedCommands.some((allowedCmd) =>
-                command.startsWith(allowedCmd)
-              );
-
-              if (!isCommandAllowed) {
-                // Not in allowlist - use detailed message and show warning/block
-                useDetailedMessage = true;
-                title = '⛔️ Untrusted Extension ⛔️';
-
-                if (STRICT_ALLOWLIST) {
-                  // Block installation completely unless override is active
-                  isBlocked = true;
-                  label = 'Extension Blocked';
-                  warningMessage =
-                    '\n\n⛔️ BLOCKED: This extension command is not in the allowed list. ' +
-                    'Installation is blocked by your administrator. ' +
-                    'Please contact your administrator if you need this extension.';
-                } else {
-                  // Allow override (either because STRICT_ALLOWLIST is false or secret key combo was used)
-                  label = 'Override and install';
-                  warningMessage =
-                    '\n\n⚠️ WARNING: This extension command is not in the allowed list. ' +
-                    'Installing extensions from untrusted sources may pose security risks. ' +
-                    'Please contact an admin if you are unsure or want to allow this extension.';
-                }
-              }
-              // If in allowlist, use simple message (useDetailedMessage remains false)
-            }
-            // If no allowlist, use simple message (useDetailedMessage remains false)
-          } catch (error) {
-            console.error('Error checking allowlist:', error);
-          }
-        }
-
-        // Set the appropriate message based on the extension type and allowlist status
-        if (useDetailedMessage) {
-          // Detailed message for SSE extensions or non-allowlisted command extensions
-          const detailedMessage = remoteUrl
-            ? `You are about to install the ${extName} extension which connects to:\n\n${remoteUrl}\n\nThis extension will be able to access your conversations and provide additional functionality.`
-            : `You are about to install the ${extName} extension which runs the command:\n\n${command}\n\nThis extension will be able to access your conversations and provide additional functionality.`;
-
-          setModalMessage(`${detailedMessage}${warningMessage}`);
-        } else {
-          // Simple message for allowlisted command extensions or when no allowlist exists
-          const messageDetails = `Command: ${command}`;
-          setModalMessage(
-            `Are you sure you want to install the ${extName} extension?\n\n${messageDetails}`
-          );
-        }
-
-        setExtensionConfirmLabel(label);
-        setExtensionConfirmTitle(title);
-
-        // If blocked, disable the confirmation button functionality by setting a special flag
-        if (isBlocked) {
-          setPendingLink(null); // Clear the pending link so confirmation does nothing
-        }
-
-        setModalVisible(true);
-      } catch (error) {
-        console.error('Error handling add-extension event:', error);
-      }
-    };
-
-    window.electron.on('add-extension', handleAddExtension);
-    return () => {
-      window.electron.off('add-extension', handleAddExtension);
-    };
-  }, [STRICT_ALLOWLIST]);
-
-  // Focus the first found input field
-  useEffect(() => {
-    const handleFocusInput = (_event: IpcRendererEvent) => {
+    const handleFocusInput = (_event: IpcRendererEvent, ..._args: unknown[]) => {
       const inputField = document.querySelector('input[type="text"], textarea') as HTMLInputElement;
       if (inputField) {
         inputField.focus();
@@ -456,174 +574,141 @@ export default function App() {
     };
   }, []);
 
-  // TODO: modify
-  const handleConfirm = async () => {
-    if (pendingLink) {
-      console.log(`Confirming installation of extension from: ${pendingLink}`);
-      setModalVisible(false); // Dismiss modal immediately
-      try {
-        await addExtensionFromDeepLinkV2(pendingLink, addExtension, setView);
-        console.log('Extension installation successful');
-      } catch (error) {
-        console.error('Failed to add extension:', error);
-        // Consider showing a user-visible error notification here
-      } finally {
-        setPendingLink(null);
-      }
-    } else {
-      // This case happens when pendingLink was cleared due to blocking
-      console.log('Extension installation blocked by allowlist restrictions');
-      setModalVisible(false);
-    }
-  };
+  // Handle initial message from launcher
+  const isProcessingRef = useRef(false);
 
-  // TODO: modify
-  const handleCancel = () => {
-    console.log('Cancelled extension installation.');
-    setModalVisible(false);
-    setPendingLink(null);
-  };
+  useEffect(() => {
+    const handleSetInitialMessage = async (_event: IpcRendererEvent, ...args: unknown[]) => {
+      const initialMessage = args[0] as string;
+      console.log(
+        '[App] Received set-initial-message event:',
+        initialMessage,
+        'isProcessing:',
+        isProcessingRef.current
+      );
+
+      if (initialMessage && !isProcessingRef.current) {
+        isProcessingRef.current = true;
+        console.log('[App] Processing initial message from launcher:', initialMessage);
+        navigate('/pair', {
+          state: {
+            initialMessage: { msg: initialMessage, images: [] },
+          },
+        });
+        setTimeout(() => {
+          isProcessingRef.current = false;
+        }, 1000);
+      } else if (initialMessage) {
+        console.log('[App] Ignoring duplicate initial message (already processing)');
+      }
+    };
+    window.electron.on('set-initial-message', handleSetInitialMessage);
+    return () => {
+      window.electron.off('set-initial-message', handleSetInitialMessage);
+    };
+  }, [navigate]);
+
+  // Register platform event handlers for app lifecycle management
+  useEffect(() => {
+    return registerPlatformEventHandlers();
+  }, []);
 
   if (fatalError) {
-    return <ErrorUI error={new Error(fatalError)} />;
+    return <ErrorUI error={errorMessage(fatalError)} />;
   }
-
-  if (isLoadingSession)
-    return (
-      <div className="flex justify-center items-center py-12">
-        <div className="animate-spin rounded-full h-8 w-8 border-t-2 border-b-2 border-textStandard"></div>
-      </div>
-    );
 
   return (
     <>
+      <PageViewTracker />
       <ToastContainer
         aria-label="Toast notifications"
         toastClassName={() =>
           `relative min-h-16 mb-4 p-2 rounded-lg
-           flex justify-between overflow-hidden cursor-pointer
-           text-textProminentInverse bg-bgStandardInverse dark:bg-bgAppInverse
-          `
+               flex justify-between overflow-hidden cursor-pointer
+               text-text-inverse bg-background-inverse
+              `
         }
-        style={{ width: '380px' }}
+        style={{ width: '450px' }}
         className="mt-6"
         position="top-right"
         autoClose={3000}
         closeOnClick
         pauseOnHover
       />
-      {modalVisible && (
-        <ConfirmationModal
-          isOpen={modalVisible}
-          message={modalMessage}
-          confirmLabel={extensionConfirmLabel}
-          title={extensionConfirmTitle}
-          onConfirm={handleConfirm}
-          onCancel={handleCancel}
-        />
-      )}
-      <div className="relative w-screen h-screen overflow-hidden bg-bgApp flex flex-col">
+      <ExtensionInstallModal addExtension={addExtension} setView={setView} />
+      <div className="relative w-screen h-screen overflow-hidden bg-background-secondary flex flex-col">
         <div className="titlebar-drag-region" />
-        <div>
-          {view === 'loading' && <SuspenseLoader />}
-          {view === 'welcome' && (
-            <ProviderSettings onClose={() => setView('chat')} isOnboarding={true} />
-          )}
-          {view === 'settings' && (
-            <SettingsViewV2
-              onClose={() => {
-                setView('chat');
-              }}
-              setView={setView}
-              viewOptions={viewOptions as SettingsViewOptions}
+        <div style={{ position: 'relative', width: '100%', height: '100%' }}>
+          <Routes>
+            <Route path="launcher" element={<LauncherView />} />
+            <Route
+              path="welcome"
+              element={<WelcomeRoute onSelectProvider={() => setDidSelectProvider(true)} />}
             />
-          )}
-          {view === 'moreModels' && (
-            <MoreModelsView
-              onClose={() => {
-                setView('settings');
-              }}
-              setView={setView}
-            />
-          )}
-          {view === 'configureProviders' && (
-            <ConfigureProvidersView
-              onClose={() => {
-                setView('settings');
-              }}
-            />
-          )}
-          {view === 'ConfigureProviders' && (
-            <ProviderSettings onClose={() => setView('chat')} isOnboarding={false} />
-          )}
-          {view === 'chat' && !isLoadingSession && (
-            <ChatView
-              readyForAutoUserPrompt={appInitialized}
-              chat={chat}
-              setChat={setChat}
-              setView={setView}
-              setIsGoosehintsModalOpen={setIsGoosehintsModalOpen}
-            />
-          )}
-          {view === 'sessions' && <SessionsView setView={setView} />}
-          {view === 'sharedSession' && (
-            <SharedSessionView
-              session={viewOptions?.sessionDetails}
-              isLoading={isLoadingSharedSession}
-              error={viewOptions?.error || sharedSessionError}
-              onBack={() => setView('sessions')}
-              onRetry={async () => {
-                if (viewOptions?.shareToken && viewOptions?.baseUrl) {
-                  setIsLoadingSharedSession(true);
-                  try {
-                    await openSharedSessionFromDeepLink(
-                      `goose://sessions/${viewOptions.shareToken}`,
-                      setView,
-                      viewOptions.baseUrl
-                    );
-                  } catch (error) {
-                    console.error('Failed to retry loading shared session:', error);
-                  } finally {
-                    setIsLoadingSharedSession(false);
-                  }
+            <Route path="configure-providers" element={<ConfigureProvidersRoute />} />
+            <Route path="standalone-app" element={<StandaloneAppView />} />
+            <Route
+              path="/"
+              element={
+                <ProviderGuard didSelectProvider={didSelectProvider}>
+                  <ChatProvider chat={chat} setChat={setChat} contextKey="hub">
+                    <AppLayout activeSessions={activeSessions} />
+                  </ChatProvider>
+                </ProviderGuard>
+              }
+            >
+              <Route index element={<HubRouteWrapper />} />
+              <Route
+                path="pair"
+                element={
+                  <PairRouteWrapper
+                    activeSessions={activeSessions}
+                    setActiveSessions={setActiveSessions}
+                  />
                 }
-              }}
-            />
-          )}
-          {view === 'recipeEditor' && (
-            <RecipeEditor
-              key={viewOptions?.config ? 'with-config' : 'no-config'}
-              config={viewOptions?.config || window.electron.getConfig().recipeConfig}
-              onClose={() => setView('chat')}
-              setView={setView}
-              onSave={(config) => {
-                console.log('Saving recipe config:', config);
-                window.electron.createChatWindow(
-                  undefined,
-                  undefined,
-                  undefined,
-                  undefined,
-                  config,
-                  'recipeEditor',
-                  { config }
-                );
-                setView('chat');
-              }}
-            />
-          )}
-          {view === 'permission' && (
-            <PermissionSettingsView
-              onClose={() => setView((viewOptions as { parentView: View }).parentView)}
-            />
-          )}
+              />
+              <Route path="settings" element={<SettingsRoute />} />
+              <Route
+                path="extensions"
+                element={
+                  <ChatProvider chat={chat} setChat={setChat} contextKey="extensions">
+                    <ExtensionsRoute />
+                  </ChatProvider>
+                }
+              />
+              <Route path="apps" element={<AppsView />} />
+              <Route path="sessions" element={<SessionsRoute />} />
+              <Route path="schedules" element={<SchedulesRoute />} />
+              <Route path="recipes" element={<RecipesRoute />} />
+              <Route
+                path="shared-session"
+                element={
+                  <SharedSessionRouteWrapper
+                    isLoadingSharedSession={isLoadingSharedSession}
+                    setIsLoadingSharedSession={setIsLoadingSharedSession}
+                    sharedSessionError={sharedSessionError}
+                  />
+                }
+              />
+              <Route path="permission" element={<PermissionRoute />} />
+            </Route>
+          </Routes>
         </div>
       </div>
-      {isGoosehintsModalOpen && (
-        <GoosehintsModal
-          directory={window.appConfig.get('GOOSE_WORKING_DIR') as string}
-          setIsGoosehintsModalOpen={setIsGoosehintsModalOpen}
-        />
-      )}
     </>
+  );
+}
+
+export default function App() {
+  return (
+    <ThemeProvider>
+      <ModelAndProviderProvider>
+        <HashRouter>
+          <AppInner />
+        </HashRouter>
+        <AnnouncementModal />
+        <TelemetryOptOutModal controlled={false} />
+      </ModelAndProviderProvider>
+    </ThemeProvider>
   );
 }

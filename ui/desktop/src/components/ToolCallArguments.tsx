@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import { useState } from 'react';
 import MarkdownContent from './MarkdownContent';
 import Expand from './ui/Expand';
 
@@ -28,31 +28,45 @@ export function ToolCallArguments({ args }: ToolCallArgumentsProps) {
 
       if (!needsExpansion) {
         return (
-          <div className="text-sm mb-2">
+          <div className="font-sans text-sm mb-2">
             <div className="flex flex-row">
-              <span className="text-textSubtle min-w-[140px]">{key}</span>
-              <span className="text-textPlaceholder">{value}</span>
+              <span className="text-text-secondary min-w-[140px]">{key}</span>
+              <span className="text-text-secondary">{value}</span>
             </div>
           </div>
         );
       }
 
       return (
-        <div className="text-sm mb-2">
-          <div className="flex flex-row">
-            <span className="text-textSubtle min-w-[140px]">{key}</span>
-            <div className="w-full flex justify-between items-start">
+        <div className={`font-sans text-sm mb-2 ${isExpanded ? '' : 'truncate min-w-0'}`}>
+          <div className={`flex flex-row items-stretch ${isExpanded ? '' : 'truncate min-w-0'}`}>
+            <button
+              onClick={() => toggleKey(key)}
+              className="flex text-left text-text-secondary min-w-[140px]"
+            >
+              <span>{key}</span>
+            </button>
+            <div className={`w-full flex items-stretch ${isExpanded ? '' : 'truncate min-w-0'}`}>
               {isExpanded ? (
-                <div className="">
-                  <MarkdownContent content={value} className="text-sm text-textPlaceholder" />
+                <div>
+                  <MarkdownContent
+                    content={value}
+                    className="font-sans text-sm text-text-secondary"
+                  />
                 </div>
               ) : (
-                <span className="text-textPlaceholder mr-2">{value.slice(0, 60)}...</span>
+                <button
+                  onClick={() => toggleKey(key)}
+                  className={`text-left text-text-secondary ${isExpanded ? '' : 'truncate min-w-0'}`}
+                >
+                  {value}
+                </button>
               )}
               <button
                 onClick={() => toggleKey(key)}
-                className="hover:opacity-75 text-textPlaceholder pr-2"
+                className="flex flex-row items-stretch grow text-text-secondary pr-2"
               >
+                <div className="min-w-2 grow" />
                 <Expand size={5} isExpanded={isExpanded} />
               </button>
             </div>
@@ -70,9 +84,11 @@ export function ToolCallArguments({ args }: ToolCallArgumentsProps) {
 
     return (
       <div className="mb-2">
-        <div className="flex flex-row">
-          <span className="mr- text-textPlaceholder min-w-[140px]2">{key}:</span>
-          <pre className="whitespace-pre-wrap text-textPlaceholder">{content}</pre>
+        <div className="flex flex-row font-sans text-sm">
+          <span className="text-text-secondary min-w-[140px]">{key}</span>
+          <pre className="whitespace-pre-wrap text-text-secondary overflow-x-auto max-w-full">
+            {content}
+          </pre>
         </div>
       </div>
     );

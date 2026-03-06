@@ -1,58 +1,30 @@
-import React, { useState, useEffect } from 'react';
-import { IpcRendererEvent } from 'electron';
 import { ScrollArea } from '../ui/scroll-area';
-import { Settings as SettingsType } from './types';
-import {
-  FullExtensionConfig,
-  addExtension,
-  removeExtension,
-  BUILT_IN_EXTENSIONS,
-} from '../../extensions';
-import { ConfigureExtensionModal } from './extensions/ConfigureExtensionModal';
-import { ManualExtensionModal } from './extensions/ManualExtensionModal';
-import { ConfigureBuiltInExtensionModal } from './extensions/ConfigureBuiltInExtensionModal';
-import BackButton from '../ui/BackButton';
-import { RecentModelsRadio } from './models/RecentModels';
-import { ExtensionItem } from './extensions/ExtensionItem';
-import { View, ViewOptions } from '../../App';
-import { ModeSelection } from './basic/ModeSelection';
-import SessionSharingSection from './session/SessionSharingSection';
-import { toastSuccess } from '../../toasts';
-import MoreMenuLayout from '../more_menu/MoreMenuLayout';
-
-const EXTENSIONS_DESCRIPTION =
-  'The Model Context Protocol (MCP) is a system that allows AI models to securely connect with local or remote resources using standard server setups. It works like a client-server setup and expands AI capabilities using three main components: Prompts, Resources, and Tools.';
-
-const EXTENSIONS_SITE_LINK = 'https://block.github.io/goose/v1/extensions/';
-
-const DEFAULT_SETTINGS: SettingsType = {
-  models: [
-    {
-      id: 'gpt4',
-      name: 'GPT 4.0',
-      description: 'Standard config',
-      enabled: false,
-    },
-    {
-      id: 'gpt4lite',
-      name: 'GPT 4.0 lite',
-      description: 'Standard config',
-      enabled: false,
-    },
-    {
-      id: 'claude',
-      name: 'Claude',
-      description: 'Standard config',
-      enabled: true,
-    },
-  ],
-  // @ts-expect-error "we actually do always have all the properties required for builtins, but tsc cannot tell for some reason"
-  extensions: BUILT_IN_EXTENSIONS,
-};
+import { Tabs, TabsContent, TabsList, TabsTrigger } from '../ui/tabs';
+import { View, ViewOptions } from '../../utils/navigationUtils';
+import ModelsSection from './models/ModelsSection';
+import SessionSharingSection from './sessions/SessionSharingSection';
+import ExternalBackendSection from './app/ExternalBackendSection';
+import AppSettingsSection from './app/AppSettingsSection';
+import ConfigSettings from './config/ConfigSettings';
+import PromptsSettingsSection from './PromptsSettingsSection';
+import { ExtensionConfig } from '../../api';
+import { MainPanelLayout } from '../Layout/MainPanelLayout';
+import { Bot, Share2, Monitor, MessageSquare, FileText, Keyboard, HardDrive, Network } from 'lucide-react';
+import { useState, useEffect, useRef } from 'react';
+import TunnelSection from './tunnel/TunnelSection';
+import GatewaySettingsSection from './gateways/GatewaySettingsSection';
+import { getTunnelStatus } from '../../api/sdk.gen';
+import ChatSettingsSection from './chat/ChatSettingsSection';
+import KeyboardShortcutsSection from './keyboard/KeyboardShortcutsSection';
+import LocalInferenceSection from './localInference/LocalInferenceSection';
+import MeshSection from './mesh/MeshSection';
+import { CONFIGURATION_ENABLED } from '../../updates';
+import { trackSettingsTabViewed } from '../../utils/analytics';
 
 export type SettingsViewOptions = {
-  extensionId: string;
-  showEnvVars: boolean;
+  deepLinkConfig?: ExtensionConfig;
+  showEnvVars?: boolean;
+  section?: string;
 };
 
 export default function SettingsView({
@@ -64,251 +36,225 @@ export default function SettingsView({
   setView: (view: View, viewOptions?: ViewOptions) => void;
   viewOptions: SettingsViewOptions;
 }) {
-  const [settings, setSettings] = React.useState<SettingsType>(() => {
-    const saved = localStorage.getItem('user_settings');
-    window.electron.logInfo('Settings: ' + saved);
-    let currentSettings = saved ? JSON.parse(saved) : DEFAULT_SETTINGS;
+  const [activeTab, setActiveTab] = useState('models');
+  const [tunnelDisabled, setTunnelDisabled] = useState(false);
+  const hasTrackedInitialTab = useRef(false);
 
-    // Ensure built-in extensions are included if not already present
-    BUILT_IN_EXTENSIONS.forEach((builtIn) => {
-      const exists = currentSettings.extensions.some(
-        (ext: FullExtensionConfig) => ext.id === builtIn.id
-      );
-      if (!exists) {
-        currentSettings.extensions.push(builtIn);
-      }
-    });
+  const handleTabChange = (tab: string) => {
+    setActiveTab(tab);
+    trackSettingsTabViewed(tab);
+  };
 
-    return currentSettings;
-  });
-
-  const [extensionBeingConfigured, setExtensionBeingConfigured] =
-    useState<FullExtensionConfig | null>(null);
-
-  const [isManualModalOpen, setIsManualModalOpen] = useState(false);
-
-  // Persist settings changes
+  // Determine initial tab based on section prop
   useEffect(() => {
-    localStorage.setItem('user_settings', JSON.stringify(settings));
-  }, [settings]);
+    if (viewOptions.section) {
+      // Map section names to tab values
+      const sectionToTab: Record<string, string> = {
+        update: 'app',
+        models: 'models',
+        modes: 'chat',
+        sharing: 'sharing',
+        styles: 'chat',
+        tools: 'chat',
+        app: 'app',
+        chat: 'chat',
+        prompts: 'prompts',
+        keyboard: 'keyboard',
+        gateway: 'sharing',
+        'local-inference': 'local-inference',
+        mesh: 'mesh',
+      };
 
-  // Listen for settings updates from extension storage
-  useEffect(() => {
-    const handleSettingsUpdate = (_event: IpcRendererEvent) => {
-      const saved = localStorage.getItem('user_settings');
-      if (saved) {
-        let currentSettings = JSON.parse(saved);
-        setSettings(currentSettings);
+      const targetTab = sectionToTab[viewOptions.section];
+      if (targetTab) {
+        setActiveTab(targetTab);
       }
-    };
+    }
+  }, [viewOptions.section]);
 
-    window.electron.on('settings-updated', handleSettingsUpdate);
-    return () => {
-      window.electron.off('settings-updated', handleSettingsUpdate);
-    };
+  useEffect(() => {
+    if (!hasTrackedInitialTab.current) {
+      trackSettingsTabViewed(activeTab);
+      hasTrackedInitialTab.current = true;
+    }
+  }, [activeTab]);
+
+  useEffect(() => {
+    getTunnelStatus()
+      .then(({ data }) => {
+        setTunnelDisabled(data?.state === 'disabled');
+      })
+      .catch(() => {
+        setTunnelDisabled(false);
+      });
   }, []);
 
-  // Handle URL parameters for auto-opening extension configuration
   useEffect(() => {
-    const extensionId = viewOptions.extensionId;
-    const showEnvVars = viewOptions.showEnvVars;
-
-    if (extensionId && showEnvVars === true) {
-      // Find the extension in settings
-      const extension = settings.extensions.find((ext) => ext.id === extensionId);
-      if (extension) {
-        // Auto-open the configuration modal
-        setExtensionBeingConfigured(extension);
-        // Scroll to extensions section
-        const element = document.getElementById('extensions');
-        if (element) {
-          element.scrollIntoView({ behavior: 'smooth' });
-        }
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape' && !event.defaultPrevented) {
+        onClose();
       }
-    }
-    // We only run this once on load
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [settings.extensions]);
+    };
 
-  const handleExtensionToggle = async (extensionId: string) => {
-    // Find the extension to get its current state
-    const extension = settings.extensions.find((ext) => ext.id === extensionId);
+    document.addEventListener('keydown', handleKeyDown);
 
-    if (!extension) return;
-
-    const newEnabled = !extension.enabled;
-
-    const originalSettings = settings;
-
-    // Optimistically update local component state
-    setSettings((prev) => ({
-      ...prev,
-      extensions: prev.extensions.map((ext) =>
-        ext.id === extensionId ? { ...ext, enabled: newEnabled } : ext
-      ),
-    }));
-
-    let response: Response;
-
-    if (newEnabled) {
-      response = await addExtension(extension);
-    } else {
-      response = await removeExtension(extension.name);
-    }
-
-    if (!response.ok) {
-      setSettings(originalSettings);
-    }
-  };
-
-  const handleExtensionRemove = async () => {
-    if (!extensionBeingConfigured) return;
-
-    const response = await removeExtension(extensionBeingConfigured.name, true);
-
-    if (response.ok) {
-      toastSuccess({
-        title: extensionBeingConfigured.name,
-        msg: `Successfully removed extension`,
-      });
-
-      // Remove from localstorage
-      setSettings((prev) => ({
-        ...prev,
-        extensions: prev.extensions.filter((ext) => ext.id !== extensionBeingConfigured.id),
-      }));
-      setExtensionBeingConfigured(null);
-    }
-  };
-
-  const handleExtensionConfigSubmit = () => {
-    setExtensionBeingConfigured(null);
-  };
-
-  const isBuiltIn = (extensionId: string) => {
-    return BUILT_IN_EXTENSIONS.some((builtIn) => builtIn.id === extensionId);
-  };
+    return () => {
+      document.removeEventListener('keydown', handleKeyDown);
+    };
+  }, [onClose]);
 
   return (
-    <div className="h-screen w-full">
-      <MoreMenuLayout showMenu={false} />
-
-      <ScrollArea className="h-full w-full">
-        <div className="flex flex-col pb-24">
-          <div className="px-8 pt-6 pb-4">
-            <BackButton onClick={() => onClose()} />
-            <h1 className="text-3xl font-medium text-textStandard mt-1">Settings</h1>
-          </div>
-
-          {/* Content Area */}
-          <div className="flex-1 py-8 pt-[20px]">
-            <div className="space-y-8">
-              {/*Models Section*/}
-              <section id="models">
-                <RecentModelsRadio setView={setView} />
-              </section>
-              <section id="extensions">
-                <div className="flex justify-between items-center mb-6 border-b border-borderSubtle px-8">
-                  <h2 className="text-xl font-semibold text-textStandard">Extensions</h2>
-                  <a
-                    href={EXTENSIONS_SITE_LINK}
-                    target="_blank"
-                    className="text-indigo-500 hover:text-indigo-600 text-sm"
-                    rel="noreferrer"
-                  >
-                    Browse
-                  </a>
-                </div>
-
-                <div className="px-8">
-                  <p className="text-sm text-textStandard mb-4">{EXTENSIONS_DESCRIPTION}</p>
-
-                  {settings.extensions.length === 0 ? (
-                    <p className="text-textSubtle text-center py-4">No Extensions Added</p>
-                  ) : (
-                    <div className="grid grid-cols-2 gap-2">
-                      {settings.extensions.map((ext) => (
-                        <ExtensionItem
-                          key={ext.id}
-                          {...ext}
-                          canConfigure={true}
-                          onToggle={handleExtensionToggle}
-                          onConfigure={(extension) => setExtensionBeingConfigured(extension)}
-                        />
-                      ))}
-                      <button
-                        onClick={() => setIsManualModalOpen(true)}
-                        className="text-indigo-500 hover:text-indigo-600 text-sm"
-                        title="Add Manually"
-                      >
-                        <div className="rounded-lg border border-dashed border-borderSubtle hover:border-borderStandard p-4 transition-colors">
-                          Add custom extension
-                        </div>
-                      </button>
-                    </div>
-                  )}
-                </div>
-              </section>
-
-              <section id="mode">
-                <div className="flex justify-between items-center mb-6 border-b border-borderSubtle px-8">
-                  <h2 className="text-xl font-semibold text-textStandard">Mode Selection</h2>
-                </div>
-
-                <div className="px-8">
-                  <p className="text-sm text-textStandard mb-4">
-                    Configure how Goose interacts with tools and extensions
-                  </p>
-
-                  <ModeSelection />
-                </div>
-              </section>
-              <section id="session-sharing">
-                <SessionSharingSection />
-              </section>
+    <>
+      <MainPanelLayout>
+        <div className="flex-1 flex flex-col min-h-0">
+          <div className="bg-background-primary px-8 pb-8 pt-16">
+            <div className="flex flex-col page-transition">
+              <div className="flex justify-between items-center mb-1">
+                <h1 className="text-4xl font-light">Settings</h1>
+              </div>
             </div>
           </div>
+
+          <div className="flex-1 min-h-0 relative px-6">
+            <Tabs
+              value={activeTab}
+              onValueChange={handleTabChange}
+              className="h-full flex flex-col"
+            >
+              <div className="px-1">
+                <TabsList className="w-full mb-2 justify-start overflow-x-auto flex-nowrap">
+                  <TabsTrigger
+                    value="models"
+                    className="flex gap-2"
+                    data-testid="settings-models-tab"
+                  >
+                    <Bot className="h-4 w-4" />
+                    Models
+                  </TabsTrigger>
+                  <TabsTrigger
+                    value="local-inference"
+                    className="flex gap-2"
+                    data-testid="settings-local-inference-tab"
+                  >
+                    <HardDrive className="h-4 w-4" />
+                    Local Inference
+                  </TabsTrigger>
+                  <TabsTrigger
+                    value="mesh"
+                    className="flex gap-2"
+                    data-testid="settings-mesh-tab"
+                  >
+                    <Network className="h-4 w-4" />
+                    Mesh
+                  </TabsTrigger>
+                  <TabsTrigger value="chat" className="flex gap-2" data-testid="settings-chat-tab">
+                    <MessageSquare className="h-4 w-4" />
+                    Chat
+                  </TabsTrigger>
+                  <TabsTrigger
+                    value="sharing"
+                    className="flex gap-2"
+                    data-testid="settings-sharing-tab"
+                  >
+                    <Share2 className="h-4 w-4" />
+                    Session
+                  </TabsTrigger>
+                  <TabsTrigger
+                    value="prompts"
+                    className="flex gap-2"
+                    data-testid="settings-prompts-tab"
+                  >
+                    <FileText className="h-4 w-4" />
+                    Prompts
+                  </TabsTrigger>
+                  <TabsTrigger
+                    value="keyboard"
+                    className="flex gap-2"
+                    data-testid="settings-keyboard-tab"
+                  >
+                    <Keyboard className="h-4 w-4" />
+                    Keyboard
+                  </TabsTrigger>
+                  <TabsTrigger value="app" className="flex gap-2" data-testid="settings-app-tab">
+                    <Monitor className="h-4 w-4" />
+                    App
+                  </TabsTrigger>
+                </TabsList>
+              </div>
+
+              <ScrollArea className="flex-1 px-2">
+                <TabsContent
+                  value="models"
+                  className="mt-0 focus-visible:outline-none focus-visible:ring-0"
+                >
+                  <ModelsSection setView={setView} />
+                </TabsContent>
+
+                <TabsContent
+                  value="local-inference"
+                  className="mt-0 focus-visible:outline-none focus-visible:ring-0"
+                >
+                  <LocalInferenceSection />
+                </TabsContent>
+
+                <TabsContent
+                  value="mesh"
+                  className="mt-0 focus-visible:outline-none focus-visible:ring-0"
+                >
+                  <MeshSection />
+                </TabsContent>
+
+                <TabsContent
+                  value="chat"
+                  className="mt-0 focus-visible:outline-none focus-visible:ring-0"
+                >
+                  <ChatSettingsSection />
+                </TabsContent>
+
+                <TabsContent
+                  value="sharing"
+                  className="mt-0 focus-visible:outline-none focus-visible:ring-0"
+                >
+                  <div className="space-y-8 pb-8">
+                    <SessionSharingSection />
+                    <ExternalBackendSection />
+                    {!tunnelDisabled && (
+                      <div className="space-y-4">
+                        <TunnelSection />
+                        <GatewaySettingsSection />
+                      </div>
+                    )}
+                  </div>
+                </TabsContent>
+
+                <TabsContent
+                  value="prompts"
+                  className="mt-0 focus-visible:outline-none focus-visible:ring-0"
+                >
+                  <PromptsSettingsSection />
+                </TabsContent>
+
+                <TabsContent
+                  value="keyboard"
+                  className="mt-0 focus-visible:outline-none focus-visible:ring-0"
+                >
+                  <KeyboardShortcutsSection />
+                </TabsContent>
+
+                <TabsContent
+                  value="app"
+                  className="mt-0 focus-visible:outline-none focus-visible:ring-0"
+                >
+                  <div className="space-y-8">
+                    {CONFIGURATION_ENABLED && <ConfigSettings />}
+                    <AppSettingsSection scrollToSection={viewOptions.section} />
+                  </div>
+                </TabsContent>
+              </ScrollArea>
+            </Tabs>
+          </div>
         </div>
-      </ScrollArea>
-
-      {extensionBeingConfigured && isBuiltIn(extensionBeingConfigured.id) ? (
-        <ConfigureBuiltInExtensionModal
-          isOpen={!!extensionBeingConfigured && isBuiltIn(extensionBeingConfigured.id)}
-          onClose={() => {
-            setExtensionBeingConfigured(null);
-          }}
-          extension={extensionBeingConfigured}
-          onSubmit={handleExtensionConfigSubmit}
-        />
-      ) : (
-        <ConfigureExtensionModal
-          isOpen={!!extensionBeingConfigured}
-          onClose={() => {
-            setExtensionBeingConfigured(null);
-          }}
-          extension={extensionBeingConfigured}
-          onSubmit={handleExtensionConfigSubmit}
-          onRemove={handleExtensionRemove}
-        />
-      )}
-
-      <ManualExtensionModal
-        isOpen={isManualModalOpen}
-        onClose={() => setIsManualModalOpen(false)}
-        onSubmit={async (extension) => {
-          const response = await addExtension(extension);
-
-          if (response.ok) {
-            setSettings((prev) => ({
-              ...prev,
-              extensions: [...prev.extensions, extension],
-            }));
-            setIsManualModalOpen(false);
-          } else {
-            // TODO - Anything for the UI state beyond validation?
-          }
-        }}
-      />
-    </div>
+      </MainPanelLayout>
+    </>
   );
 }

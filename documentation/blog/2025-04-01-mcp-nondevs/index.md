@@ -24,18 +24,18 @@ That's exactly where MCP comes in. Best part is, you don't need to be a develope
 ## MCP Servers You Should Try Right Now
 So what can you connect your AI agent to? MCP Servers! MCP servers give your agent access to your tools. With [over 3000 MCP servers](https://glama.ai/mcp/servers) you can connect to, here is your top list of popular MCP servers you should try:
 
-- **[Google Drive](/docs/tutorials/google-drive-mcp)**: File access and search capabilities for Google Drive
-- **[YouTube Transcript](/docs/tutorials/youtube-transcript)**: Grab and work with YouTube video transcripts
-- **[Google Maps](/docs/tutorials/google-maps-mcp)**: Location services, directions, and place details
-- **[Tavily Web Search](/docs/tutorials/tavily-mcp)**: Web and local search using Tavily's Search API
-- **[Asana](/docs/tutorials/asana-mcp)**: View asana tasks, projects, workspaces, and/or comments
-- **[Speech](/docs/tutorials/speech-mcp)**: Real-time voice interaction, audio/video transcription, text-to-speech conversion and more
-- **[GitHub](/docs/tutorials/github-mcp)**: Tools to read, search, and manage Git repositories
-- **[Fetch](/docs/tutorials/fetch-mcp)**: Web content fetching and conversion for efficient LLM usage
+- **[Google Drive](/docs/mcp/google-drive-mcp)**: File access and search capabilities for Google Drive
+- **[YouTube Transcript](/docs/mcp/youtube-transcript-mcp)**: Grab and work with YouTube video transcripts
+- **[Google Maps](/docs/mcp/google-maps-mcp)**: Location services, directions, and place details
+- **[Tavily Web Search](/docs/mcp/tavily-mcp)**: Web and local search using Tavily's Search API
+- **[Asana](/docs/mcp/asana-mcp)**: View asana tasks, projects, workspaces, and/or comments
+- **[Speech](/docs/mcp/speech-mcp)**: Real-time voice interaction, audio/video transcription, text-to-speech conversion and more
+- **[GitHub](/docs/mcp/github-mcp)**: Tools to read, search, and manage Git repositories
+- **[Fetch](/docs/mcp/fetch-mcp)**: Web content fetching and conversion for efficient LLM usage
 
 This quick list should give you an idea of all the ways you can now use AI agents with your workflow. You can also explore community favorites in [handy MCP directories](https://dev.to/techgirl1908/my-favorite-mcp-directories-573n), and learn [how to check MCP servers are safe](/blog/2025/03/26/mcp-security) before installing.
 
-You can also check out these [Goose tutorials](/docs/category/tutorials), showing you exactly how you can use some of these popular MCP servers with Goose, or use [Goose's Tutorial extension](/docs/tutorials/tutorial-extension) to get extra help walking you through using or building extensions.
+You can also check out these [Goose tutorials](/docs/category/mcp-servers), showing you exactly how you can use some of these popular MCP servers with Goose, or use [Goose's Tutorial extension](/docs/mcp/tutorial-mcp) to get extra help walking you through using or building extensions.
 
 ## Example MCP Prompts
 Now that you've caught a glimpse of some of the MCP servers that out there, how do you make sure you're using MCPs with AI agents the best you can? This is where prompts come in.
@@ -75,7 +75,7 @@ While some are developed by official providers, a vast majority of MCP servers y
 
 Hopefully now, instead of spending hours manually gathering data and creating your next marketing report, or manually sorting through your todo-backlog on a Monday, you will use MCP with Goose and have it done for you in minutes.
 
-*To learn more about using MCP servers and Goose, check out the [Goose documentation](https://block.github.io/goose/docs/category/getting-started), or join the [Block Open Source Discord](https://discord.gg/block-opensource) to connect with other open source community members.*
+*To learn more about using MCP servers and Goose, check out the [Goose documentation](https://block.github.io/goose/docs/category/getting-started), or join the [Block Open Source Discord](https://discord.gg/goose-oss) to connect with other open source community members.*
 
 <head>
   <meta property="og:title" content="MCP Explained for Non-Developers" />

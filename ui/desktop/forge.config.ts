@@ -4,69 +4,139 @@ const { resolve } = require('path');
 
 let cfg = {
   asar: true,
-  extraResource: ['src/bin', 'src/images'],
+  extraResource: ['src/bin', 'src/images', 'src/sandbox'],
   icon: 'src/images/icon',
   // Windows specific configuration
   win32: {
     icon: 'src/images/icon.ico',
     certificateFile: process.env.WINDOWS_CERTIFICATE_FILE,
-    certificatePassword: process.env.WINDOWS_CERTIFICATE_PASSWORD,
+    signingRole: process.env.WINDOW_SIGNING_ROLE,
     rfc3161TimeStampServer: 'http://timestamp.digicert.com',
-    signWithParams: '/fd sha256 /tr http://timestamp.digicert.com /td sha256'
+    signWithParams: '/fd sha256 /tr http://timestamp.digicert.com /td sha256',
   },
   // Protocol registration
   protocols: [
     {
-      name: "GooseProtocol",
-      schemes: ["goose"]
-    }
+      name: 'GooseProtocol',
+      schemes: ['goose'],
+    },
   ],
-  // macOS specific configuration
-  osxSign: {
-    entitlements: 'entitlements.plist',
-    'entitlements-inherit': 'entitlements.plist',
-    'gatekeeper-assess': false,
-    hardenedRuntime: true,
-    identity: 'Developer ID Application: Michael Neale (W2L75AE9HQ)',
+  // macOS Info.plist extensions for drag-and-drop support
+  extendInfo: {
+    // Document types for drag-and-drop support onto dock icon
+    CFBundleDocumentTypes: [
+      {
+        CFBundleTypeName: 'Folders',
+        CFBundleTypeRole: 'Viewer',
+        LSHandlerRank: 'Alternate',
+        LSItemContentTypes: ['public.directory', 'public.folder'],
+      },
+    ],
+    // Usage descriptions for macOS TCC (Transparency, Consent, and Control)
+    NSCalendarsUsageDescription: 'Goose needs access to your calendars to help manage and query calendar events.',
+    NSRemindersUsageDescription: 'Goose needs access to your reminders to help manage and query reminders.',
   },
-  osxNotarize: {
-    appleId: process.env['APPLE_ID'],
-    appleIdPassword: process.env['APPLE_ID_PASSWORD'],
-    teamId: process.env['APPLE_TEAM_ID']
-  },
-}
-
-if (process.env['APPLE_ID'] === undefined) {
-  delete cfg.osxNotarize;
-  delete cfg.osxSign;
-}
+};
 
 module.exports = {
   packagerConfig: cfg,
   rebuildConfig: {},
+  publishers: [
+    {
+      name: '@electron-forge/publisher-github',
+      config: {
+        repository: {
+          owner: process.env.GITHUB_OWNER || 'block',
+          name: process.env.GITHUB_REPO || 'goose',
+        },
+        prerelease: false,
+        draft: true,
+      },
+    },
+  ],
   makers: [
     {
       name: '@electron-forge/maker-zip',
-      platforms: ['darwin', 'win32'],
+      platforms: ['darwin', 'win32', 'linux'],
       config: {
         arch: process.env.ELECTRON_ARCH === 'x64' ? ['x64'] : ['arm64'],
         options: {
-          icon: 'src/images/icon.ico'
-        }
-      }
+          icon: 'src/images/icon.ico',
+        },
+      },
     },
     {
       name: '@electron-forge/maker-deb',
       config: {
         name: 'Goose',
-        bin: 'Goose'
+        bin: 'Goose',
+        maintainer: 'Block, Inc.',
+        homepage: 'https://block.github.io/goose/',
+        categories: ['Development'],
+        desktopTemplate: './forge.deb.desktop',
+        options: {
+          icon: 'src/images/icon.png',
+          prefix: '/opt',
+        },
       },
     },
     {
       name: '@electron-forge/maker-rpm',
       config: {
         name: 'Goose',
-        bin: 'Goose'
+        bin: 'Goose',
+        maintainer: 'Block, Inc.',
+        homepage: 'https://block.github.io/goose/',
+        categories: ['Development'],
+        desktopTemplate: './forge.rpm.desktop',
+        options: {
+          icon: 'src/images/icon.png',
+          prefix: '/opt',
+          fpm: ['--rpm-rpmbuild-define', '_build_id_links none'],
+        },
+      },
+    },
+    {
+      name: '@electron-forge/maker-flatpak',
+      config: {
+        options: {
+          id: 'io.github.block.Goose',
+          categories: ['Development'],
+          icon: {
+            'scalable': 'src/images/icon.svg',
+            '512x512': 'src/images/icon-512.png',
+          },
+          homepage: 'https://block.github.io/goose/',
+          runtimeVersion: '25.08',
+          baseVersion: '25.08',
+          bin: 'Goose',
+          modules: [
+            {
+              name: 'libbz2-shim',
+              buildsystem: 'simple',
+              'build-commands': [
+                // Create the lib directory in the app bundle
+                'mkdir -p /app/lib',
+                // Point to the actual library in the 25.08 runtime
+                // We use a wildcard to handle multi-arch paths (x86_64-linux-gnu, etc)
+                'ln -s $(find /usr/lib -name "libbz2.so.1" | head -n 1) /app/lib/libbz2.so.1.0'
+              ]
+            }
+          ],
+          finishArgs: [
+            '--share=ipc',
+            '--socket=x11',
+            '--socket=wayland',
+            '--device=dri',
+            '--share=network',
+            '--filesystem=home',
+            '--talk-name=org.freedesktop.Notifications',
+            '--socket=session-bus',
+            '--socket=system-bus',
+            // This ensures the app looks in our shim folder first
+            '--env=LD_LIBRARY_PATH=/app/lib'
+          ],
+        },
       },
     },
   ],
@@ -77,17 +147,17 @@ module.exports = {
         build: [
           {
             entry: 'src/main.ts',
-            config: 'vite.main.config.ts',
+            config: 'vite.main.config.mts',
           },
           {
             entry: 'src/preload.ts',
-            config: 'vite.preload.config.ts',
+            config: 'vite.preload.config.mts',
           },
         ],
         renderer: [
           {
             name: 'main_window',
-            config: 'vite.renderer.config.ts',
+            config: 'vite.renderer.config.mts',
           },
         ],
       },

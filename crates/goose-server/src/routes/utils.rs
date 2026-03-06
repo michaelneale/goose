@@ -1,7 +1,6 @@
-use crate::state::AppState;
+use goose::config::declarative_providers::load_provider;
 use goose::config::Config;
-use goose::providers::base::{ConfigKey, ProviderMetadata};
-use http::{HeaderMap, StatusCode};
+use goose::providers::base::{ConfigKey, ProviderMetadata, ProviderType};
 use serde::{Deserialize, Serialize};
 use std::env;
 use std::error::Error;
@@ -23,27 +22,13 @@ pub struct KeyInfo {
     pub value: Option<String>, // Only populated for non-secret keys that are set
 }
 
-pub fn verify_secret_key(headers: &HeaderMap, state: &AppState) -> Result<StatusCode, StatusCode> {
-    // Verify secret key
-    let secret_key = headers
-        .get("X-Secret-Key")
-        .and_then(|value| value.to_str().ok())
-        .ok_or(StatusCode::UNAUTHORIZED)?;
-
-    if secret_key != state.secret_key {
-        Err(StatusCode::UNAUTHORIZED)
-    } else {
-        Ok(StatusCode::OK)
-    }
-}
-
 /// Inspects a configuration key to determine if it's set, its location, and value (for non-secret keys)
 #[allow(dead_code)]
 pub fn inspect_key(key_name: &str, is_secret: bool) -> Result<KeyInfo, Box<dyn Error>> {
     let config = Config::global();
 
     // Check environment variable first
-    let env_value = std::env::var(key_name).ok();
+    let env_value = env::var(key_name).ok();
 
     if let Some(value) = env_value {
         return Ok(KeyInfo {
@@ -106,8 +91,48 @@ pub fn inspect_keys(
     Ok(results)
 }
 
-pub fn check_provider_configured(metadata: &ProviderMetadata) -> bool {
+pub fn check_provider_configured(metadata: &ProviderMetadata, provider_type: ProviderType) -> bool {
     let config = Config::global();
+
+    // Special override: local and mesh are always available
+    if metadata.name == "local" || metadata.name == "mesh" {
+        return true;
+    }
+
+    if provider_type == ProviderType::Custom || provider_type == ProviderType::Declarative {
+        if let Ok(loaded_provider) = load_provider(metadata.name.as_str()) {
+            if !loaded_provider.config.requires_auth {
+                return true;
+            }
+
+            if !loaded_provider.config.api_key_env.is_empty() {
+                let api_key_result =
+                    config.get_secret::<String>(&loaded_provider.config.api_key_env);
+                if api_key_result.is_ok() {
+                    return true;
+                }
+            }
+
+            // Custom providers with config files are intentionally created
+            return provider_type == ProviderType::Custom;
+        }
+    }
+
+    // Special case: OAuth providers - check for configured marker
+    let has_oauth_key = metadata.config_keys.iter().any(|key| key.oauth_flow);
+    if has_oauth_key {
+        let configured_marker = format!("{}_configured", metadata.name);
+        if matches!(config.get_param::<bool>(&configured_marker), Ok(true)) {
+            return true;
+        }
+    }
+
+    // Special case: Zero-config providers (no config keys)
+    if metadata.config_keys.is_empty() {
+        // Check if the provider has been explicitly configured via the UI
+        let configured_marker = format!("{}_configured", metadata.name);
+        return config.get_param::<bool>(&configured_marker).is_ok();
+    }
 
     // Get all required keys
     let required_keys: Vec<&ConfigKey> = metadata
@@ -126,6 +151,21 @@ pub fn check_provider_configured(metadata: &ProviderMetadata) -> bool {
         let is_set_in_config = config.get(&key.name, key.secret).is_ok();
 
         return is_set_in_env || is_set_in_config;
+    }
+
+    // Special case: If a provider has only optional keys with defaults,
+    // check if a configuration marker exists
+    if required_keys.is_empty() && !metadata.config_keys.is_empty() {
+        let all_optional_with_defaults = metadata
+            .config_keys
+            .iter()
+            .all(|key| !key.required && key.default.is_some());
+
+        if all_optional_with_defaults {
+            // Check if the provider has been explicitly configured via the UI
+            let configured_marker = format!("{}_configured", metadata.name);
+            return config.get_param::<bool>(&configured_marker).is_ok();
+        }
     }
 
     // For providers with multiple keys or keys without defaults:

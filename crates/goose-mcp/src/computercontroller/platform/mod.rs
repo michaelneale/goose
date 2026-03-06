@@ -1,5 +1,8 @@
+#[cfg(target_os = "linux")]
 mod linux;
+#[cfg(target_os = "macos")]
 mod macos;
+#[cfg(target_os = "windows")]
 mod windows;
 
 #[cfg(target_os = "windows")]
@@ -8,9 +11,10 @@ pub use self::windows::WindowsAutomation;
 #[cfg(target_os = "macos")]
 pub use self::macos::MacOSAutomation;
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 pub use self::linux::LinuxAutomation;
 
+#[allow(dead_code)]
 pub trait SystemAutomation: Send + Sync {
     fn execute_system_script(&self, script: &str) -> std::io::Result<String>;
     fn get_shell_command(&self) -> (&'static str, &'static str); // (shell, arg)

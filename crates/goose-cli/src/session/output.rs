@@ -1,13 +1,30 @@
+use anstream::println;
 use bat::WrappingMode;
-use console::{style, Color};
+use console::{measure_text_width, style, Color, Term};
 use goose::config::Config;
-use goose::message::{Message, MessageContent, ToolRequest, ToolResponse};
-use mcp_core::prompt::PromptArgument;
-use mcp_core::tool::ToolCall;
+use goose::conversation::message::{
+    ActionRequiredData, Message, MessageContent, SystemNotificationContent, SystemNotificationType,
+    ToolRequest, ToolResponse,
+};
+use goose::providers::canonical::maybe_get_canonical_model;
+#[cfg(target_os = "windows")]
+use goose::subprocess::SubprocessExt;
+use goose::utils::safe_truncate;
+use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
+use rmcp::model::{CallToolRequestParams, JsonObject, PromptArgument};
 use serde_json::Value;
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::io::{Error, IsTerminal, Write};
 use std::path::Path;
+use std::sync::{Arc, LazyLock};
+use std::time::Duration;
+
+use super::streaming_buffer::MarkdownBuffer;
+
+pub const DEFAULT_MIN_PRIORITY: f32 = 0.0;
+pub const DEFAULT_CLI_LIGHT_THEME: &str = "GitHub";
+pub const DEFAULT_CLI_DARK_THEME: &str = "zenburn";
 
 // Re-export theme for use in main
 #[derive(Clone, Copy)]
@@ -18,11 +35,15 @@ pub enum Theme {
 }
 
 impl Theme {
-    fn as_str(&self) -> &'static str {
+    fn as_str(&self) -> String {
         match self {
-            Theme::Light => "GitHub",
-            Theme::Dark => "zenburn",
-            Theme::Ansi => "base16",
+            Theme::Light => Config::global()
+                .get_param::<String>("GOOSE_CLI_LIGHT_THEME")
+                .unwrap_or(DEFAULT_CLI_LIGHT_THEME.to_string()),
+            Theme::Dark => Config::global()
+                .get_param::<String>("GOOSE_CLI_DARK_THEME")
+                .unwrap_or(DEFAULT_CLI_DARK_THEME.to_string()),
+            Theme::Ansi => "base16".to_string(),
         }
     }
 
@@ -52,21 +73,45 @@ thread_local! {
             .unwrap_or_else(||
                 Config::global().get_param::<String>("GOOSE_CLI_THEME").ok()
                     .map(|val| Theme::from_config_str(&val))
-                    .unwrap_or(Theme::Dark)
+                    .unwrap_or(Theme::Ansi)
             )
     );
+    static SHOW_FULL_TOOL_OUTPUT: RefCell<bool> = const { RefCell::new(false) };
 }
 
 pub fn set_theme(theme: Theme) {
     let config = Config::global();
     config
-        .set_param("GOOSE_CLI_THEME", Value::String(theme.as_config_string()))
+        .set_param("GOOSE_CLI_THEME", theme.as_config_string())
         .expect("Failed to set theme");
     CURRENT_THEME.with(|t| *t.borrow_mut() = theme);
+
+    let config = Config::global();
+    let theme_str = match theme {
+        Theme::Light => "light",
+        Theme::Dark => "dark",
+        Theme::Ansi => "ansi",
+    };
+
+    if let Err(e) = config.set_param("GOOSE_CLI_THEME", theme_str) {
+        eprintln!("Failed to save theme setting to config: {}", e);
+    }
 }
 
 pub fn get_theme() -> Theme {
     CURRENT_THEME.with(|t| *t.borrow())
+}
+
+pub fn toggle_full_tool_output() -> bool {
+    SHOW_FULL_TOOL_OUTPUT.with(|s| {
+        let mut val = s.borrow_mut();
+        *val = !*val;
+        *val
+    })
+}
+
+pub fn get_show_full_tool_output() -> bool {
+    SHOW_FULL_TOOL_OUTPUT.with(|s| *s.borrow())
 }
 
 // Simple wrapper around spinner to manage its state
@@ -78,10 +123,19 @@ pub struct ThinkingIndicator {
 impl ThinkingIndicator {
     pub fn show(&mut self) {
         let spinner = cliclack::spinner();
-        spinner.start(format!(
-            "{}...",
-            super::thinking::get_random_thinking_message()
-        ));
+        let hint = style("(Ctrl+C to interrupt)").dim();
+        if Config::global()
+            .get_param("RANDOM_THINKING_MESSAGES")
+            .unwrap_or(true)
+        {
+            spinner.start(format!(
+                "{}...  {}",
+                super::thinking::get_random_thinking_message(),
+                hint,
+            ));
+        } else {
+            spinner.start(format!("Thinking...  {}", hint));
+        }
         self.spinner = Some(spinner);
     }
 
@@ -89,6 +143,10 @@ impl ThinkingIndicator {
         if let Some(spinner) = self.spinner.take() {
             spinner.stop("");
         }
+    }
+
+    pub fn is_shown(&self) -> bool {
+        self.spinner.is_some()
     }
 }
 
@@ -106,11 +164,57 @@ thread_local! {
 }
 
 pub fn show_thinking() {
-    THINKING.with(|t| t.borrow_mut().show());
+    if std::io::stdout().is_terminal() {
+        THINKING.with(|t| t.borrow_mut().show());
+    }
 }
 
 pub fn hide_thinking() {
-    THINKING.with(|t| t.borrow_mut().hide());
+    if std::io::stdout().is_terminal() {
+        THINKING.with(|t| t.borrow_mut().hide());
+    }
+}
+
+pub fn run_status_hook(status: &str) {
+    if let Ok(hook) = Config::global().get_param::<String>("GOOSE_STATUS_HOOK") {
+        let status = status.to_string();
+        std::thread::spawn(move || {
+            #[cfg(target_os = "windows")]
+            let result = std::process::Command::new("cmd")
+                .arg("/C")
+                .arg(format!("{} {}", hook, status))
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .set_no_window()
+                .status();
+
+            #[cfg(not(target_os = "windows"))]
+            let result = std::process::Command::new("sh")
+                .arg("-c")
+                .arg(format!("{} {}", hook, status))
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status();
+
+            let _ = result;
+        });
+    }
+}
+
+pub fn is_showing_thinking() -> bool {
+    THINKING.with(|t| t.borrow().is_shown())
+}
+
+pub fn set_thinking_message(s: &String) {
+    if std::io::stdout().is_terminal() {
+        THINKING.with(|t| {
+            if let Some(spinner) = t.borrow_mut().spinner.as_mut() {
+                spinner.set_message(s);
+            }
+        });
+    }
 }
 
 pub fn render_message(message: &Message, debug: bool) {
@@ -118,32 +222,195 @@ pub fn render_message(message: &Message, debug: bool) {
 
     for content in &message.content {
         match content {
+            MessageContent::ActionRequired(action) => match &action.data {
+                ActionRequiredData::ToolConfirmation { tool_name, .. } => {
+                    println!("action_required(tool_confirmation): {}", tool_name)
+                }
+                ActionRequiredData::Elicitation { message, .. } => {
+                    println!("action_required(elicitation): {}", message)
+                }
+                ActionRequiredData::ElicitationResponse { id, .. } => {
+                    println!("action_required(elicitation_response): {}", id)
+                }
+            },
             MessageContent::Text(text) => print_markdown(&text.text, theme),
             MessageContent::ToolRequest(req) => render_tool_request(req, theme, debug),
             MessageContent::ToolResponse(resp) => render_tool_response(resp, theme, debug),
             MessageContent::Image(image) => {
                 println!("Image: [data: {}, type: {}]", image.data, image.mime_type);
             }
-            MessageContent::Thinking(thinking) => {
-                if std::env::var("GOOSE_CLI_SHOW_THINKING").is_ok() {
-                    println!("\n{}", style("Thinking:").dim().italic());
-                    print_markdown(&thinking.thinking, theme);
-                }
-            }
+            MessageContent::Thinking(t) => render_thinking(&t.thinking, theme),
+            MessageContent::Reasoning(r) => render_thinking(&r.text, theme),
             MessageContent::RedactedThinking(_) => {
-                // For redacted thinking, print thinking was redacted
                 println!("\n{}", style("Thinking:").dim().italic());
                 print_markdown("Thinking was redacted", theme);
             }
+            MessageContent::SystemNotification(notification) => {
+                match notification.notification_type {
+                    SystemNotificationType::ThinkingMessage => {
+                        show_thinking();
+                        set_thinking_message(&notification.msg);
+                    }
+                    SystemNotificationType::InlineMessage => {
+                        hide_thinking();
+                        println!("\n{}", style(&notification.msg).yellow());
+                    }
+                    SystemNotificationType::CreditsExhausted => {
+                        render_credits_exhausted_notification(notification);
+                    }
+                }
+            }
             _ => {
-                println!("WARNING: Message content type could not be rendered");
+                eprintln!("WARNING: Message content type could not be rendered");
             }
         }
     }
-    println!();
+
+    let _ = std::io::stdout().flush();
+}
+
+/// Render a streaming message, using a buffer to accumulate text content
+/// and only render when markdown constructs are complete.
+pub fn render_message_streaming(
+    message: &Message,
+    buffer: &mut MarkdownBuffer,
+    thinking_header_shown: &mut bool,
+    debug: bool,
+) {
+    let theme = get_theme();
+
+    for content in &message.content {
+        if !matches!(
+            content,
+            MessageContent::Thinking(_) | MessageContent::Reasoning(_)
+        ) {
+            *thinking_header_shown = false;
+        }
+
+        match content {
+            MessageContent::Text(text) => {
+                if let Some(safe_content) = buffer.push(&text.text) {
+                    print_markdown(&safe_content, theme);
+                }
+            }
+            MessageContent::ToolRequest(req) => {
+                flush_markdown_buffer(buffer, theme);
+                render_tool_request(req, theme, debug);
+            }
+            MessageContent::ToolResponse(resp) => {
+                flush_markdown_buffer(buffer, theme);
+                render_tool_response(resp, theme, debug);
+            }
+            MessageContent::ActionRequired(action) => {
+                flush_markdown_buffer(buffer, theme);
+                match &action.data {
+                    ActionRequiredData::ToolConfirmation { tool_name, .. } => {
+                        println!("action_required(tool_confirmation): {}", tool_name)
+                    }
+                    ActionRequiredData::Elicitation { message, .. } => {
+                        println!("action_required(elicitation): {}", message)
+                    }
+                    ActionRequiredData::ElicitationResponse { id, .. } => {
+                        println!("action_required(elicitation_response): {}", id)
+                    }
+                }
+            }
+            MessageContent::Image(image) => {
+                flush_markdown_buffer(buffer, theme);
+                println!("Image: [data: {}, type: {}]", image.data, image.mime_type);
+            }
+            MessageContent::Thinking(t) => {
+                render_thinking_streaming(&t.thinking, buffer, thinking_header_shown, theme);
+            }
+            MessageContent::Reasoning(r) => {
+                render_thinking_streaming(&r.text, buffer, thinking_header_shown, theme);
+            }
+            MessageContent::RedactedThinking(_) => {
+                flush_markdown_buffer(buffer, theme);
+                println!("\n{}", style("Thinking:").dim().italic());
+                print_markdown("Thinking was redacted", theme);
+            }
+            MessageContent::SystemNotification(notification) => {
+                match notification.notification_type {
+                    SystemNotificationType::ThinkingMessage => {
+                        show_thinking();
+                        set_thinking_message(&notification.msg);
+                    }
+                    SystemNotificationType::InlineMessage => {
+                        flush_markdown_buffer(buffer, theme);
+                        hide_thinking();
+                        println!("\n{}", style(&notification.msg).yellow());
+                    }
+                    SystemNotificationType::CreditsExhausted => {
+                        flush_markdown_buffer(buffer, theme);
+                        render_credits_exhausted_notification(notification);
+                    }
+                }
+            }
+            _ => {
+                flush_markdown_buffer(buffer, theme);
+                eprintln!("WARNING: Message content type could not be rendered");
+            }
+        }
+    }
+
+    let _ = std::io::stdout().flush();
+}
+
+fn render_credits_exhausted_notification(notification: &SystemNotificationContent) {
+    hide_thinking();
+    println!("\n{}", style(&notification.msg).yellow());
+
+    if let Some(url) = notification
+        .data
+        .as_ref()
+        .and_then(|d| d.get("top_up_url"))
+        .and_then(|v| v.as_str())
+    {
+        println!(
+            "{}",
+            style(format!("Visit this URL to top up credits: {url}")).yellow()
+        );
+    }
+}
+
+pub fn get_credits_top_up_url(message: &Message) -> Option<String> {
+    message.content.iter().find_map(|content| {
+        let MessageContent::SystemNotification(notification) = content else {
+            return None;
+        };
+        if notification.notification_type != SystemNotificationType::CreditsExhausted {
+            return None;
+        }
+        notification
+            .data
+            .as_ref()
+            .and_then(|d| d.get("top_up_url"))
+            .and_then(|v| v.as_str())
+            .map(str::to_string)
+    })
+}
+
+pub fn flush_markdown_buffer(buffer: &mut MarkdownBuffer, theme: Theme) {
+    let remaining = buffer.flush();
+    if !remaining.is_empty() {
+        print_markdown(&remaining, theme);
+    }
+}
+
+pub fn flush_markdown_buffer_current_theme(buffer: &mut MarkdownBuffer) {
+    flush_markdown_buffer(buffer, get_theme());
 }
 
 pub fn render_text(text: &str, color: Option<Color>, dim: bool) {
+    render_text_no_newlines(format!("\n{}\n\n", text).as_str(), color, dim);
+}
+
+pub fn render_text_no_newlines(text: &str, color: Option<Color>, dim: bool) {
+    if !std::io::stdout().is_terminal() {
+        println!("{}", text);
+        return;
+    }
     let mut styled_text = style(text);
     if dim {
         styled_text = styled_text.dim();
@@ -153,7 +420,7 @@ pub fn render_text(text: &str, color: Option<Color>, dim: bool) {
     } else {
         styled_text = styled_text.green();
     }
-    println!("\n{}\n", styled_text);
+    print!("{}", styled_text);
 }
 
 pub fn render_enter_plan_mode() {
@@ -183,11 +450,48 @@ pub fn goose_mode_message(text: &str) {
     println!("\n{}", style(text).yellow(),);
 }
 
+static SHOW_THINKING: LazyLock<bool> = LazyLock::new(|| {
+    std::env::var("GOOSE_CLI_SHOW_THINKING").is_ok() && std::io::stdout().is_terminal()
+});
+
+fn should_show_thinking() -> bool {
+    *SHOW_THINKING
+}
+
+fn render_thinking(text: &str, theme: Theme) {
+    if should_show_thinking() {
+        println!("\n{}", style("Thinking:").dim().italic());
+        print_markdown(text, theme);
+    }
+}
+
+fn render_thinking_streaming(
+    text: &str,
+    buffer: &mut MarkdownBuffer,
+    header_shown: &mut bool,
+    theme: Theme,
+) {
+    if should_show_thinking() {
+        flush_markdown_buffer(buffer, theme);
+        if !*header_shown {
+            println!("\n{}", style("Thinking:").dim().italic());
+            *header_shown = true;
+        }
+        print!("{}", style(text).dim());
+        let _ = std::io::stdout().flush();
+    }
+}
+
 fn render_tool_request(req: &ToolRequest, theme: Theme, debug: bool) {
     match &req.tool_call {
-        Ok(call) => match call.name.as_str() {
-            "developer__text_editor" => render_text_editor_request(call, debug),
-            "developer__shell" => render_shell_request(call, debug),
+        Ok(call) => match call.name.to_string().as_str() {
+            name if is_shell_tool_name(name) => render_shell_request(call, debug),
+            name if is_file_tool_name(name) => render_text_editor_request(call, debug),
+            "execute" | "execute_code" => render_execute_code_request(call, debug),
+            "delegate" => render_delegate_request(call, debug),
+            "subagent" => render_delegate_request(call, debug),
+            "todo__write" => render_todo_request(call, debug),
+            "load" => {}
             _ => render_default_request(call, debug),
         },
         Err(e) => print_markdown(&e.to_string(), theme),
@@ -198,10 +502,10 @@ fn render_tool_response(resp: &ToolResponse, theme: Theme, debug: bool) {
     let config = Config::global();
 
     match &resp.tool_result {
-        Ok(contents) => {
-            for content in contents {
+        Ok(result) => {
+            for content in &result.content {
                 if let Some(audience) = content.audience() {
-                    if !audience.contains(&mcp_core::role::Role::User) {
+                    if !audience.contains(&rmcp::model::Role::User) {
                         continue;
                     }
                 }
@@ -209,7 +513,7 @@ fn render_tool_response(resp: &ToolResponse, theme: Theme, debug: bool) {
                 let min_priority = config
                     .get_param::<f32>("GOOSE_CLI_MIN_PRIORITY")
                     .ok()
-                    .unwrap_or(0.5);
+                    .unwrap_or(DEFAULT_MIN_PRIORITY);
 
                 if content
                     .priority()
@@ -221,13 +525,21 @@ fn render_tool_response(resp: &ToolResponse, theme: Theme, debug: bool) {
 
                 if debug {
                     println!("{:#?}", content);
-                } else if let mcp_core::content::Content::Text(text) = content {
+                } else if let Some(text) = content.as_text() {
                     print_markdown(&text.text, theme);
                 }
             }
         }
         Err(e) => print_markdown(&e.to_string(), theme),
     }
+}
+
+fn is_shell_tool_name(name: &str) -> bool {
+    matches!(name, "shell")
+}
+
+fn is_file_tool_name(name: &str) -> bool {
+    matches!(name, "write" | "edit")
 }
 
 pub fn render_error(message: &str) {
@@ -247,17 +559,18 @@ pub fn render_prompts(prompts: &HashMap<String, Vec<String>>) {
 
 pub fn render_prompt_info(info: &PromptInfo) {
     println!();
-
     if let Some(ext) = &info.extension {
         println!(" {}: {}", style("Extension").green(), ext);
     }
-
     println!(" Prompt: {}", style(&info.name).cyan().bold());
-
     if let Some(desc) = &info.description {
         println!("\n {}", desc);
     }
+    render_arguments(info);
+    println!();
+}
 
+fn render_arguments(info: &PromptInfo) {
     if let Some(args) = &info.arguments {
         println!("\n Arguments:");
         for arg in args {
@@ -276,7 +589,6 @@ pub fn render_prompt_info(info: &PromptInfo) {
             );
         }
     }
-    println!();
 }
 
 pub fn render_extension_success(name: &str) {
@@ -325,65 +637,279 @@ pub fn render_builtin_error(names: &str, error: &str) {
     println!();
 }
 
-fn render_text_editor_request(call: &ToolCall, debug: bool) {
+fn render_text_editor_request(call: &CallToolRequestParams, debug: bool) {
     print_tool_header(call);
 
-    // Print path first with special formatting
-    if let Some(Value::String(path)) = call.arguments.get("path") {
+    if let Some(args) = &call.arguments {
+        if let Some(Value::String(path)) = args.get("path") {
+            println!(
+                "    {} {}",
+                style("path").dim(),
+                style(shorten_path(path, debug)).dim()
+            );
+        }
+
+        if let Some(args) = &call.arguments {
+            let mut other_args = serde_json::Map::new();
+            for (k, v) in args {
+                if k != "path" {
+                    other_args.insert(k.clone(), v.clone());
+                }
+            }
+            if !other_args.is_empty() {
+                print_params(&Some(other_args), 1, debug);
+            }
+        }
+    }
+    println!();
+}
+
+fn render_shell_request(call: &CallToolRequestParams, debug: bool) {
+    print_tool_header(call);
+    print_params(&call.arguments, 1, debug);
+    println!();
+}
+
+fn render_execute_code_request(call: &CallToolRequestParams, debug: bool) {
+    let tool_graph = call
+        .arguments
+        .as_ref()
+        .and_then(|args| args.get("tool_graph"))
+        .and_then(Value::as_array)
+        .filter(|arr| !arr.is_empty());
+
+    let Some(tool_graph) = tool_graph else {
+        return render_default_request(call, debug);
+    };
+
+    let count = tool_graph.len();
+    let plural = if count == 1 { "" } else { "s" };
+    println!();
+    println!(
+        "  {} {} {} tool call{}",
+        style("▸").dim(),
+        style("execute").dim(),
+        style(count).dim(),
+        plural,
+    );
+
+    for (i, node) in tool_graph.iter().filter_map(Value::as_object).enumerate() {
+        let tool = node
+            .get("tool")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown");
+        let desc = node
+            .get("description")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        let deps: Vec<_> = node
+            .get("depends_on")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_u64)
+            .map(|d| (d + 1).to_string())
+            .collect();
+        let deps_str = if deps.is_empty() {
+            String::new()
+        } else {
+            format!(" (uses {})", deps.join(", "))
+        };
         println!(
-            "{}: {}",
-            style("path").dim(),
-            style(shorten_path(path, debug)).green()
+            "    {}. {} {}{}",
+            style(i + 1).dim(),
+            style(tool).dim(),
+            style(desc).dim(),
+            style(deps_str).dim()
         );
     }
 
-    // Print other arguments normally, excluding path
-    if let Some(args) = call.arguments.as_object() {
+    let code = call
+        .arguments
+        .as_ref()
+        .and_then(|args| args.get("code"))
+        .and_then(Value::as_str)
+        .filter(|c| !c.is_empty());
+    if code.is_some_and(|_| debug) {
+        println!("{}", style(code.unwrap_or_default()).green());
+    }
+
+    println!();
+}
+
+fn render_delegate_request(call: &CallToolRequestParams, debug: bool) {
+    print_tool_header(call);
+
+    if let Some(args) = &call.arguments {
+        if let Some(Value::String(source)) = args.get("source") {
+            println!("    {} {}", style("source").dim(), style(source).dim());
+        }
+
+        if let Some(Value::String(instructions)) = args.get("instructions") {
+            let display = if instructions.len() > 100 && !debug {
+                safe_truncate(instructions, 100)
+            } else {
+                instructions.clone()
+            };
+            println!(
+                "    {} {}",
+                style("instructions").dim(),
+                style(display).dim()
+            );
+        }
+
+        if let Some(Value::Object(params)) = args.get("parameters") {
+            println!("    {}:", style("parameters").dim());
+            print_params(&Some(params.clone()), 2, debug);
+        }
+
+        let skip_keys = ["source", "instructions", "parameters"];
         let mut other_args = serde_json::Map::new();
         for (k, v) in args {
-            if k != "path" {
+            if !skip_keys.contains(&k.as_str()) {
                 other_args.insert(k.clone(), v.clone());
             }
         }
-        print_params(&Value::Object(other_args), 0, debug);
-    }
-    println!();
-}
-
-fn render_shell_request(call: &ToolCall, debug: bool) {
-    print_tool_header(call);
-
-    match call.arguments.get("command") {
-        Some(Value::String(s)) => {
-            println!("{}: {}", style("command").dim(), style(s).green());
+        if !other_args.is_empty() {
+            print_params(&Some(other_args), 1, debug);
         }
-        _ => print_params(&call.arguments, 0, debug),
+    }
+
+    println!();
+}
+
+fn render_todo_request(call: &CallToolRequestParams, _debug: bool) {
+    print_tool_header(call);
+
+    if let Some(args) = &call.arguments {
+        if let Some(Value::String(content)) = args.get("content") {
+            println!("    {} {}", style("content").dim(), style(content).dim());
+        }
     }
     println!();
 }
 
-fn render_default_request(call: &ToolCall, debug: bool) {
+fn render_default_request(call: &CallToolRequestParams, debug: bool) {
     print_tool_header(call);
-    print_params(&call.arguments, 0, debug);
+    print_params(&call.arguments, 1, debug);
+    println!();
+}
+
+fn split_tool_name(tool_name: &str) -> (String, String) {
+    let parts: Vec<_> = tool_name.rsplit("__").collect();
+    let tool = parts.first().copied().unwrap_or("unknown");
+    let extension = parts
+        .split_first()
+        .map(|(_, s)| s.iter().rev().copied().collect::<Vec<_>>().join("__"))
+        .unwrap_or_default();
+    (tool.to_string(), extension_display_name(&extension))
+}
+
+fn extension_display_name(name: &str) -> String {
+    match name {
+        "code_execution" => "Code Mode".to_string(),
+        _ => name.to_string(),
+    }
+}
+
+pub fn format_subagent_tool_call_message(subagent_id: &str, tool_name: &str) -> String {
+    let short_id = subagent_id.rsplit('_').next().unwrap_or(subagent_id);
+    let (tool, extension) = split_tool_name(tool_name);
+
+    if extension.is_empty() {
+        format!("[subagent:{}] {}", short_id, tool)
+    } else {
+        format!("[subagent:{}] {} | {}", short_id, tool, extension)
+    }
+}
+
+pub fn render_subagent_tool_call(
+    subagent_id: &str,
+    tool_name: &str,
+    arguments: Option<&JsonObject>,
+    debug: bool,
+) {
+    if tool_name == "code_execution__execute_code" {
+        let tool_graph = arguments
+            .and_then(|args| args.get("tool_graph"))
+            .and_then(Value::as_array)
+            .filter(|arr| !arr.is_empty());
+        if let Some(tool_graph) = tool_graph {
+            return render_subagent_tool_graph(subagent_id, tool_graph);
+        }
+    }
+    let tool_header = format!(
+        "  {} {}",
+        style("▸").dim(),
+        style(format_subagent_tool_call_message(subagent_id, tool_name)).dim(),
+    );
+    println!();
+    println!("{}", tool_header);
+    print_params(&arguments.cloned(), 1, debug);
+    println!();
+}
+
+fn render_subagent_tool_graph(subagent_id: &str, tool_graph: &[Value]) {
+    let short_id = subagent_id.rsplit('_').next().unwrap_or(subagent_id);
+    let count = tool_graph.len();
+    let plural = if count == 1 { "" } else { "s" };
+    println!();
+    println!(
+        "  {} {} {} {} tool call{}",
+        style("▸").dim(),
+        style(format!("[subagent:{}]", short_id)).dim(),
+        style("execute_code").dim(),
+        style(count).dim(),
+        plural,
+    );
+
+    for (i, node) in tool_graph.iter().filter_map(Value::as_object).enumerate() {
+        let tool = node
+            .get("tool")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown");
+        let desc = node
+            .get("description")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        let deps: Vec<_> = node
+            .get("depends_on")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_u64)
+            .map(|d| (d + 1).to_string())
+            .collect();
+        let deps_str = if deps.is_empty() {
+            String::new()
+        } else {
+            format!(" (uses {})", deps.join(", "))
+        };
+        println!(
+            "    {}. {} {}{}",
+            style(i + 1).dim(),
+            style(tool).dim(),
+            style(desc).dim(),
+            style(deps_str).dim()
+        );
+    }
     println!();
 }
 
 // Helper functions
 
-fn print_tool_header(call: &ToolCall) {
-    let parts: Vec<_> = call.name.rsplit("__").collect();
-    let tool_header = format!(
-        "─── {} | {} ──────────────────────────",
-        style(parts.first().unwrap_or(&"unknown")),
-        style(
-            parts
-                .split_first()
-                .map(|(_, s)| s.iter().rev().copied().collect::<Vec<_>>().join("__"))
-                .unwrap_or_else(|| "unknown".to_string())
+fn print_tool_header(call: &CallToolRequestParams) {
+    let (tool, extension) = split_tool_name(&call.name);
+    let tool_header = if extension.is_empty() {
+        format!("  {} {}", style("▸").dim(), style(&tool).dim())
+    } else {
+        format!(
+            "  {} {} {}",
+            style("▸").dim(),
+            style(&tool).dim(),
+            style(extension).magenta().dim(),
         )
-        .magenta()
-        .dim(),
-    );
+    };
     println!();
     println!("{}", tool_header);
 }
@@ -395,6 +921,25 @@ pub fn env_no_color() -> bool {
 }
 
 fn print_markdown(content: &str, theme: Theme) {
+    if std::io::stdout().is_terminal() {
+        if let Some((before, table, after)) = extract_markdown_table(content) {
+            if !before.is_empty() {
+                print_markdown_raw(&before, theme);
+            }
+            print_table(&table, theme);
+            if !after.is_empty() {
+                print_markdown(after, theme);
+            }
+        } else {
+            print_markdown_raw(content, theme);
+        }
+    } else {
+        print!("{}", content);
+    }
+}
+
+/// Renders markdown content using bat (no table processing)
+fn print_markdown_raw(content: &str, theme: Theme) {
     bat::PrettyPrinter::new()
         .input(bat::Input::from_bytes(content.as_bytes()))
         .theme(theme.as_str())
@@ -405,77 +950,256 @@ fn print_markdown(content: &str, theme: Theme) {
         .unwrap();
 }
 
-const INDENT: &str = "    ";
+fn extract_markdown_table(content: &str) -> Option<(String, Vec<&str>, &str)> {
+    let lines: Vec<&str> = content.lines().collect();
 
-fn get_tool_params_max_length() -> usize {
-    Config::global()
-        .get_param::<usize>("GOOSE_CLI_TOOL_PARAMS_TRUNCATION_MAX_LENGTH")
-        .ok()
-        .unwrap_or(40)
+    // Track newline positions for safe slicing later
+    let newline_indices: Vec<usize> = content
+        .bytes()
+        .enumerate()
+        .filter_map(|(i, b)| if b == b'\n' { Some(i) } else { None })
+        .collect();
+
+    // Skip tables inside code blocks
+    let mut in_code_block = false;
+    let mut table_start = None;
+    let mut table_end = None;
+
+    for (i, line) in lines.iter().enumerate() {
+        let trimmed = line.trim();
+
+        if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
+            in_code_block = !in_code_block;
+            continue;
+        }
+
+        if in_code_block {
+            continue;
+        }
+
+        if trimmed.starts_with('|') && trimmed.ends_with('|') {
+            if table_start.is_none() {
+                table_start = Some(i);
+            }
+            table_end = Some(i);
+        } else if table_start.is_some() {
+            break;
+        }
+    }
+
+    let start = table_start?;
+    let end = table_end?;
+
+    // Need at least header + separator (2 rows minimum)
+    if end < start + 1 {
+        return None;
+    }
+
+    // Require separator to be the second row with proper format
+    let separator_line = lines.get(start + 1)?;
+    let is_valid_separator = separator_line.trim().starts_with('|')
+        && separator_line.trim().ends_with('|')
+        && separator_line
+            .trim()
+            .trim_matches('|')
+            .split('|')
+            .all(|cell| {
+                let t = cell.trim();
+                !t.is_empty() && t.chars().all(|c| c == '-' || c == ':' || c == ' ')
+            });
+
+    if !is_valid_separator {
+        return None;
+    }
+
+    let before = lines[..start].join("\n");
+    let before = if before.is_empty() {
+        before
+    } else {
+        before + "\n"
+    };
+    let table = lines[start..=end].to_vec();
+
+    let after = if end + 1 >= lines.len() {
+        ""
+    } else if let Some(&newline_pos) = newline_indices.get(end) {
+        content.get(newline_pos + 1..).unwrap_or("")
+    } else {
+        ""
+    };
+
+    Some((before, table, after))
 }
 
-fn print_params(value: &Value, depth: usize, debug: bool) {
+fn print_table(table_lines: &[&str], theme: Theme) {
+    use comfy_table::{presets, Cell, CellAlignment, ContentArrangement, Table};
+
+    let mut table = Table::new();
+    table.set_content_arrangement(ContentArrangement::Dynamic);
+
+    table.load_preset(presets::ASCII_MARKDOWN);
+
+    let mut rows: Vec<Vec<String>> = Vec::new();
+    let mut alignments: Vec<CellAlignment> = Vec::new();
+    let mut separator_idx = None;
+
+    for (i, line) in table_lines.iter().enumerate() {
+        let cells: Vec<String> = line
+            .trim()
+            .trim_matches('|')
+            .split('|')
+            .map(|s| s.trim().to_string())
+            .collect();
+
+        let is_separator = cells.iter().all(|c| {
+            let t = c.trim();
+            t.chars().all(|ch| ch == '-' || ch == ':') && t.contains('-')
+        });
+        if is_separator {
+            separator_idx = Some(i);
+            alignments = cells
+                .iter()
+                .map(|c| {
+                    let t = c.trim();
+                    if t.starts_with(':') && t.ends_with(':') {
+                        CellAlignment::Center
+                    } else if t.ends_with(':') {
+                        CellAlignment::Right
+                    } else {
+                        CellAlignment::Left
+                    }
+                })
+                .collect();
+        } else {
+            rows.push(cells);
+        }
+    }
+
+    if separator_idx.is_none() && !rows.is_empty() {
+        alignments = vec![CellAlignment::Left; rows[0].len()];
+    }
+
+    if let Some(header) = rows.first() {
+        let header_cells: Vec<Cell> = header
+            .iter()
+            .enumerate()
+            .map(|(i, text)| {
+                let cell = Cell::new(text);
+                if let Some(align) = alignments.get(i) {
+                    cell.set_alignment(*align)
+                } else {
+                    cell
+                }
+            })
+            .collect();
+        table.set_header(header_cells);
+    }
+
+    for row in rows.iter().skip(1) {
+        let cells: Vec<Cell> = row
+            .iter()
+            .enumerate()
+            .map(|(i, text)| {
+                let cell = Cell::new(text);
+                if let Some(align) = alignments.get(i) {
+                    cell.set_alignment(*align)
+                } else {
+                    cell
+                }
+            })
+            .collect();
+        table.add_row(cells);
+    }
+
+    let table_str = table.to_string();
+    print_markdown_raw(&table_str, theme);
+}
+
+const INDENT: &str = "    ";
+
+fn print_value_with_prefix(prefix: &String, value: &Value, debug: bool) {
+    let prefix_width = measure_text_width(prefix.as_str());
+    print!("{}", prefix);
+    print_value(value, debug, prefix_width)
+}
+
+fn print_value(value: &Value, debug: bool, reserve_width: usize) {
+    let max_width = Term::stdout()
+        .size_checked()
+        .map(|(_h, w)| (w as usize).saturating_sub(reserve_width));
+    let show_full = get_show_full_tool_output();
+    let formatted = match value {
+        Value::String(s) => match (max_width, debug || show_full) {
+            (Some(w), false) if s.len() > w => style(safe_truncate(s, w)),
+            _ => style(s.to_string()),
+        }
+        .green(),
+        Value::Number(n) => style(n.to_string()).yellow(),
+        Value::Bool(b) => style(b.to_string()).yellow(),
+        Value::Null => style("null".to_string()).dim(),
+        _ => unreachable!(),
+    };
+    println!("{}", formatted);
+}
+
+fn print_params(value: &Option<JsonObject>, depth: usize, debug: bool) {
     let indent = INDENT.repeat(depth);
 
-    match value {
-        Value::Object(map) => {
-            for (key, val) in map {
-                match val {
-                    Value::Object(_) => {
-                        println!("{}{}:", indent, style(key).dim());
-                        print_params(val, depth + 1, debug);
-                    }
-                    Value::Array(arr) => {
+    if let Some(json_object) = value {
+        for (key, val) in json_object.iter() {
+            match val {
+                Value::Object(obj) => {
+                    println!("{}{}:", indent, style(key).dim());
+                    print_params(&Some(obj.clone()), depth + 1, debug);
+                }
+                Value::Array(arr) => {
+                    // Check if all items are simple values (not objects or arrays)
+                    let all_simple = arr.iter().all(|item| {
+                        matches!(
+                            item,
+                            Value::String(_) | Value::Number(_) | Value::Bool(_) | Value::Null
+                        )
+                    });
+
+                    if all_simple {
+                        // Render inline for simple arrays, truncation will be handled by print_value if needed
+                        let values: Vec<String> = arr
+                            .iter()
+                            .map(|item| match item {
+                                Value::String(s) => s.clone(),
+                                Value::Number(n) => n.to_string(),
+                                Value::Bool(b) => b.to_string(),
+                                Value::Null => "null".to_string(),
+                                _ => unreachable!(),
+                            })
+                            .collect();
+                        let joined_values = values.join(", ");
+                        print_value_with_prefix(
+                            &format!("{}{}: ", indent, style(key).dim()),
+                            &Value::String(joined_values),
+                            debug,
+                        );
+                    } else {
+                        // Use the original multi-line format for complex arrays
                         println!("{}{}:", indent, style(key).dim());
                         for item in arr.iter() {
-                            println!("{}{}- ", indent, INDENT);
-                            print_params(item, depth + 2, debug);
+                            if let Value::Object(obj) = item {
+                                println!("{}{}- ", indent, INDENT);
+                                print_params(&Some(obj.clone()), depth + 2, debug);
+                            } else {
+                                println!("{}{}- {}", indent, INDENT, item);
+                            }
                         }
-                    }
-                    Value::String(s) => {
-                        if !debug && s.len() > get_tool_params_max_length() {
-                            println!("{}{}: {}", indent, style(key).dim(), style("...").dim());
-                        } else {
-                            println!("{}{}: {}", indent, style(key).dim(), style(s).green());
-                        }
-                    }
-                    Value::Number(n) => {
-                        println!("{}{}: {}", indent, style(key).dim(), style(n).blue());
-                    }
-                    Value::Bool(b) => {
-                        println!("{}{}: {}", indent, style(key).dim(), style(b).blue());
-                    }
-                    Value::Null => {
-                        println!("{}{}: {}", indent, style(key).dim(), style("null").dim());
                     }
                 }
+                _ => {
+                    print_value_with_prefix(
+                        &format!("{}{}: ", indent, style(key).dim()),
+                        val,
+                        debug,
+                    );
+                }
             }
-        }
-        Value::Array(arr) => {
-            for (i, item) in arr.iter().enumerate() {
-                println!("{}{}.", indent, i + 1);
-                print_params(item, depth + 1, debug);
-            }
-        }
-        Value::String(s) => {
-            if !debug && s.len() > get_tool_params_max_length() {
-                println!(
-                    "{}{}",
-                    indent,
-                    style(format!("[REDACTED: {} chars]", s.len())).yellow()
-                );
-            } else {
-                println!("{}{}", indent, style(s).green());
-            }
-        }
-        Value::Number(n) => {
-            println!("{}{}", indent, style(n).yellow());
-        }
-        Value::Bool(b) => {
-            println!("{}{}", indent, style(b).yellow());
-        }
-        Value::Null => {
-            println!("{}{}", indent, style("null").dim());
         }
     }
 }
@@ -529,48 +1253,237 @@ fn shorten_path(path: &str, debug: bool) -> String {
     shortened.join("/")
 }
 
-// Session display functions
-pub fn display_session_info(resume: bool, provider: &str, model: &str, session_file: &Path) {
-    let start_session_msg = if resume {
-        "resuming session |"
-    } else if session_file.to_str() == Some("/dev/null") || session_file.to_str() == Some("NUL") {
-        "running without session |"
+pub fn display_session_info(
+    resume: bool,
+    provider: &str,
+    model: &str,
+    session_id: &Option<String>,
+    provider_instance: Option<&Arc<dyn goose::providers::base::Provider>>,
+) {
+    set_terminal_title();
+
+    let status = if resume {
+        "resuming"
+    } else if session_id.is_none() {
+        "ephemeral"
     } else {
-        "starting session |"
+        "new session"
     };
+
+    let model_display = if let Some(provider_inst) = provider_instance {
+        if let Some(lead_worker) = provider_inst.as_lead_worker() {
+            let (lead_model, worker_model) = lead_worker.get_model_info();
+            format!("{} → {}", lead_model, worker_model)
+        } else {
+            model.to_string()
+        }
+    } else {
+        model.to_string()
+    };
+
+    let cwd_display = std::env::current_dir()
+        .ok()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|| "unknown".to_string());
+
+    // ASCII art goose with session info on the right
+    println!();
     println!(
-        "{} {} {} {} {}",
-        style(start_session_msg).dim(),
-        style("provider:").dim(),
-        style(provider).cyan().dim(),
-        style("model:").dim(),
-        style(model).cyan().dim(),
+        "  {}  {} {} {} {} {}",
+        style("  __( O)>").white(),
+        style("●").green(),
+        style(status).dim(),
+        style("·").dim(),
+        style(provider).dim(),
+        style(&model_display).cyan(),
     );
 
-    if session_file.to_str() != Some("/dev/null") && session_file.to_str() != Some("NUL") {
+    if let Some(id) = session_id {
         println!(
-            "    {} {}",
-            style("logging to").dim(),
-            style(session_file.display()).dim().cyan(),
+            "  {}  {} {} {}",
+            style(r" \____)").white(),
+            style(" ").dim(),
+            style(id).dim(),
+            style(format!("· {}", cwd_display)).dim(),
+        );
+    } else {
+        println!(
+            "  {}  {} {}",
+            style(r" \____)").white(),
+            style(" ").dim(),
+            style(format!("  {}", cwd_display)).dim(),
         );
     }
-
     println!(
-        "    {} {}",
-        style("working directory:").dim(),
-        style(std::env::current_dir().unwrap().display())
-            .cyan()
-            .dim()
+        "  {}  {}",
+        style("   L L").white(),
+        style("   goose is ready").white()
     );
 }
 
-pub fn display_greeting() {
-    println!("\nGoose is running! Enter your instructions, or try asking what goose can do.\n");
+fn set_terminal_title() {
+    if !std::io::stdout().is_terminal() {
+        return;
+    }
+    let dir_name = std::env::current_dir()
+        .ok()
+        .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
+        .unwrap_or_default();
+    // Sanitize: strip control characters (ESC, BEL, etc.) to prevent terminal escape injection
+    let sanitized: String = dir_name.chars().filter(|c| !c.is_control()).collect();
+    // OSC 0 sets the terminal window/tab title
+    print!("\x1b]0;🪿 {}\x07", sanitized);
+    let _ = std::io::stdout().flush();
+}
+
+pub fn display_context_usage(total_tokens: usize, context_limit: usize) {
+    use console::style;
+
+    if context_limit == 0 {
+        println!(
+            "  {}",
+            style("context usage unavailable (context limit is 0)").dim()
+        );
+        return;
+    }
+
+    let percentage =
+        (((total_tokens as f64 / context_limit as f64) * 100.0).round() as usize).min(100);
+
+    let bar_width = 20;
+    let filled = ((percentage as f64 / 100.0) * bar_width as f64).round() as usize;
+    let empty = bar_width - filled.min(bar_width);
+
+    let bar = format!("{}{}", "━".repeat(filled), "╌".repeat(empty));
+    let colored_bar = if percentage < 50 {
+        style(bar).green().dim()
+    } else if percentage < 85 {
+        style(bar).yellow()
+    } else {
+        style(bar).red()
+    };
+
+    fn format_tokens(n: usize) -> String {
+        if n >= 1_000_000 {
+            format!("{:.1}M", n as f64 / 1_000_000.0)
+        } else if n >= 1_000 {
+            format!("{:.0}k", n as f64 / 1_000.0)
+        } else {
+            n.to_string()
+        }
+    }
+
+    println!(
+        "  {} {} {}",
+        colored_bar,
+        style(format!("{}%", percentage)).dim(),
+        style(format!(
+            "{}/{}",
+            format_tokens(total_tokens),
+            format_tokens(context_limit)
+        ))
+        .dim(),
+    );
+}
+
+fn estimate_cost_usd(
+    provider: &str,
+    model: &str,
+    input_tokens: usize,
+    output_tokens: usize,
+) -> Option<f64> {
+    let canonical_model = maybe_get_canonical_model(provider, model)?;
+
+    let input_cost_per_token = canonical_model.cost.input? / 1_000_000.0;
+    let output_cost_per_token = canonical_model.cost.output? / 1_000_000.0;
+
+    let input_cost = input_cost_per_token * input_tokens as f64;
+    let output_cost = output_cost_per_token * output_tokens as f64;
+    Some(input_cost + output_cost)
+}
+
+/// Display cost information, if price data is available.
+pub fn display_cost_usage(provider: &str, model: &str, input_tokens: usize, output_tokens: usize) {
+    if let Some(cost) = estimate_cost_usd(provider, model, input_tokens, output_tokens) {
+        use console::style;
+        eprintln!(
+            "Cost: {} USD ({} tokens: in {}, out {})",
+            style(format!("${:.4}", cost)).cyan(),
+            input_tokens + output_tokens,
+            input_tokens,
+            output_tokens
+        );
+    }
+}
+
+pub struct McpSpinners {
+    bars: HashMap<String, ProgressBar>,
+    log_spinner: Option<ProgressBar>,
+
+    multi_bar: MultiProgress,
+}
+
+impl McpSpinners {
+    pub fn new() -> Self {
+        McpSpinners {
+            bars: HashMap::new(),
+            log_spinner: None,
+            multi_bar: MultiProgress::new(),
+        }
+    }
+
+    pub fn log(&mut self, message: &str) {
+        let spinner = self.log_spinner.get_or_insert_with(|| {
+            let bar = self.multi_bar.add(
+                ProgressBar::new_spinner()
+                    .with_style(
+                        ProgressStyle::with_template("{spinner:.green} {msg}")
+                            .unwrap()
+                            .tick_chars("⠋⠙⠚⠛⠓⠒⠊⠉"),
+                    )
+                    .with_message(message.to_string()),
+            );
+            bar.enable_steady_tick(Duration::from_millis(100));
+            bar
+        });
+
+        spinner.set_message(message.to_string());
+    }
+
+    pub fn update(&mut self, token: &str, value: f64, total: Option<f64>, message: Option<&str>) {
+        let bar = self.bars.entry(token.to_string()).or_insert_with(|| {
+            if let Some(total) = total {
+                self.multi_bar.add(
+                    ProgressBar::new((total * 100_f64) as u64).with_style(
+                        ProgressStyle::with_template("[{elapsed}] {bar:40} {pos:>3}/{len:3} {msg}")
+                            .unwrap(),
+                    ),
+                )
+            } else {
+                self.multi_bar.add(ProgressBar::new_spinner())
+            }
+        });
+        bar.set_position((value * 100_f64) as u64);
+        if let Some(msg) = message {
+            bar.set_message(msg.to_string());
+        }
+    }
+
+    pub fn hide(&mut self) -> Result<(), Error> {
+        self.bars.iter_mut().for_each(|(_, bar)| {
+            bar.disable_steady_tick();
+        });
+        if let Some(spinner) = self.log_spinner.as_mut() {
+            spinner.disable_steady_tick();
+        }
+        self.multi_bar.clear()
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
     use std::env;
 
     #[test]
@@ -616,6 +1529,19 @@ mod tests {
     }
 
     #[test]
+    fn test_toggle_full_tool_output() {
+        let initial = get_show_full_tool_output();
+
+        let after_first_toggle = toggle_full_tool_output();
+        assert_eq!(after_first_toggle, !initial);
+        assert_eq!(get_show_full_tool_output(), after_first_toggle);
+
+        let after_second_toggle = toggle_full_tool_output();
+        assert_eq!(after_second_toggle, initial);
+        assert_eq!(get_show_full_tool_output(), initial);
+    }
+
+    #[test]
     fn test_long_path_shortening() {
         assert_eq!(
             shorten_path(
@@ -624,5 +1550,28 @@ mod tests {
             ),
             "/v/l/p/w/m/components/file.txt"
         );
+    }
+
+    #[test]
+    fn test_get_credits_top_up_url_from_credits_notification() {
+        let message = Message::assistant().with_system_notification_with_data(
+            SystemNotificationType::CreditsExhausted,
+            "Insufficient credits",
+            json!({"top_up_url": "https://router.tetrate.ai/billing"}),
+        );
+        assert_eq!(
+            get_credits_top_up_url(&message).as_deref(),
+            Some("https://router.tetrate.ai/billing")
+        );
+    }
+
+    #[test]
+    fn test_get_credits_top_up_url_ignores_non_credits_notification() {
+        let message = Message::assistant().with_system_notification_with_data(
+            SystemNotificationType::InlineMessage,
+            "hello",
+            json!({"top_up_url": "https://router.tetrate.ai/billing"}),
+        );
+        assert_eq!(get_credits_top_up_url(&message), None);
     }
 }

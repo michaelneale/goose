@@ -1,97 +1,50 @@
 use anyhow::{Context, Result};
-use etcetera::{choose_app_strategy, AppStrategy};
-use std::fs;
-use std::path::PathBuf;
-use std::sync::Arc;
 use std::sync::Once;
-use tokio::sync::Mutex;
 use tracing_appender::rolling::Rotation;
 use tracing_subscriber::{
     filter::LevelFilter, fmt, layer::SubscriberExt, util::SubscriberInitExt, EnvFilter, Layer,
     Registry,
 };
 
+use goose::otel::otlp;
 use goose::tracing::langfuse_layer;
-use goose_bench::bench_session::BenchAgentError;
-use goose_bench::error_capture::ErrorCaptureLayer;
 
 // Used to ensure we only set up tracing once
 static INIT: Once = Once::new();
 
-/// Returns the directory where log files should be stored.
-/// Creates the directory structure if it doesn't exist.
-fn get_log_directory() -> Result<PathBuf> {
-    get_log_directory_with_date(None)
-}
-
-/// Internal function that allows specifying a custom date string for testing
-fn get_log_directory_with_date(test_date: Option<String>) -> Result<PathBuf> {
-    // choose_app_strategy().state_dir()
-    // - macOS/Linux: ~/.local/state/goose/logs/cli
-    // - Windows:     ~\AppData\Roaming\Block\goose\data\logs\cli
-    // - Windows has no convention for state_dir, use data_dir instead
-    let home_dir = choose_app_strategy(crate::APP_STRATEGY.clone())
-        .context("HOME environment variable not set")?;
-
-    let base_log_dir = home_dir
-        .in_state_dir("logs/cli")
-        .unwrap_or_else(|| home_dir.in_data_dir("logs/cli"));
-
-    // Create date-based subdirectory
-    let date_str = test_date.unwrap_or_else(|| {
-        let now = chrono::Local::now();
-        now.format("%Y-%m-%d").to_string()
-    });
-    let date_dir = base_log_dir.join(date_str);
-
-    // Ensure log directory exists
-    fs::create_dir_all(&date_dir).context("Failed to create log directory")?;
-
-    Ok(date_dir)
+fn default_env_filter() -> EnvFilter {
+    EnvFilter::new("")
+        // Keep goose and MCP logs visible without verbose debug payloads.
+        .add_directive("mcp_client=info".parse().unwrap())
+        .add_directive("goose=info".parse().unwrap())
+        .add_directive("goose_cli=info".parse().unwrap())
+        .add_directive(LevelFilter::WARN.into())
 }
 
 /// Sets up the logging infrastructure for the application.
 /// This includes:
 /// - File-based logging with JSON formatting (DEBUG level)
-/// - Console output for development (INFO level)
+/// - No console output (all logs go to files only)
 /// - Optional Langfuse integration (DEBUG level)
-/// - Optional error capture layer for benchmarking
-pub fn setup_logging(
-    name: Option<&str>,
-    error_capture: Option<Arc<Mutex<Vec<BenchAgentError>>>>,
-) -> Result<()> {
-    setup_logging_internal(name, error_capture, false)
+pub fn setup_logging(name: Option<&str>) -> Result<()> {
+    setup_logging_internal(name, false)
 }
 
 /// Internal function that allows bypassing the Once check for testing
-fn setup_logging_internal(
-    name: Option<&str>,
-    error_capture: Option<Arc<Mutex<Vec<BenchAgentError>>>>,
-    force: bool,
-) -> Result<()> {
+fn setup_logging_internal(name: Option<&str>, force: bool) -> Result<()> {
     let mut result = Ok(());
-
-    // Register the error vector if provided
-    if let Some(errors) = error_capture {
-        ErrorCaptureLayer::register_error_vector(errors);
-    }
 
     let mut setup = || {
         result = (|| {
-            // Set up file appender for goose module logs
-            let log_dir = get_log_directory()?;
+            let log_dir = goose::logging::prepare_log_directory("cli", true)?;
             let timestamp = chrono::Local::now().format("%Y%m%d_%H%M%S").to_string();
-
-            // Create log file name by prefixing with timestamp
-            let log_filename = if name.is_some() {
-                format!("{}-{}.log", timestamp, name.unwrap())
+            let log_filename = if let Some(n) = name {
+                format!("{}-{}.log", timestamp, n)
             } else {
                 format!("{}.log", timestamp)
             };
-
-            // Create non-rolling file appender for detailed logs
             let file_appender = tracing_appender::rolling::RollingFileAppender::new(
-                Rotation::NEVER,
+                Rotation::NEVER, // we do manual rotation via file naming and cleanup_old_logs
                 log_dir,
                 log_filename,
             );
@@ -104,43 +57,20 @@ fn setup_logging_internal(
                 .with_ansi(false)
                 .json();
 
-            // Create console logging layer for development - INFO and above only
-            let console_layer = fmt::layer()
-                .with_target(true)
-                .with_level(true)
-                .with_ansi(true)
-                .with_file(true)
-                .with_line_number(true)
-                .pretty();
-
             // Base filter
-            let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| {
-                // Set default levels for different modules
-                EnvFilter::new("")
-                    // Set mcp-server module to DEBUG
-                    .add_directive("mcp_server=debug".parse().unwrap())
-                    // Set mcp-client to DEBUG
-                    .add_directive("mcp_client=debug".parse().unwrap())
-                    // Set goose module to DEBUG
-                    .add_directive("goose=debug".parse().unwrap())
-                    // Set goose-cli to INFO
-                    .add_directive("goose_cli=info".parse().unwrap())
-                    // Set everything else to WARN
-                    .add_directive(LevelFilter::WARN.into())
-            });
+            let env_filter =
+                EnvFilter::try_from_default_env().unwrap_or_else(|_| default_env_filter());
 
             // Start building the subscriber
             let mut layers = vec![
                 file_layer.with_filter(env_filter).boxed(),
-                console_layer.with_filter(LevelFilter::WARN).boxed(),
+                // Console logging disabled for CLI - all logs go to files only
             ];
 
-            // Only add ErrorCaptureLayer if not in test mode
             if !force {
-                layers.push(ErrorCaptureLayer::new().boxed());
+                layers.extend(otlp::init_otlp_layers(goose::config::Config::global()));
             }
 
-            // Add Langfuse layer if available
             if let Some(langfuse) = langfuse_layer::create_langfuse_observer() {
                 layers.push(langfuse.with_filter(LevelFilter::DEBUG).boxed());
             }
@@ -179,10 +109,8 @@ fn setup_logging_internal(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::TimeZone;
     use std::env;
     use tempfile::TempDir;
-    use test_case::test_case;
 
     fn setup_temp_home() -> TempDir {
         let temp_dir = TempDir::new().unwrap();
@@ -197,7 +125,7 @@ mod tests {
     #[test]
     fn test_log_directory_creation() {
         let _temp_dir = setup_temp_home();
-        let log_dir = get_log_directory().unwrap();
+        let log_dir = goose::logging::prepare_log_directory("cli", true).unwrap();
         assert!(log_dir.exists());
         assert!(log_dir.is_dir());
 
@@ -206,225 +134,6 @@ mod tests {
         assert!(path_components.iter().any(|c| c.as_os_str() == "goose"));
         assert!(path_components.iter().any(|c| c.as_os_str() == "logs"));
         assert!(path_components.iter().any(|c| c.as_os_str() == "cli"));
-    }
-
-    #[tokio::test]
-    #[test_case(Some("test_session"), true ; "with session name and error capture")]
-    #[test_case(Some("test_session"), false ; "with session name without error capture")]
-    #[test_case(None, false ; "without session name")]
-    async fn test_log_file_name(session_name: Option<&str>, _with_error_capture: bool) {
-        // Create a unique test directory for each test
-        let test_name = session_name.unwrap_or("no_session");
-        let random_suffix = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .subsec_nanos();
-        let test_dir = PathBuf::from(format!(
-            "/tmp/goose_test_home_{}_{}",
-            test_name, random_suffix
-        ));
-        if test_dir.exists() {
-            fs::remove_dir_all(&test_dir).unwrap();
-        }
-        fs::create_dir_all(&test_dir).unwrap();
-
-        // Set up environment
-        if cfg!(windows) {
-            env::set_var("USERPROFILE", &test_dir);
-        } else {
-            env::set_var("HOME", &test_dir);
-        }
-
-        // Create error capture if needed - but don't use it in tests to avoid tokio runtime issues
-        let error_capture = None;
-
-        // Get current timestamp before setting up logging
-        let before_timestamp = chrono::Local::now() - chrono::Duration::seconds(1);
-        println!("Before timestamp: {}", before_timestamp);
-
-        // Get the log directory and clean any existing log files
-        let log_dir = get_log_directory_with_date(Some(format!("test-{}", random_suffix))).unwrap();
-        println!("Log directory: {}", log_dir.display());
-        if log_dir.exists() {
-            for entry in fs::read_dir(&log_dir).unwrap() {
-                let entry = entry.unwrap();
-                if entry.path().extension().map_or(false, |ext| ext == "log") {
-                    fs::remove_file(entry.path()).unwrap();
-                }
-            }
-        } else {
-            fs::create_dir_all(&log_dir).unwrap();
-        }
-        println!("Log directory created: {}", log_dir.exists());
-
-        // Set up logging with force=true to bypass the Once check
-        setup_logging_internal(session_name, error_capture, true).unwrap();
-
-        // Write a test log entry
-        tracing::info!("Test log entry");
-        println!("Wrote first test log entry");
-
-        // Wait longer for the log file to be created and flushed
-        std::thread::sleep(std::time::Duration::from_millis(500));
-
-        // Write another log entry to ensure it's flushed
-        tracing::warn!("Another test log entry");
-        println!("Wrote second test log entry");
-
-        // Wait again to ensure it's flushed
-        std::thread::sleep(std::time::Duration::from_millis(500));
-
-        // List all files in log directory
-        println!("Log directory exists: {}", log_dir.exists());
-
-        // Check if there are any log files directly
-        let all_files = fs::read_dir(&log_dir)
-            .unwrap_or_else(|e| {
-                println!("Error reading log directory: {}", e);
-                panic!("Failed to read log directory: {}", e);
-            })
-            .collect::<Result<Vec<_>, _>>()
-            .unwrap();
-
-        let log_count = all_files
-            .iter()
-            .filter(|e| e.path().extension().map_or(false, |ext| ext == "log"))
-            .count();
-
-        println!("Found {} log files in directory", log_count);
-
-        if log_count == 0 {
-            // If no log files found, manually create one for testing
-            println!("No log files found, manually creating one for testing");
-            let timestamp = chrono::Local::now().format("%Y%m%d_%H%M%S").to_string();
-            let log_filename = if let Some(session) = session_name {
-                format!("{}-{}.log", timestamp, session)
-            } else {
-                format!("{}.log", timestamp)
-            };
-            let log_path = log_dir.join(&log_filename);
-            fs::write(&log_path, "Test log content").unwrap();
-            println!("Created test log file: {}", log_path.display());
-        }
-
-        // Read directory again after potential manual creation
-        let entries = fs::read_dir(&log_dir)
-            .unwrap_or_else(|e| {
-                println!("Error reading log directory: {}", e);
-                panic!("Failed to read log directory: {}", e);
-            })
-            .collect::<Result<Vec<_>, _>>()
-            .unwrap();
-
-        // List all log files for debugging
-        println!("All files in log directory ({}):", log_dir.display());
-        for entry in &entries {
-            println!(
-                "  {} (is_file: {})",
-                entry.file_name().to_string_lossy(),
-                entry.file_type().map(|ft| ft.is_file()).unwrap_or(false)
-            );
-        }
-
-        // Verify the file exists and has the correct name
-        let mut log_files: Vec<_> = entries
-            .iter()
-            .filter(|e| {
-                let path = e.path();
-                let matches = path.extension().map_or(false, |ext| ext == "log")
-                    && path.file_name().map_or(false, |name| {
-                        let name = name.to_string_lossy();
-                        if let Some(session) = session_name {
-                            name.ends_with(&format!("{}.log", session))
-                        } else {
-                            // For non-session logs, verify it's a timestamp format and it's after our before_timestamp
-                            if name.len() != 19 {
-                                // YYYYMMDD_HHMMSS.log
-                                println!("  Rejecting {} - wrong length", name);
-                                return false;
-                            }
-                            if name.as_bytes()[8] != b'_' {
-                                println!("  Rejecting {} - no underscore at position 8", name);
-                                return false;
-                            }
-                            let timestamp_str = &name[..15]; // Get YYYYMMDD_HHMMSS part
-                            if !timestamp_str
-                                .chars()
-                                .all(|c| c.is_ascii_digit() || c == '_')
-                            {
-                                println!("  Rejecting {} - invalid characters in timestamp", name);
-                                return false;
-                            }
-                            // Parse the timestamp
-                            if let Ok(file_time) = chrono::NaiveDateTime::parse_from_str(
-                                timestamp_str,
-                                "%Y%m%d_%H%M%S",
-                            ) {
-                                // Convert to DateTime<Local>
-                                let local_time =
-                                    chrono::Local.from_local_datetime(&file_time).unwrap();
-                                println!(
-                                    "  File time: {} vs before time: {}",
-                                    local_time, before_timestamp
-                                );
-                                // Check if file timestamp is after our before_timestamp
-                                local_time >= before_timestamp
-                            } else {
-                                println!("  Rejecting {} - couldn't parse timestamp", name);
-                                false
-                            }
-                        }
-                    });
-                println!(
-                    "  File {} matches: {}",
-                    e.file_name().to_string_lossy(),
-                    matches
-                );
-                matches
-            })
-            .collect();
-
-        log_files.sort_by(|a, b| a.file_name().cmp(&b.file_name()));
-        assert_eq!(log_files.len(), 1, "Expected exactly one matching log file");
-
-        let log_file_name = log_files[0].file_name().to_string_lossy().into_owned();
-        println!("Found log file name: {}", log_file_name);
-
-        if let Some(name) = session_name {
-            assert!(
-                log_file_name.ends_with(&format!("{}.log", name)),
-                "Log file {} should end with {}.log",
-                log_file_name,
-                name
-            );
-        } else {
-            // Extract just the filename without extension for comparison
-            let name_without_ext = log_file_name.trim_end_matches(".log");
-            // Verify it's a valid timestamp format
-            assert_eq!(
-                name_without_ext.len(),
-                15,
-                "Expected 15 characters (YYYYMMDD_HHMMSS)"
-            );
-            assert!(
-                name_without_ext[8..9].contains('_'),
-                "Expected underscore at position 8"
-            );
-            assert!(
-                name_without_ext
-                    .chars()
-                    .all(|c| c.is_ascii_digit() || c == '_'),
-                "Expected only digits and underscore"
-            );
-        }
-
-        // Wait a moment to ensure all files are written
-        std::thread::sleep(std::time::Duration::from_millis(100));
-
-        // Clean up test directory
-        fs::remove_dir_all(&test_dir).unwrap_or_else(|e| {
-            println!("Warning: Failed to clean up test directory: {}", e);
-        });
     }
 
     #[tokio::test]
@@ -477,5 +186,15 @@ mod tests {
                 None => env::remove_var(var),
             }
         }
+    }
+
+    #[test]
+    fn test_default_filter_avoids_debug_by_default() {
+        let filter = super::default_env_filter().to_string();
+        assert!(!filter.contains("mcp_client=debug"));
+        assert!(!filter.contains("goose=debug"));
+        assert!(filter.contains("mcp_client=info"));
+        assert!(filter.contains("goose=info"));
+        assert!(filter.contains("goose_cli=info"));
     }
 }

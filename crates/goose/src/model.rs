@@ -1,172 +1,322 @@
 use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use std::collections::HashMap;
+use thiserror::Error;
+use utoipa::ToSchema;
 
 const DEFAULT_CONTEXT_LIMIT: usize = 128_000;
 
-// Tokenizer names, used to infer from model name
-pub const GPT_4O_TOKENIZER: &str = "Xenova--gpt-4o";
-pub const CLAUDE_TOKENIZER: &str = "Xenova--claude-tokenizer";
-
-// Define the model limits as a static HashMap for reuse
-static MODEL_SPECIFIC_LIMITS: Lazy<HashMap<&'static str, usize>> = Lazy::new(|| {
-    let mut map = HashMap::new();
-    // OpenAI models, https://platform.openai.com/docs/models#models-overview
-    map.insert("gpt-4o", 128_000);
-    map.insert("gpt-4-turbo", 128_000);
-    map.insert("o3", 200_000);
-    map.insert("o3-mini", 200_000);
-    map.insert("o4-mini", 200_000);
-    map.insert("gpt-4.1", 1_000_000);
-    map.insert("gpt-4-1", 1_000_000);
-
-    // Anthropic models, https://docs.anthropic.com/en/docs/about-claude/models
-    map.insert("claude-3", 200_000);
-
-    // Google models, https://ai.google/get-started/our-models/
-    map.insert("gemini-2.5", 1_000_000);
-    map.insert("gemini-2-5", 1_000_000);
-
-    // Meta Llama models, https://github.com/meta-llama/llama-models/tree/main?tab=readme-ov-file#llama-models-1
-    map.insert("llama3.2", 128_000);
-    map.insert("llama3.3", 128_000);
-    map
-});
-
-/// Configuration for model-specific settings and limits
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ModelConfig {
-    /// The name of the model to use
-    pub model_name: String,
-    // Optional tokenizer name (corresponds to the sanitized HuggingFace tokenizer name)
-    // "Xenova/gpt-4o" -> "Xenova/gpt-4o"
-    // If not provided, best attempt will be made to infer from model name or default
-    pub tokenizer_name: String,
-    /// Optional explicit context limit that overrides any defaults
-    pub context_limit: Option<usize>,
-    /// Optional temperature setting (0.0 - 1.0)
-    pub temperature: Option<f32>,
-    /// Optional maximum tokens to generate
-    pub max_tokens: Option<i32>,
-    /// Whether to interpret tool calls with toolshim
-    pub toolshim: bool,
-    /// Model to use for toolshim (optional as a default exists)
-    pub toolshim_model: Option<String>,
+#[derive(Debug, Clone, Deserialize)]
+struct PredefinedModel {
+    name: String,
+    #[serde(default)]
+    context_limit: Option<usize>,
+    #[serde(default)]
+    request_params: Option<HashMap<String, Value>>,
 }
 
-/// Struct to represent model pattern matches and their limits
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ModelLimitConfig {
-    pub pattern: String,
-    pub context_limit: usize,
+fn get_predefined_models() -> Vec<PredefinedModel> {
+    static PREDEFINED_MODELS: Lazy<Vec<PredefinedModel>> =
+        Lazy::new(|| match std::env::var("GOOSE_PREDEFINED_MODELS") {
+            Ok(json_str) => serde_json::from_str(&json_str).unwrap_or_else(|e| {
+                tracing::warn!("Failed to parse GOOSE_PREDEFINED_MODELS: {}", e);
+                Vec::new()
+            }),
+            Err(_) => Vec::new(),
+        });
+    PREDEFINED_MODELS.clone()
+}
+
+fn find_predefined_model(model_name: &str) -> Option<PredefinedModel> {
+    get_predefined_models()
+        .into_iter()
+        .find(|m| m.name == model_name)
+}
+
+#[derive(Error, Debug)]
+pub enum ConfigError {
+    #[error("Environment variable '{0}' not found")]
+    EnvVarMissing(String),
+    #[error("Invalid value for '{0}': '{1}' - {2}")]
+    InvalidValue(String, String, String),
+    #[error("Value for '{0}' is out of valid range: {1}")]
+    InvalidRange(String, String),
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, ToSchema)]
+pub struct ModelConfig {
+    pub model_name: String,
+    pub context_limit: Option<usize>,
+    pub temperature: Option<f32>,
+    pub max_tokens: Option<i32>,
+    pub toolshim: bool,
+    pub toolshim_model: Option<String>,
+    #[serde(skip)]
+    pub fast_model_config: Option<Box<ModelConfig>>,
+    /// Provider-specific request parameters (e.g., anthropic_beta headers)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_params: Option<HashMap<String, Value>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning: Option<bool>,
 }
 
 impl ModelConfig {
-    /// Create a new ModelConfig with the specified model name
-    ///
-    /// The context limit is set with the following precedence:
-    /// 1. Explicit context_limit if provided in config
-    /// 2. Model-specific default based on model name
-    /// 3. Global default (128_000) (in get_context_limit)
-    pub fn new(model_name: String) -> Self {
-        let context_limit = Self::get_model_specific_limit(&model_name);
-        let tokenizer_name = Self::infer_tokenizer_name(&model_name);
+    pub fn new(model_name: &str) -> Result<Self, ConfigError> {
+        Self::new_base(model_name.to_string(), None)
+    }
 
-        let toolshim = std::env::var("GOOSE_TOOLSHIM")
-            .map(|val| val == "1" || val.to_lowercase() == "true")
-            .unwrap_or(false);
+    pub fn new_with_context_env(
+        model_name: String,
+        provider_name: &str,
+        context_env_var: Option<&str>,
+    ) -> Result<Self, ConfigError> {
+        let config = Self::new_base(model_name, context_env_var)?;
+        Ok(config.with_canonical_limits(provider_name))
+    }
 
-        let toolshim_model = std::env::var("GOOSE_TOOLSHIM_OLLAMA_MODEL").ok();
+    fn new_base(model_name: String, context_env_var: Option<&str>) -> Result<Self, ConfigError> {
+        let context_limit = if let Some(env_var) = context_env_var {
+            if let Ok(val) = std::env::var(env_var) {
+                Some(Self::validate_context_limit(&val, env_var)?)
+            } else {
+                None
+            }
+        } else if let Ok(val) = std::env::var("GOOSE_CONTEXT_LIMIT") {
+            Some(Self::validate_context_limit(&val, "GOOSE_CONTEXT_LIMIT")?)
+        } else {
+            None
+        };
 
-        let temperature = std::env::var("GOOSE_TEMPERATURE")
-            .ok()
-            .and_then(|val| val.parse::<f32>().ok());
+        let max_tokens = Self::parse_max_tokens()?;
+        let temperature = Self::parse_temperature()?;
+        let toolshim = Self::parse_toolshim()?;
+        let toolshim_model = Self::parse_toolshim_model()?;
 
-        Self {
+        // Pick up request_params from predefined models (always applies)
+        let predefined = find_predefined_model(&model_name);
+        let request_params = predefined.and_then(|pm| pm.request_params);
+
+        Ok(Self {
             model_name,
-            tokenizer_name: tokenizer_name.to_string(),
             context_limit,
             temperature,
-            max_tokens: None,
+            max_tokens,
             toolshim,
             toolshim_model,
-        }
+            fast_model_config: None,
+            request_params,
+            reasoning: None,
+        })
     }
 
-    fn infer_tokenizer_name(model_name: &str) -> &'static str {
-        if model_name.contains("claude") {
-            CLAUDE_TOKENIZER
-        } else {
-            // Default tokenizer
-            GPT_4O_TOKENIZER
-        }
-    }
-
-    /// Get model-specific context limit based on model name
-    fn get_model_specific_limit(model_name: &str) -> Option<usize> {
-        for (pattern, &limit) in MODEL_SPECIFIC_LIMITS.iter() {
-            if model_name.contains(pattern) {
-                return Some(limit);
+    pub fn with_canonical_limits(mut self, provider_name: &str) -> Self {
+        if let Some(canonical) =
+            crate::providers::canonical::maybe_get_canonical_model(provider_name, &self.model_name)
+        {
+            if self.context_limit.is_none() {
+                self.context_limit = Some(canonical.limit.context);
+            }
+            if self.max_tokens.is_none() {
+                self.max_tokens = canonical.limit.output.map(|o| o as i32);
+            }
+            if self.reasoning.is_none() {
+                self.reasoning = canonical.reasoning;
             }
         }
-        None
+
+        // Try filling remaining gaps from predefined models
+        if self.context_limit.is_none() {
+            if let Some(pm) = find_predefined_model(&self.model_name) {
+                self.context_limit = pm.context_limit;
+            }
+        }
+
+        self
     }
 
-    /// Get all model pattern matches and their limits
-    pub fn get_all_model_limits() -> Vec<ModelLimitConfig> {
-        MODEL_SPECIFIC_LIMITS
-            .iter()
-            .map(|(&pattern, &context_limit)| ModelLimitConfig {
-                pattern: pattern.to_string(),
-                context_limit,
-            })
-            .collect()
+    fn validate_context_limit(val: &str, env_var: &str) -> Result<usize, ConfigError> {
+        let limit = val.parse::<usize>().map_err(|_| {
+            ConfigError::InvalidValue(
+                env_var.to_string(),
+                val.to_string(),
+                "must be a positive integer".to_string(),
+            )
+        })?;
+
+        if limit < 4 * 1024 {
+            return Err(ConfigError::InvalidRange(
+                env_var.to_string(),
+                "must be greater than 4K".to_string(),
+            ));
+        }
+
+        Ok(limit)
     }
 
-    /// Set an explicit context limit
+    fn parse_temperature() -> Result<Option<f32>, ConfigError> {
+        if let Ok(val) = std::env::var("GOOSE_TEMPERATURE") {
+            let temp = val.parse::<f32>().map_err(|_| {
+                ConfigError::InvalidValue(
+                    "GOOSE_TEMPERATURE".to_string(),
+                    val.clone(),
+                    "must be a valid number".to_string(),
+                )
+            })?;
+            if temp < 0.0 {
+                return Err(ConfigError::InvalidRange(
+                    "GOOSE_TEMPERATURE".to_string(),
+                    val,
+                ));
+            }
+            Ok(Some(temp))
+        } else {
+            Ok(None)
+        }
+    }
+
+    fn parse_max_tokens() -> Result<Option<i32>, ConfigError> {
+        match crate::config::Config::global().get_param::<i32>("GOOSE_MAX_TOKENS") {
+            Ok(tokens) => {
+                if tokens <= 0 {
+                    return Err(ConfigError::InvalidRange(
+                        "goose_max_tokens".to_string(),
+                        "must be greater than 0".to_string(),
+                    ));
+                }
+                Ok(Some(tokens))
+            }
+            Err(crate::config::ConfigError::NotFound(_)) => Ok(None),
+            Err(e) => Err(ConfigError::InvalidValue(
+                "goose_max_tokens".to_string(),
+                String::new(),
+                e.to_string(),
+            )),
+        }
+    }
+
+    fn parse_toolshim() -> Result<bool, ConfigError> {
+        if let Ok(val) = std::env::var("GOOSE_TOOLSHIM") {
+            match val.to_lowercase().as_str() {
+                "1" | "true" | "yes" | "on" => Ok(true),
+                "0" | "false" | "no" | "off" => Ok(false),
+                _ => Err(ConfigError::InvalidValue(
+                    "GOOSE_TOOLSHIM".to_string(),
+                    val,
+                    "must be one of: 1, true, yes, on, 0, false, no, off".to_string(),
+                )),
+            }
+        } else {
+            Ok(false)
+        }
+    }
+
+    fn parse_toolshim_model() -> Result<Option<String>, ConfigError> {
+        match std::env::var("GOOSE_TOOLSHIM_OLLAMA_MODEL") {
+            Ok(val) if val.trim().is_empty() => Err(ConfigError::InvalidValue(
+                "GOOSE_TOOLSHIM_OLLAMA_MODEL".to_string(),
+                val,
+                "cannot be empty if set".to_string(),
+            )),
+            Ok(val) => Ok(Some(val)),
+            Err(_) => Ok(None),
+        }
+    }
+
     pub fn with_context_limit(mut self, limit: Option<usize>) -> Self {
-        // Default is None and therefore DEFAULT_CONTEXT_LIMIT, only set
-        // if input is Some to allow passing through with_context_limit in
-        // configuration cases
         if limit.is_some() {
             self.context_limit = limit;
         }
         self
     }
 
-    /// Set the temperature
     pub fn with_temperature(mut self, temp: Option<f32>) -> Self {
         self.temperature = temp;
         self
     }
 
-    /// Set the max tokens
     pub fn with_max_tokens(mut self, tokens: Option<i32>) -> Self {
         self.max_tokens = tokens;
         self
     }
 
-    /// Set whether to interpret tool calls
     pub fn with_toolshim(mut self, toolshim: bool) -> Self {
         self.toolshim = toolshim;
         self
     }
 
-    /// Set the tool call interpreter model
     pub fn with_toolshim_model(mut self, model: Option<String>) -> Self {
         self.toolshim_model = model;
         self
     }
 
-    /// Get the tokenizer name
-    pub fn tokenizer_name(&self) -> &str {
-        &self.tokenizer_name
+    pub fn with_fast(
+        mut self,
+        fast_model_name: &str,
+        provider_name: &str,
+    ) -> Result<Self, ConfigError> {
+        // Create a full ModelConfig for the fast model with proper canonical lookup
+        let fast_config = ModelConfig::new(fast_model_name)?.with_canonical_limits(provider_name);
+        self.fast_model_config = Some(Box::new(fast_config));
+        Ok(self)
     }
 
-    /// Get the context_limit for the current model
-    /// If none are defined, use the DEFAULT_CONTEXT_LIMIT
+    pub fn with_request_params(mut self, params: Option<HashMap<String, Value>>) -> Self {
+        self.request_params = params;
+        self
+    }
+
+    pub fn use_fast_model(&self) -> Self {
+        if let Some(fast_config) = &self.fast_model_config {
+            *fast_config.clone()
+        } else {
+            self.clone()
+        }
+    }
+
     pub fn context_limit(&self) -> usize {
         self.context_limit.unwrap_or(DEFAULT_CONTEXT_LIMIT)
+    }
+
+    pub fn is_openai_reasoning_model(&self) -> bool {
+        const DATABRICKS_MODEL_NAME_PREFIXES: &[&str] = &["goose-", "databricks-"];
+        const REASONING_PREFIXES: &[&str] = &["o1", "o3", "o4", "gpt-5"];
+
+        let base = DATABRICKS_MODEL_NAME_PREFIXES
+            .iter()
+            .find_map(|p| self.model_name.strip_prefix(p))
+            .unwrap_or(&self.model_name);
+
+        REASONING_PREFIXES.iter().any(|p| base.starts_with(p))
+    }
+
+    pub fn max_output_tokens(&self) -> i32 {
+        if let Some(tokens) = self.max_tokens {
+            return tokens;
+        }
+
+        4_096
+    }
+
+    pub fn get_config_param<T: for<'de> serde::Deserialize<'de>>(
+        &self,
+        request_key: &str,
+        config_key: &str,
+    ) -> Option<T> {
+        self.request_params
+            .as_ref()
+            .and_then(|params| params.get(request_key))
+            .and_then(|v| serde_json::from_value(v.clone()).ok())
+            .or_else(|| {
+                crate::config::Config::global()
+                    .get_param::<T>(config_key)
+                    .ok()
+            })
+    }
+
+    pub fn new_or_fail(model_name: &str) -> ModelConfig {
+        ModelConfig::new(model_name)
+            .unwrap_or_else(|_| panic!("Failed to create model config for {}", model_name))
     }
 }
 
@@ -175,83 +325,183 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_model_config_context_limits() {
-        // Test explicit limit
-        let config =
-            ModelConfig::new("claude-3-opus".to_string()).with_context_limit(Some(150_000));
-        assert_eq!(config.context_limit(), 150_000);
-
-        // Test model-specific defaults
-        let config = ModelConfig::new("claude-3-opus".to_string());
-        assert_eq!(config.context_limit(), 200_000);
-
-        let config = ModelConfig::new("gpt-4-turbo".to_string());
-        assert_eq!(config.context_limit(), 128_000);
-
-        // Test fallback to default
-        let config = ModelConfig::new("unknown-model".to_string());
-        assert_eq!(config.context_limit(), DEFAULT_CONTEXT_LIMIT);
+    fn test_parse_max_tokens_valid() {
+        let _guard = env_lock::lock_env([("GOOSE_MAX_TOKENS", Some("4096"))]);
+        let result = ModelConfig::parse_max_tokens().unwrap();
+        assert_eq!(result, Some(4096));
     }
 
     #[test]
-    fn test_model_config_settings() {
-        let config = ModelConfig::new("test-model".to_string())
-            .with_temperature(Some(0.7))
-            .with_max_tokens(Some(1000))
-            .with_context_limit(Some(50_000));
-
-        assert_eq!(config.temperature, Some(0.7));
-        assert_eq!(config.max_tokens, Some(1000));
-        assert_eq!(config.context_limit, Some(50_000));
+    fn test_parse_max_tokens_not_set() {
+        let _guard = env_lock::lock_env([("GOOSE_MAX_TOKENS", None::<&str>)]);
+        let result = ModelConfig::parse_max_tokens().unwrap();
+        assert_eq!(result, None);
     }
 
     #[test]
-    fn test_model_config_tool_interpretation() {
-        // Test without env vars - should be false
-        let config = ModelConfig::new("test-model".to_string());
-        assert!(!config.toolshim);
-
-        // Test with tool interpretation setting
-        let config = ModelConfig::new("test-model".to_string()).with_toolshim(true);
-        assert!(config.toolshim);
-
-        // Test tool interpreter model
-        let config = ModelConfig::new("test-model".to_string())
-            .with_toolshim_model(Some("mistral-nemo".to_string()));
-        assert_eq!(config.toolshim_model, Some("mistral-nemo".to_string()));
+    fn test_parse_max_tokens_invalid_string() {
+        let _guard = env_lock::lock_env([("GOOSE_MAX_TOKENS", Some("not_a_number"))]);
+        let result = ModelConfig::parse_max_tokens();
+        assert!(result.is_err());
+        assert!(matches!(result.unwrap_err(), ConfigError::InvalidValue(..)));
     }
 
     #[test]
-    fn test_model_config_temp_env_var() {
-        use temp_env::with_var;
-
-        with_var("GOOSE_TEMPERATURE", Some("0.128"), || {
-            let config = ModelConfig::new("test-model".to_string());
-            assert_eq!(config.temperature, Some(0.128));
-        });
-
-        with_var("GOOSE_TEMPERATURE", Some("notanum"), || {
-            let config = ModelConfig::new("test-model".to_string());
-            assert_eq!(config.temperature, None);
-        });
-
-        with_var("GOOSE_TEMPERATURE", Some(""), || {
-            let config = ModelConfig::new("test-model".to_string());
-            assert_eq!(config.temperature, None);
-        });
-
-        let config = ModelConfig::new("test-model".to_string());
-        assert_eq!(config.temperature, None);
+    fn test_parse_max_tokens_zero() {
+        let _guard = env_lock::lock_env([("GOOSE_MAX_TOKENS", Some("0"))]);
+        let result = ModelConfig::parse_max_tokens();
+        assert!(result.is_err());
+        assert!(matches!(result.unwrap_err(), ConfigError::InvalidRange(..)));
     }
 
     #[test]
-    fn test_get_all_model_limits() {
-        let limits = ModelConfig::get_all_model_limits();
-        assert!(!limits.is_empty());
+    fn test_parse_max_tokens_negative() {
+        let _guard = env_lock::lock_env([("GOOSE_MAX_TOKENS", Some("-100"))]);
+        let result = ModelConfig::parse_max_tokens();
+        assert!(result.is_err());
+        assert!(matches!(result.unwrap_err(), ConfigError::InvalidRange(..)));
+    }
 
-        // Test that we can find specific patterns
-        let gpt4_limit = limits.iter().find(|l| l.pattern == "gpt-4o");
-        assert!(gpt4_limit.is_some());
-        assert_eq!(gpt4_limit.unwrap().context_limit, 128_000);
+    #[test]
+    fn test_model_config_with_max_tokens_env() {
+        let _guard = env_lock::lock_env([
+            ("GOOSE_MAX_TOKENS", Some("8192")),
+            ("GOOSE_TEMPERATURE", None::<&str>),
+            ("GOOSE_CONTEXT_LIMIT", None::<&str>),
+            ("GOOSE_TOOLSHIM", None::<&str>),
+            ("GOOSE_TOOLSHIM_OLLAMA_MODEL", None::<&str>),
+        ]);
+        let config = ModelConfig::new("test-model").unwrap();
+        assert_eq!(config.max_tokens, Some(8192));
+    }
+
+    #[test]
+    fn test_model_config_without_max_tokens_env() {
+        let _guard = env_lock::lock_env([
+            ("GOOSE_MAX_TOKENS", None::<&str>),
+            ("GOOSE_TEMPERATURE", None::<&str>),
+            ("GOOSE_CONTEXT_LIMIT", None::<&str>),
+            ("GOOSE_TOOLSHIM", None::<&str>),
+            ("GOOSE_TOOLSHIM_OLLAMA_MODEL", None::<&str>),
+        ]);
+        let config = ModelConfig::new("test-model").unwrap();
+        assert_eq!(config.max_tokens, None);
+    }
+
+    #[test]
+    fn test_get_config_param() {
+        let _guard = env_lock::lock_env([
+            ("CLAUDE_THINKING_EFFORT", Some("high")),
+            ("CLAUDE_THINKING_TYPE", None::<&str>),
+        ]);
+
+        let mut params = HashMap::new();
+        params.insert("effort".to_string(), serde_json::json!("low"));
+
+        let config_with_params = ModelConfig {
+            model_name: "test".to_string(),
+            request_params: Some(params),
+            ..Default::default()
+        };
+
+        let config_without_params = ModelConfig {
+            request_params: None,
+            ..config_with_params.clone()
+        };
+
+        assert_eq!(
+            config_with_params.get_config_param::<String>("effort", "CLAUDE_THINKING_EFFORT"),
+            Some("low".to_string())
+        );
+        assert_eq!(
+            config_without_params.get_config_param::<String>("effort", "CLAUDE_THINKING_EFFORT"),
+            Some("high".to_string())
+        );
+        assert_eq!(
+            config_without_params
+                .get_config_param::<String>("nonexistent", "NONEXISTENT_CONFIG_KEY"),
+            None
+        );
+    }
+
+    mod with_canonical_limits {
+        use super::*;
+
+        #[test]
+        fn sets_limits_from_canonical_model() {
+            let config = ModelConfig::new_or_fail("gpt-4o").with_canonical_limits("openai");
+
+            assert_eq!(config.context_limit, Some(128_000));
+            assert_eq!(config.max_tokens, Some(16_384));
+            assert_eq!(config.reasoning, Some(false));
+        }
+
+        #[test]
+        fn does_not_override_existing_context_limit() {
+            let mut config = ModelConfig::new_or_fail("gpt-4o");
+            config.context_limit = Some(64_000);
+            let config = config.with_canonical_limits("openai");
+
+            assert_eq!(config.context_limit, Some(64_000));
+        }
+
+        #[test]
+        fn does_not_override_existing_max_tokens() {
+            let mut config = ModelConfig::new_or_fail("gpt-4o");
+            config.max_tokens = Some(1_000);
+            let config = config.with_canonical_limits("openai");
+
+            assert_eq!(config.max_tokens, Some(1_000));
+        }
+
+        #[test]
+        fn unknown_model_leaves_fields_none() {
+            let config =
+                ModelConfig::new_or_fail("totally-unknown-model").with_canonical_limits("openai");
+
+            assert_eq!(config.context_limit, None);
+            assert_eq!(config.max_tokens, None);
+            assert_eq!(config.reasoning, None);
+        }
+    }
+
+    mod is_openai_reasoning_model {
+        use super::*;
+
+        #[test]
+        fn bare_reasoning_models() {
+            assert!(ModelConfig::new_or_fail("o1").is_openai_reasoning_model());
+            assert!(ModelConfig::new_or_fail("o1-preview").is_openai_reasoning_model());
+            assert!(ModelConfig::new_or_fail("o3").is_openai_reasoning_model());
+            assert!(ModelConfig::new_or_fail("o3-mini").is_openai_reasoning_model());
+            assert!(ModelConfig::new_or_fail("o4-mini").is_openai_reasoning_model());
+            assert!(ModelConfig::new_or_fail("gpt-5").is_openai_reasoning_model());
+            assert!(ModelConfig::new_or_fail("gpt-5-3-codex").is_openai_reasoning_model());
+        }
+
+        #[test]
+        fn goose_prefixed_reasoning_models() {
+            assert!(ModelConfig::new_or_fail("goose-o3-mini").is_openai_reasoning_model());
+            assert!(ModelConfig::new_or_fail("goose-o4-mini").is_openai_reasoning_model());
+            assert!(ModelConfig::new_or_fail("goose-gpt-5").is_openai_reasoning_model());
+        }
+
+        #[test]
+        fn databricks_prefixed_reasoning_models() {
+            assert!(ModelConfig::new_or_fail("databricks-o3-mini").is_openai_reasoning_model());
+            assert!(ModelConfig::new_or_fail("databricks-o4-mini").is_openai_reasoning_model());
+            assert!(ModelConfig::new_or_fail("databricks-gpt-5").is_openai_reasoning_model());
+        }
+
+        #[test]
+        fn non_reasoning_models() {
+            assert!(!ModelConfig::new_or_fail("claude-sonnet-4").is_openai_reasoning_model());
+            assert!(!ModelConfig::new_or_fail("gpt-4o").is_openai_reasoning_model());
+            assert!(
+                !ModelConfig::new_or_fail("databricks-claude-sonnet-4").is_openai_reasoning_model()
+            );
+            assert!(!ModelConfig::new_or_fail("goose-claude-sonnet-4").is_openai_reasoning_model());
+            assert!(!ModelConfig::new_or_fail("llama-3-70b").is_openai_reasoning_model());
+        }
     }
 }

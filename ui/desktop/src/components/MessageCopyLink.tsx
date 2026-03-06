@@ -1,11 +1,11 @@
-/* global Blob, ClipboardItem */
+/* global ClipboardItem */
 
 import React, { useState } from 'react';
 import { Copy } from './icons';
 
 interface MessageCopyLinkProps {
   text: string;
-  contentRef: React.RefObject<HTMLElement>;
+  contentRef: React.RefObject<HTMLDivElement | null>;
 }
 
 export default function MessageCopyLink({ text, contentRef }: MessageCopyLinkProps) {
@@ -51,7 +51,7 @@ export default function MessageCopyLink({ text, contentRef }: MessageCopyLinkPro
   return (
     <button
       onClick={handleCopy}
-      className="flex items-center gap-1 text-xs text-textSubtle hover:cursor-pointer hover:text-textProminent transition-all duration-200 opacity-0 group-hover:opacity-100 -translate-y-4 group-hover:translate-y-0"
+      className="flex font-mono items-center gap-1 text-xs text-text-secondary hover:cursor-pointer hover:text-text-primary transition-all duration-200 opacity-0 group-hover:opacity-100 -translate-y-4 group-hover:translate-y-0"
     >
       <Copy className="h-3 w-3" />
       <span>{copied ? 'Copied!' : 'Copy'}</span>

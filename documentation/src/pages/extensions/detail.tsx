@@ -1,5 +1,5 @@
 import Layout from "@theme/Layout";
-import { Download, Terminal, Star, ArrowLeft, Info } from "lucide-react";
+import { Download, Terminal, Star, ArrowLeft, Info, BookOpen } from "lucide-react";
 import { Button } from "@site/src/components/ui/button";
 import { Badge } from "@site/src/components/ui/badge";
 import { getGooseInstallLink } from "@site/src/utils/install-links";
@@ -7,9 +7,41 @@ import { useLocation } from "@docusaurus/router";
 import { useEffect, useState } from "react";
 import type { MCPServer } from "@site/src/types/server";
 import { fetchMCPServers } from "@site/src/utils/mcp-servers";
-import Link from "@docusaurus/Link";
+import { fetchGitHubStars, formatStarCount } from "@site/src/utils/github-stars";
+import Link from "@docusaurus/Link"; 
 
 function ExtensionDetail({ server }: { server: MCPServer }) {
+  const [githubStars, setGithubStars] = useState<number | null>(null);
+
+
+// outliers in naming
+const overrides: Record<string, string> = {
+  'computercontroller': 'computer-controller-mcp',
+  'pdf-read': 'pdf-mcp',
+  'knowledge-graph-memory': 'knowledge-graph-mcp',
+  'vscode': 'vs-code-mcp',
+};
+
+const getDocumentationPath = (serverId: string): string => {
+  let filename = serverId.replace(/_/g, '-');
+  filename = overrides[filename] ?? filename;
+
+  if (!filename.endsWith('-mcp')) {
+    filename += '-mcp';
+  }
+
+  return filename;
+};
+
+
+  useEffect(() => {
+    if (server.link) {
+      fetchGitHubStars(server.link).then(stars => {
+        setGithubStars(stars);
+      });
+    }
+  }, [server.link]);
+
   return (
     <Layout>
       <div className="min-h-screen flex items-start justify-center py-16">
@@ -27,7 +59,14 @@ function ExtensionDetail({ server }: { server: MCPServer }) {
             </div>
 
             <div className="server-card flex-1">
-              <div className="card p-8">
+              <div className="card p-8 relative">
+                <Link
+                  to={`/docs/mcp/${getDocumentationPath(server.id)}`}
+                  className="absolute top-4 right-4 flex items-center gap-2 text-textSubtle hover:text-textProminent transition-colors no-underline"
+                  title="View tutorial"
+                >
+                  <BookOpen className="h-5 w-5" />
+                </Link>
                 <div className="card-header mb-6">
                   <div className="flex items-center gap-4">
                     <h1 className="font-medium text-5xl text-textProminent m-0">
@@ -61,22 +100,36 @@ function ExtensionDetail({ server }: { server: MCPServer }) {
                       <div className="flex items-center gap-2">
                         <Info className="h-4 w-4 text-textSubtle shrink-0" />
                         <span className="text-sm text-textSubtle">
-                          Can be enabled in the goose settings page
+                           Can be enabled on the Extensions page in goose
                         </span>
                       </div>
-                    ) : (
+                    ) : server.show_install_command !== false ? (
                       <>
                         <div className="flex items-center gap-2 text-textStandard">
                           <Terminal className="h-4 w-4" />
                           <h4 className="font-medium m-0">Command</h4>
                         </div>
                         <div className="command-content">
-                          <code className="text-sm block">
-                            {`goose session --with-extension "${server.command}"`}
-                          </code>
+                          {(server.type === "local" || !server.type) ? (
+                            <code className="text-sm block">
+                              {`goose session --with-extension "${server.command}"`}
+                            </code>
+                          ) : server.type === "remote" ? (
+                            <code className="text-sm block">
+                              {`goose session --with-remote-extension "${server.url}"`}
+                            </code>
+                          ) : server.type === "streamable-http" ? (
+                            <code className="text-sm block">
+                              {`goose session --with-streamable-http-extension "${server.url}"`}
+                            </code>
+                          ) : (
+                            <code className="text-sm block">
+                              No command available
+                            </code>
+                          )}
                         </div>
                       </>
-                    )}
+                    ) : null}
                   </div>
 
                   {server.environmentVariables && (
@@ -114,25 +167,55 @@ function ExtensionDetail({ server }: { server: MCPServer }) {
                     </div>
                   )}
 
+                  {server.headers && server.headers.length > 0 && (
+                    <div className="space-y-4">
+                      <h2 className="text-lg font-medium text-textStandard m-0">
+                        Request Headers
+                      </h2>
+                      <div>
+                        {server.headers.map((header) => (
+                          <div
+                            key={header.name}
+                            className="border-b border-borderSubtle py-4 first:pt-0 last:border-0"
+                          >
+                            <div className="text-sm text-textStandard font-medium">
+                              {header.name}
+                            </div>
+                            <div className="text-textSubtle text-sm mt-1">
+                              {header.description}
+                            </div>
+                            {header.required && (
+                              <Badge variant="secondary" className="mt-2">
+                                Required
+                              </Badge>
+                            )}
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+
                   <div className="card-footer">
-                    <a
-                      href={server.link}
-                      target="_blank"
-                      rel="noopener noreferrer"
-                      className="card-stats"
-                    >
-                      <Star className="h-4 w-4" />
-                      <span>{server.githubStars} on Github</span>
-                    </a>
+                    {githubStars !== null && (
+                      <a
+                        href={server.link}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        className="card-stats"
+                      >
+                        <Star className="h-4 w-4" />
+                        <span>{formatStarCount(githubStars)} on GitHub</span>
+                      </a>
+                    )}
 
                     {server.is_builtin ? (
                       <div
                         className="built-in-badge"
-                        title="This extension is built into goose and can be enabled in the settings page"
+                        title="This extension is built into Goose and can be enabled on the Extensions page"
                       >
                         Built-in
                       </div>
-                    ) : (
+                    ) : server.show_install_link !== false ? (
                       <a
                         href={getGooseInstallLink(server)}
                         target="_blank"
@@ -142,7 +225,7 @@ function ExtensionDetail({ server }: { server: MCPServer }) {
                         <span>Install</span>
                         <Download className="h-4 w-4" />
                       </a>
-                    )}
+                    ) : null}
                   </div>
                 </div>
               </div>

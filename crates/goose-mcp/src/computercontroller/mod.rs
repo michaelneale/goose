@@ -1,468 +1,332 @@
+use crate::subprocess::SubprocessExt;
+#[cfg(target_os = "macos")]
 use base64::Engine;
 use etcetera::{choose_app_strategy, AppStrategy};
 use indoc::{formatdoc, indoc};
 use reqwest::{Client, Url};
-use serde_json::{json, Value};
-use std::{
-    collections::HashMap, fs, future::Future, path::PathBuf, pin::Pin, sync::Arc, sync::Mutex,
+use rmcp::{
+    handler::server::{router::tool::ToolRouter, wrapper::Parameters},
+    model::{
+        AnnotateAble, CallToolResult, Content, ErrorCode, ErrorData, Implementation,
+        ListResourcesResult, PaginatedRequestParams, RawResource, ReadResourceRequestParams,
+        ReadResourceResult, Resource, ResourceContents, ServerCapabilities, ServerInfo,
+    },
+    schemars::JsonSchema,
+    service::RequestContext,
+    tool, tool_handler, tool_router, RoleServer, ServerHandler,
 };
+use serde::{Deserialize, Serialize};
+use std::{collections::HashMap, fs, path::PathBuf, sync::Arc, sync::Mutex};
 use tokio::process::Command;
 
-use mcp_core::{
-    handler::{PromptError, ResourceError, ToolError},
-    prompt::Prompt,
-    protocol::ServerCapabilities,
-    resource::Resource,
-    tool::{Tool, ToolAnnotations},
-    Content,
-};
-use mcp_server::router::CapabilitiesBuilder;
-use mcp_server::Router;
+#[cfg(target_os = "macos")]
+use rmcp::model::Role;
+#[cfg(target_os = "macos")]
+use std::sync::atomic::{AtomicBool, Ordering};
+
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 
 mod docx_tool;
 mod pdf_tool;
-mod presentation_tool;
 mod xlsx_tool;
 
 mod platform;
 use platform::{create_system_automation, SystemAutomation};
 
-/// An extension designed for non-developers to help them with common tasks like
-/// web scraping, data processing, and automation.
+/// Enum for save_as parameter in web_scrape tool
+#[derive(Debug, Serialize, Deserialize, JsonSchema, Clone, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum SaveAsFormat {
+    /// Save as text (for HTML pages)
+    #[default]
+    Text,
+    /// Save as JSON (for API responses)
+    Json,
+    /// Save as binary (for images and other files)
+    Binary,
+}
+
+/// Parameters for the web_scrape tool
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+pub struct WebScrapeParams {
+    /// The URL to fetch content from
+    pub url: String,
+    /// Format of the response.
+    #[serde(default)]
+    pub save_as: SaveAsFormat,
+}
+
+/// Enum for language parameter in automation_script tool
+#[derive(Debug, Serialize, Deserialize, JsonSchema, Clone)]
+#[serde(rename_all = "lowercase")]
+pub enum ScriptLanguage {
+    /// Shell/Bash script
+    Shell,
+    /// Batch script (Windows)
+    Batch,
+    /// Ruby script
+    Ruby,
+    /// PowerShell script
+    Powershell,
+}
+
+/// Enum for command parameter in cache tool
+#[derive(Debug, Serialize, Deserialize, JsonSchema, Clone)]
+#[serde(rename_all = "lowercase")]
+pub enum CacheCommand {
+    /// List all cached files
+    List,
+    /// View content of a cached file
+    View,
+    /// Delete a cached file
+    Delete,
+    /// Clear all cached files
+    Clear,
+}
+
+/// Parameters for the automation_script tool
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+pub struct AutomationScriptParams {
+    /// The scripting language to use
+    #[serde(rename = "language")]
+    pub language: ScriptLanguage,
+    /// The script content
+    pub script: String,
+    /// Whether to save the script output to a file
+    #[serde(default)]
+    pub save_output: bool,
+}
+
+/// Parameters for the computer_control tool (Windows, Linux)
+#[cfg(not(target_os = "macos"))]
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+pub struct ComputerControlParams {
+    /// The automation script content (PowerShell for Windows, shell for Linux)
+    pub script: String,
+    /// Whether to save the script output to a file
+    #[serde(default)]
+    pub save_output: bool,
+}
+
+/// Parameters for the computer_control tool (macOS — Peekaboo CLI passthrough)
+#[cfg(target_os = "macos")]
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+pub struct ComputerControlParams {
+    /// The peekaboo subcommand and arguments as a single string.
+    /// Examples:
+    ///   "see --app Safari --annotate"
+    ///   "click --on B1"
+    ///   "type --text \"hello\" --return"
+    ///   "hotkey --keys cmd,c"
+    ///   "app launch Safari --open https://example.com"
+    ///   "window list --app Safari --json"
+    ///   "press tab --count 3"
+    ///   "clipboard --action get"
+    pub command: String,
+    /// Whether to capture and return a screenshot as part of the result.
+    /// Useful after click/type actions to see the updated UI state.
+    #[serde(default)]
+    pub capture_screenshot: bool,
+}
+
+/// Parameters for the cache tool
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+pub struct CacheParams {
+    /// The command to perform
+    pub command: CacheCommand,
+    /// Path to the cached file for view/delete commands
+    pub path: Option<String>,
+}
+
+/// Parameters for the pdf_tool
+/// Enum for operation parameter in pdf_tool
+#[derive(Debug, Serialize, Deserialize, JsonSchema, Clone)]
+#[serde(rename_all = "snake_case")]
+pub enum PdfOperation {
+    /// Extract all text content from the PDF
+    ExtractText,
+    /// Extract and save embedded images to PNG files
+    ExtractImages,
+}
+
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+pub struct PdfToolParams {
+    /// Path to the PDF file
+    pub path: String,
+    /// Operation to perform on the PDF
+    pub operation: PdfOperation,
+}
+
+/// Enum for operation parameter in docx_tool
+#[derive(Debug, Serialize, Deserialize, JsonSchema, Clone)]
+#[serde(rename_all = "snake_case")]
+pub enum DocxOperation {
+    /// Extract all text content and structure from the DOCX
+    ExtractText,
+    /// Create a new DOCX or update existing one with provided content
+    UpdateDoc,
+}
+
+/// Enum for update mode in docx_tool params
+#[derive(Debug, Serialize, Deserialize, JsonSchema, Clone, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum DocxUpdateMode {
+    /// Add content to end of document (default)
+    #[default]
+    Append,
+    /// Replace specific text with new content
+    Replace,
+    /// Add content with specific heading level and styling
+    Structured,
+    /// Add an image to the document (with optional caption)
+    AddImage,
+}
+
+/// Enum for text alignment in docx_tool params
+#[derive(Debug, Serialize, Deserialize, JsonSchema, Clone)]
+#[serde(rename_all = "lowercase")]
+pub enum TextAlignment {
+    /// Left alignment
+    Left,
+    /// Center alignment
+    Center,
+    /// Right alignment
+    Right,
+    /// Justified alignment
+    Justified,
+}
+
+/// Styling options for text in docx_tool
+#[derive(Debug, Serialize, Deserialize, JsonSchema, Clone, Default)]
+pub struct DocxTextStyle {
+    /// Make text bold
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bold: Option<bool>,
+    /// Make text italic
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub italic: Option<bool>,
+    /// Make text underlined
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub underline: Option<bool>,
+    /// Font size in points
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub size: Option<u32>,
+    /// Text color in hex format (e.g., 'FF0000' for red)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub color: Option<String>,
+    /// Text alignment
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub alignment: Option<TextAlignment>,
+}
+
+/// Additional parameters for update_doc operation
+#[derive(Debug, Serialize, Deserialize, JsonSchema, Clone, Default)]
+pub struct DocxUpdateParams {
+    /// Update mode (default: append)
+    #[serde(default)]
+    pub mode: DocxUpdateMode,
+    /// Text to replace (required for replace mode)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub old_text: Option<String>,
+    /// Heading level for structured mode (e.g., 'Heading1', 'Heading2')
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub level: Option<String>,
+    /// Path to the image file (required for add_image mode)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub image_path: Option<String>,
+    /// Image width in pixels (optional)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub width: Option<u32>,
+    /// Image height in pixels (optional)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub height: Option<u32>,
+    /// Styling options for the text
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub style: Option<DocxTextStyle>,
+}
+
+/// Parameters for the docx_tool
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+pub struct DocxToolParams {
+    /// Path to the DOCX file
+    pub path: String,
+    /// Operation to perform on the DOCX
+    pub operation: DocxOperation,
+    /// Content to write (required for update_doc operation)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub content: Option<String>,
+    /// Additional parameters for update_doc operation
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub params: Option<DocxUpdateParams>,
+}
+
+/// Parameters for the xlsx_tool
+/// Enum for operation parameter in xlsx_tool
+#[derive(Debug, Serialize, Deserialize, JsonSchema, Clone)]
+#[serde(rename_all = "snake_case")]
+pub enum XlsxOperation {
+    /// List all worksheets in the workbook
+    ListWorksheets,
+    /// Get column names from a worksheet
+    GetColumns,
+    /// Get values and formulas from a cell range
+    GetRange,
+    /// Search for text in a worksheet
+    FindText,
+    /// Update a single cell's value
+    UpdateCell,
+    /// Get value and formula from a specific cell
+    GetCell,
+    /// Save changes back to the file
+    Save,
+}
+
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+pub struct XlsxToolParams {
+    /// Path to the XLSX file
+    pub path: String,
+    /// Operation to perform on the XLSX file
+    pub operation: XlsxOperation,
+    /// Worksheet name (if not provided, uses first worksheet)
+    pub worksheet: Option<String>,
+    /// Cell range in A1 notation (e.g., 'A1:C10') for get_range operation
+    pub range: Option<String>,
+    /// Text to search for in find_text operation
+    pub search_text: Option<String>,
+    /// Whether search should be case-sensitive
+    #[serde(default)]
+    pub case_sensitive: bool,
+    /// Row number for update_cell and get_cell operations
+    pub row: Option<u64>,
+    /// Column number for update_cell and get_cell operations
+    pub col: Option<u64>,
+    /// New value for update_cell operation
+    pub value: Option<String>,
+}
+
+/// ComputerController MCP Server using official RMCP SDK
 #[derive(Clone)]
-pub struct ComputerControllerRouter {
-    tools: Vec<Tool>,
+pub struct ComputerControllerServer {
+    tool_router: ToolRouter<Self>,
     cache_dir: PathBuf,
-    active_resources: Arc<Mutex<HashMap<String, Resource>>>,
+    active_resources: Arc<Mutex<HashMap<String, ResourceContents>>>,
     http_client: Client,
     instructions: String,
     system_automation: Arc<Box<dyn SystemAutomation + Send + Sync>>,
+    #[cfg(target_os = "macos")]
+    peekaboo_installed: Arc<AtomicBool>,
 }
 
-impl Default for ComputerControllerRouter {
+impl Default for ComputerControllerServer {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl ComputerControllerRouter {
+#[tool_router(router = tool_router)]
+impl ComputerControllerServer {
     pub fn new() -> Self {
-        let web_scrape_tool = Tool::new(
-            "web_scrape",
-            indoc! {r#"
-                Fetch and save content from a web page. The content can be saved as:
-                - text (for HTML pages)
-                - json (for API responses)
-                - binary (for images and other files)
-
-                The content is cached locally and can be accessed later using the cache_path
-                returned in the response.
-            "#},
-            json!({
-                "type": "object",
-                "required": ["url"],
-                "properties": {
-                    "url": {
-                        "type": "string",
-                        "description": "The URL to fetch content from"
-                    },
-                    "save_as": {
-                        "type": "string",
-                        "enum": ["text", "json", "binary"],
-                        "default": "text",
-                        "description": "How to interpret and save the content"
-                    }
-                }
-            }),
-            Some(ToolAnnotations {
-                title: Some("Web Scrape".to_string()),
-                read_only_hint: true,
-                destructive_hint: false,
-                idempotent_hint: false,
-                open_world_hint: true,
-            }),
-        );
-
-        let computer_control_desc = match std::env::consts::OS {
-            "windows" => indoc! {r#"
-                Control the computer using Windows system automation.
-
-                Features available:
-                - PowerShell automation for system control
-                - UI automation through PowerShell
-                - File and system management
-                - Windows-specific features and settings
-
-                Can be combined with screenshot tool for visual task assistance.
-            "#},
-            "macos" => indoc! {r#"
-                Control the computer using AppleScript (macOS only). Automate applications and system features.
-
-                Key capabilities:
-                - Control Applications: Launch, quit, manage apps (Mail, Safari, iTunes, etc)
-                    - Interact with app-specific feature: (e.g, edit documents, process photos)
-                    - Perform tasks in third-party apps that support AppleScript
-                - UI Automation: Simulate user interactions like, clicking buttons, select menus, type text, filling out forms
-                - System Control: Manage settings (volume, brightness, wifi), shutdown/restart, monitor events
-                - Web & Email: Open URLs, web automation, send/organize emails, handle attachments
-                - Media: Manage music libraries, photo collections, playlists
-                - File Operations: Organize files/folders
-                - Integration: Calendar, reminders, messages
-                - Data: Interact with spreadsheets and documents
-
-                Can be combined with screenshot tool for visual task assistance.
-            "#},
-            _ => indoc! {r#"
-                Control the computer using Linux system automation.
-
-                Features available:
-                - Shell scripting for system control
-                - X11/Wayland window management
-                - D-Bus for system services
-                - File and system management
-                - Desktop environment control (GNOME, KDE, etc.)
-                - Process management and monitoring
-                - System settings and configurations
-
-                Can be combined with screenshot tool for visual task assistance.
-            "#},
-        };
-
-        let computer_control_tool = Tool::new(
-            "computer_control",
-            computer_control_desc.to_string(),
-            json!({
-                "type": "object",
-                "required": ["script"],
-                "properties": {
-                    "script": {
-                        "type": "string",
-                        "description": "The automation script content (PowerShell for Windows, AppleScript for macOS)"
-                    },
-                    "save_output": {
-                        "type": "boolean",
-                        "default": false,
-                        "description": "Whether to save the script output to a file"
-                    }
-                }
-            }),
-            None,
-        );
-
-        let quick_script_desc = match std::env::consts::OS {
-            "windows" => indoc! {r#"
-                Create and run small PowerShell or Batch scripts for automation tasks.
-                PowerShell is recommended for most tasks.
-
-                The script is saved to a temporary file and executed.
-                Some examples:
-                - Sort unique lines: Get-Content file.txt | Sort-Object -Unique
-                - Extract CSV column: Import-Csv file.csv | Select-Object -ExpandProperty Column2
-                - Find text: Select-String -Pattern "pattern" -Path file.txt
-            "#},
-            _ => indoc! {r#"
-                Create and run small scripts for automation tasks.
-                Supports Shell and Ruby (on macOS).
-
-                The script is saved to a temporary file and executed.
-                Consider using shell script (bash) for most simple tasks first.
-                Ruby is useful for text processing or when you need more sophisticated scripting capabilities.
-                Some examples of shell:
-                    - create a sorted list of unique lines: sort file.txt | uniq
-                    - extract 2nd column in csv: awk -F "," '{ print $2}'
-                    - pattern matching: grep pattern file.txt
-            "#},
-        };
-
-        let quick_script_tool = Tool::new(
-            "automation_script",
-            quick_script_desc.to_string(),
-            json!({
-                "type": "object",
-                "required": ["language", "script"],
-                "properties": {
-                    "language": {
-                        "type": "string",
-                        "enum": ["shell", "ruby", "powershell", "batch"],
-                        "description": "The scripting language to use"
-                    },
-                    "script": {
-                        "type": "string",
-                        "description": "The script content"
-                    },
-                    "save_output": {
-                        "type": "boolean",
-                        "default": false,
-                        "description": "Whether to save the script output to a file"
-                    }
-                }
-            }),
-            None,
-        );
-
-        let cache_tool = Tool::new(
-            "cache",
-            indoc! {r#"
-                Manage cached files and data:
-                - list: List all cached files
-                - view: View content of a cached file
-                - delete: Delete a cached file
-                - clear: Clear all cached files
-            "#},
-            json!({
-                "type": "object",
-                "required": ["command"],
-                "properties": {
-                    "command": {
-                        "type": "string",
-                        "enum": ["list", "view", "delete", "clear"],
-                        "description": "The command to perform"
-                    },
-                    "path": {
-                        "type": "string",
-                        "description": "Path to the cached file for view/delete commands"
-                    }
-                }
-            }),
-            None,
-        );
-
-        let pdf_tool = Tool::new(
-            "pdf_tool",
-            indoc! {r#"
-                Process PDF files to extract text and images.
-                Supports operations:
-                - extract_text: Extract all text content from the PDF
-                - extract_images: Extract and save embedded images to PNG files
-
-                Use this when there is a .pdf file or files that need to be processed.
-            "#},
-            json!({
-                "type": "object",
-                "required": ["path", "operation"],
-                "properties": {
-                    "path": {
-                        "type": "string",
-                        "description": "Path to the PDF file"
-                    },
-                    "operation": {
-                        "type": "string",
-                        "enum": ["extract_text", "extract_images"],
-                        "description": "Operation to perform on the PDF"
-                    }
-                }
-            }),
-            Some(ToolAnnotations {
-                title: Some("PDF process".to_string()),
-                read_only_hint: true,
-                destructive_hint: false,
-                idempotent_hint: true,
-                open_world_hint: false,
-            }),
-        );
-
-        let docx_tool = Tool::new(
-            "docx_tool",
-            indoc! {r#"
-                Process DOCX files to extract text and create/update documents.
-                Supports operations:
-                - extract_text: Extract all text content and structure (headings, TOC) from the DOCX
-                - update_doc: Create a new DOCX or update existing one with provided content
-                  Modes:
-                  - append: Add content to end of document (default)
-                  - replace: Replace specific text with new content
-                  - structured: Add content with specific heading level and styling
-                  - add_image: Add an image to the document (with optional caption)
-
-                Use this when there is a .docx file that needs to be processed or created.
-            "#},
-            json!({
-                "type": "object",
-                "required": ["path", "operation"],
-                "properties": {
-                    "path": {
-                        "type": "string",
-                        "description": "Path to the DOCX file"
-                    },
-                    "operation": {
-                        "type": "string",
-                        "enum": ["extract_text", "update_doc"],
-                        "description": "Operation to perform on the DOCX"
-                    },
-                    "content": {
-                        "type": "string",
-                        "description": "Content to write (required for update_doc operation)"
-                    },
-                    "params": {
-                        "type": "object",
-                        "description": "Additional parameters for update_doc operation",
-                        "properties": {
-                            "mode": {
-                                "type": "string",
-                                "enum": ["append", "replace", "structured", "add_image"],
-                                "description": "Update mode (default: append)"
-                            },
-                            "old_text": {
-                                "type": "string",
-                                "description": "Text to replace (required for replace mode)"
-                            },
-                            "level": {
-                                "type": "string",
-                                "description": "Heading level for structured mode (e.g., 'Heading1', 'Heading2')"
-                            },
-                            "image_path": {
-                                "type": "string",
-                                "description": "Path to the image file (required for add_image mode)"
-                            },
-                            "width": {
-                                "type": "integer",
-                                "description": "Image width in pixels (optional)"
-                            },
-                            "height": {
-                                "type": "integer",
-                                "description": "Image height in pixels (optional)"
-                            },
-                            "style": {
-                                "type": "object",
-                                "description": "Styling options for the text",
-                                "properties": {
-                                    "bold": {
-                                        "type": "boolean",
-                                        "description": "Make text bold"
-                                    },
-                                    "italic": {
-                                        "type": "boolean",
-                                        "description": "Make text italic"
-                                    },
-                                    "underline": {
-                                        "type": "boolean",
-                                        "description": "Make text underlined"
-                                    },
-                                    "size": {
-                                        "type": "integer",
-                                        "description": "Font size in points"
-                                    },
-                                    "color": {
-                                        "type": "string",
-                                        "description": "Text color in hex format (e.g., 'FF0000' for red)"
-                                    },
-                                    "alignment": {
-                                        "type": "string",
-                                        "enum": ["left", "center", "right", "justified"],
-                                        "description": "Text alignment"
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }),
-            None,
-        );
-
-        let make_presentation_tool = Tool::new(
-            "make_presentation",
-            indoc! {r#"
-                Create and manage HTML presentations with a simple, modern design.
-                Operations:
-                - create: Create new presentation with template
-                - add_slide: Add a new slide with content
-
-                Open in a browser (using a command) to show the user: open <path> 
-
-                For advanced edits, use developer tools to modify the HTML directly.
-                A template slide is included in comments for reference.
-            "#},
-            json!({
-                "type": "object",
-                "required": ["path", "operation"],
-                "properties": {
-                    "path": {
-                        "type": "string",
-                        "description": "Path to the presentation file"
-                    },
-                    "operation": {
-                        "type": "string",
-                        "enum": ["create", "add_slide"],
-                        "description": "Operation to perform"
-                    },
-                    "params": {
-                        "type": "object",
-                        "description": "Parameters for add_slide operation",
-                        "properties": {
-                            "content": {
-                                "type": "string",
-                                "description": "Content for the new slide"
-                            }
-                        }
-                    }
-                }
-            }),
-            None,
-        );
-
-        let xlsx_tool = Tool::new(
-            "xlsx_tool",
-            indoc! {r#"
-                Process Excel (XLSX) files to read and manipulate spreadsheet data.
-                Supports operations:
-                - list_worksheets: List all worksheets in the workbook (returns name, index, column_count, row_count)
-                - get_columns: Get column names from a worksheet (returns values from the first row)
-                - get_range: Get values and formulas from a cell range (e.g., "A1:C10") (returns a 2D array organized as [row][column])
-                - find_text: Search for text in a worksheet (returns a list of (row, column) coordinates)
-                - update_cell: Update a single cell's value (returns confirmation message)
-                - get_cell: Get value and formula from a specific cell (returns both value and formula if present)
-                - save: Save changes back to the file (returns confirmation message)
-
-                Use this when working with Excel spreadsheets to analyze or modify data.
-            "#},
-            json!({
-                "type": "object",
-                "required": ["path", "operation"],
-                "properties": {
-                    "path": {
-                        "type": "string",
-                        "description": "Path to the XLSX file"
-                    },
-                    "operation": {
-                        "type": "string",
-                        "enum": ["list_worksheets", "get_columns", "get_range", "find_text", "update_cell", "get_cell", "save"],
-                        "description": "Operation to perform on the XLSX file"
-                    },
-                    "worksheet": {
-                        "type": "string",
-                        "description": "Worksheet name (if not provided, uses first worksheet)"
-                    },
-                    "range": {
-                        "type": "string",
-                        "description": "Cell range in A1 notation (e.g., 'A1:C10') for get_range operation"
-                    },
-                    "search_text": {
-                        "type": "string",
-                        "description": "Text to search for in find_text operation"
-                    },
-                    "case_sensitive": {
-                        "type": "boolean",
-                        "default": false,
-                        "description": "Whether search should be case-sensitive"
-                    },
-                    "row": {
-                        "type": "integer",
-                        "description": "Row number for update_cell and get_cell operations"
-                    },
-                    "col": {
-                        "type": "integer",
-                        "description": "Column number for update_cell and get_cell operations"
-                    },
-                    "value": {
-                        "type": "string",
-                        "description": "New value for update_cell operation"
-                    }
-                }
-            }),
-            None,
-        );
-
         // choose_app_strategy().cache_dir()
         // - macOS/Linux: ~/.cache/goose/computer_controller/
         // - Windows:     ~\AppData\Local\Block\goose\cache\computer_controller\
@@ -501,25 +365,96 @@ impl ComputerControllerRouter {
             "macos" => indoc! {r#"
             Here are some extra tools:
             automation_script
-              - Create and run Shell and Ruby scripts
-              - Shell (bash) is recommended for most tasks
+              - Create and run Shell, Ruby, or AppleScript scripts
               - Scripts can save their output to files
-              - macOS-specific features:
-                - AppleScript for system and UI control
-                - Integration with macOS apps and services
-              - Use the screenshot tool if needed to help with tasks
 
-            computer_control
-              - System automation using AppleScript
-              - Consider the screenshot tool to work out what is on screen and what to do to help with the control task.
+            computer_control — Peekaboo CLI for macOS UI automation (auto-installed via Homebrew).
+              Peekaboo captures/inspects screens, targets UI elements, drives input, and manages
+              apps/windows/menus. Pass a peekaboo subcommand string as the `command` parameter.
+              Set `capture_screenshot: true` to capture the screen after actions (click, type, etc.).
+              Commands support `--json`/`-j` for structured output. Run `peekaboo <cmd> --help` for
+              full flags if needed.
 
-            When you need to interact with websites or web applications, consider using the computer_control tool with AppleScript, which can automate Safari or other browsers to:
-              - Open specific URLs
-              - Fill in forms
-              - Click buttons
-              - Extract content
-              - Handle web-based workflows
-            This is often more reliable than web scraping for modern web applications.
+              Quickstart (most reliable flow):
+                1. command: "see --app Safari --annotate"    — get annotated screenshot with element IDs
+                2. command: "click --on B3 --app Safari"     — click element B3
+                3. command: "type \"user@example.com\" --app Safari"  — type text
+                4. command: "press tab --count 1 --app Safari"       — press tab
+                5. command: "type \"password\" --app Safari --return" — type and press enter
+
+              Vision:
+              - see — annotated UI map with element IDs and optional AI analysis
+                `see --app Safari --annotate`, `see --mode screen --screen-index 0`
+                `see --app Notes --analyze "describe what's on screen"`
+              - image — capture screenshots without annotation
+                `image --mode frontmost`, `image --mode screen --screen-index 1 --retina`
+                `image --app Safari --window-title "Dashboard" --analyze "Summarize KPIs"`
+              - capture — live motion-aware capture
+                `capture live --mode region --region 100,100,800,600 --duration 30`
+
+              Interaction:
+              - click — by element ID, query, or coordinates with smart waits
+                `click --on B1`, `click --coords 100,200`, `click --on B1 --double`, `click --on B1 --right`
+              - type — text input with optional control keys
+                `type "hello" --return`, `type "text" --clear --app Notes`, `type "slow" --wpm 80`
+              - press — special key sequences with repeats
+                `press tab --count 3`, `press escape`, `press return`, `press space`
+              - hotkey — modifier key combos (comma-separated)
+                `hotkey --keys cmd,c`, `hotkey --keys cmd,shift,t`, `hotkey --keys cmd,a`
+              - paste — set clipboard then paste (more reliable than type for long text)
+                `paste --text "long multi-line content"`
+              - scroll — directional scrolling with optional targeting
+                `scroll --direction down --amount 5 --smooth`, `scroll --direction up --amount 3`
+              - drag — drag between elements or coordinates
+                `drag --from B1 --to T2`, `drag --from-coords 100,100 --to-coords 500,300`
+              - swipe — gesture-style drags
+                `swipe --from-coords 100,500 --to-coords 100,200 --duration 800`
+              - move — cursor positioning
+                `move 500,300 --smooth`
+
+              Apps & Windows:
+              - app — launch, quit, switch, list applications
+                `app launch Safari --open https://example.com`, `app quit Safari`
+                `app switch Safari`, `app list`, `app hide Safari`, `app unhide Safari`
+              - window — manage window position, size, focus, list
+                `window list --app Safari --json`, `window focus --app Safari`
+                `window set-bounds --app Safari --x 50 --y 50 --width 1200 --height 800`
+                `window close --app Safari`, `window minimize --app Safari`
+              - list — enumerate apps, windows, screens
+                `list apps --json`, `list windows --json`, `list screens --json`
+              - space — macOS Spaces (virtual desktops)
+                `space list`, `space switch --index 2`
+
+              Menus & System:
+              - menu — click application menu items
+                `menu click --app Safari --item "New Window"`
+                `menu click --app TextEdit --path "Format > Font > Show Fonts"`
+              - menubar — status bar / menu extras
+                `menubar list --json`, `menubar click --title "WiFi"`
+              - dock — Dock items
+                `dock launch Safari`, `dock list --json`
+              - dialog — system dialogs and alerts
+                `dialog click --button "OK"`, `dialog list`
+              - clipboard — read/write clipboard
+                `clipboard --action get`, `clipboard --action set --text "content"`
+              - open — open URLs or files with app targeting
+                `open https://example.com --app Safari`
+              - permissions — check Screen Recording / Accessibility status
+                `permissions status`
+
+              Common targeting parameters (work across most commands):
+              - App/window: `--app Name`, `--pid 1234`, `--window-title "title"`, `--window-id 5678`, `--window-index 0`
+              - Elements: `--on B1` (element ID from see), `--coords 100,200`
+              - Snapshot reuse: `--snapshot <id>` (reuse a previous see result without re-capturing)
+              - Focus: `--no-auto-focus`, `--space-switch`, `--bring-to-current-space`
+
+              Tips:
+              - Always `see --annotate` first to identify element IDs before clicking
+              - Use `--json` for structured output on list/query commands
+              - Use `paste` over `type` for long or multi-line text
+              - Use `--screen-index` for multi-monitor setups
+              - If something fails, check `permissions status` for missing permissions
+              - Use `capture_screenshot: true` on click/type/press actions to verify the result
             "#},
             _ => indoc! {r#"
             Here are some extra tools:
@@ -582,21 +517,14 @@ impl ComputerControllerRouter {
         };
 
         Self {
-            tools: vec![
-                web_scrape_tool,
-                quick_script_tool,
-                computer_control_tool,
-                cache_tool,
-                pdf_tool,
-                docx_tool,
-                xlsx_tool,
-                make_presentation_tool,
-            ],
+            tool_router: Self::tool_router(),
             cache_dir,
             active_resources: Arc::new(Mutex::new(HashMap::new())),
-            http_client: Client::builder().user_agent("Goose/1.0").build().unwrap(),
-            instructions: instructions.clone(),
+            http_client: Client::builder().user_agent("goose/1.0").build().unwrap(),
+            instructions,
             system_automation,
+            #[cfg(target_os = "macos")]
+            peekaboo_installed: Arc::new(AtomicBool::new(crate::peekaboo::is_peekaboo_installed())),
         }
     }
 
@@ -613,171 +541,323 @@ impl ComputerControllerRouter {
         content: &[u8],
         prefix: &str,
         extension: &str,
-    ) -> Result<PathBuf, ToolError> {
+    ) -> Result<PathBuf, ErrorData> {
         let cache_path = self.get_cache_path(prefix, extension);
-        fs::write(&cache_path, content)
-            .map_err(|e| ToolError::ExecutionError(format!("Failed to write to cache: {}", e)))?;
+        fs::write(&cache_path, content).map_err(|e| {
+            ErrorData::new(
+                ErrorCode::INTERNAL_ERROR,
+                format!("Failed to write to cache: {}", e),
+                None,
+            )
+        })?;
         Ok(cache_path)
     }
 
     // Helper function to register a file as a resource
-    fn register_as_resource(&self, cache_path: &PathBuf, mime_type: &str) -> Result<(), ToolError> {
+    fn register_as_resource(&self, cache_path: &PathBuf, mime_type: &str) -> Result<(), ErrorData> {
         let uri = Url::from_file_path(cache_path)
-            .map_err(|_| ToolError::ExecutionError("Invalid cache path".into()))?
+            .map_err(|_| {
+                ErrorData::new(
+                    ErrorCode::INTERNAL_ERROR,
+                    "Invalid cache path".to_string(),
+                    None,
+                )
+            })?
             .to_string();
 
-        let resource = Resource::new(
-            uri.clone(),
-            Some(mime_type.to_string()),
-            Some(cache_path.to_string_lossy().into_owned()),
-        )
-        .map_err(|e| ToolError::ExecutionError(e.to_string()))?;
+        let resource = ResourceContents::TextResourceContents {
+            uri: uri.clone(),
+            text: String::new(), // We'll read it when needed
+            mime_type: Some(mime_type.to_string()),
+            meta: None,
+        };
 
         self.active_resources.lock().unwrap().insert(uri, resource);
         Ok(())
     }
 
-    async fn web_scrape(&self, params: Value) -> Result<Vec<Content>, ToolError> {
-        let url = params
-            .get("url")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| ToolError::InvalidParameters("Missing 'url' parameter".into()))?;
-
-        let save_as = params
-            .get("save_as")
-            .and_then(|v| v.as_str())
-            .unwrap_or("text");
+    /// Fetch and save content from a web page
+    #[tool(
+        name = "web_scrape",
+        description = "
+            Fetch and save content from a web page. The content can be saved as:
+            - text (for HTML pages)
+            - json (for API responses)
+            - binary (for images and other files)
+            Returns 'Content saved to: <path>'. Use cache to read the content.
+        "
+    )]
+    pub async fn web_scrape(
+        &self,
+        params: Parameters<WebScrapeParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let params = params.0;
+        let url = &params.url;
+        let save_as = params.save_as;
 
         // Fetch the content
         let response = self
             .http_client
             .get(url)
+            .header("Accept", "text/markdown, */*")
             .send()
             .await
-            .map_err(|e| ToolError::ExecutionError(format!("Failed to fetch URL: {}", e)))?;
+            .map_err(|e| {
+                ErrorData::new(
+                    ErrorCode::INTERNAL_ERROR,
+                    format!("Failed to fetch URL: {}", e),
+                    None,
+                )
+            })?;
 
         let status = response.status();
         if !status.is_success() {
-            return Err(ToolError::ExecutionError(format!(
-                "HTTP request failed with status: {}",
-                status
-            )));
+            return Err(ErrorData::new(
+                ErrorCode::INTERNAL_ERROR,
+                format!("HTTP request failed with status: {}", status),
+                None,
+            ));
         }
 
         // Process based on save_as parameter
-        let (content, extension) =
-            match save_as {
-                "text" => {
-                    let text = response.text().await.map_err(|e| {
-                        ToolError::ExecutionError(format!("Failed to get text: {}", e))
-                    })?;
-                    (text.into_bytes(), "txt")
-                }
-                "json" => {
-                    let text = response.text().await.map_err(|e| {
-                        ToolError::ExecutionError(format!("Failed to get text: {}", e))
-                    })?;
-                    // Verify it's valid JSON
-                    serde_json::from_str::<Value>(&text).map_err(|e| {
-                        ToolError::ExecutionError(format!("Invalid JSON response: {}", e))
-                    })?;
-                    (text.into_bytes(), "json")
-                }
-                "binary" => {
-                    let bytes = response.bytes().await.map_err(|e| {
-                        ToolError::ExecutionError(format!("Failed to get bytes: {}", e))
-                    })?;
-                    (bytes.to_vec(), "bin")
-                }
-                _ => {
-                    return Err(ToolError::InvalidParameters(format!(
-                    "Invalid 'save_as' parameter: {}. Valid options are: 'text', 'json', 'binary'",
-                    save_as
-                )));
-                }
-            };
+        let (content, extension, mime_type) = match save_as {
+            SaveAsFormat::Text => {
+                let text = response.text().await.map_err(|e| {
+                    ErrorData::new(
+                        ErrorCode::INTERNAL_ERROR,
+                        format!("Failed to get text: {}", e),
+                        None,
+                    )
+                })?;
+                (text.into_bytes(), "txt", "text/plain")
+            }
+            SaveAsFormat::Json => {
+                let text = response.text().await.map_err(|e| {
+                    ErrorData::new(
+                        ErrorCode::INTERNAL_ERROR,
+                        format!("Failed to get text: {}", e),
+                        None,
+                    )
+                })?;
+                // Verify it's valid JSON
+                serde_json::from_str::<serde_json::Value>(&text).map_err(|e| {
+                    ErrorData::new(
+                        ErrorCode::INTERNAL_ERROR,
+                        format!("Invalid JSON response: {}", e),
+                        None,
+                    )
+                })?;
+                (text.into_bytes(), "json", "application/json")
+            }
+            SaveAsFormat::Binary => {
+                let bytes = response.bytes().await.map_err(|e| {
+                    ErrorData::new(
+                        ErrorCode::INTERNAL_ERROR,
+                        format!("Failed to get bytes: {}", e),
+                        None,
+                    )
+                })?;
+                (bytes.to_vec(), "bin", "application/octet-stream")
+            }
+        };
 
         // Save to cache
         let cache_path = self.save_to_cache(&content, "web", extension).await?;
 
         // Register as a resource
-        self.register_as_resource(&cache_path, save_as)?;
+        self.register_as_resource(&cache_path, mime_type)?;
 
-        Ok(vec![Content::text(format!(
+        Ok(CallToolResult::success(vec![Content::text(format!(
             "Content saved to: {}",
             cache_path.display()
-        ))])
+        ))]))
     }
 
-    // Implement quick_script tool functionality
-    async fn quick_script(&self, params: Value) -> Result<Vec<Content>, ToolError> {
-        let language = params
-            .get("language")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| ToolError::InvalidParameters("Missing 'language' parameter".into()))?;
+    /// Create and run small scripts for automation tasks
+    #[cfg(target_os = "windows")]
+    #[tool(
+        name = "automation_script",
+        description = "
+            Create and run small PowerShell or Batch scripts for automation tasks.
+            PowerShell is recommended for most tasks.
 
-        let script = params
-            .get("script")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| ToolError::InvalidParameters("Missing 'script' parameter".into()))?;
+            The script is saved to a temporary file and executed.
+            Some examples:
+            - Sort unique lines: Get-Content file.txt | Sort-Object -Unique
+            - Extract CSV column: Import-Csv file.csv | Select-Object -ExpandProperty Column2
+            - Find text: Select-String -Pattern 'pattern' -Path file.txt
+        "
+    )]
+    pub async fn automation_script(
+        &self,
+        params: Parameters<AutomationScriptParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        self.automation_script_impl(params).await
+    }
 
-        let save_output = params
-            .get("save_output")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false);
+    /// Create and run small scripts for automation tasks
+    #[cfg(target_os = "macos")]
+    #[tool(
+        name = "automation_script",
+        description = "
+            Create and run Shell, Ruby, or AppleScript (via osascript) scripts.
+            Use shell (bash) for most tasks. AppleScript for app scripting and system settings.
+            Examples:
+                - sort file.txt | uniq
+                - awk -F ',' '{ print $2}' file.csv
+                - osascript -e 'tell app \"Finder\" to get name of every window'
+        "
+    )]
+    pub async fn automation_script(
+        &self,
+        params: Parameters<AutomationScriptParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        self.automation_script_impl(params).await
+    }
+
+    /// Create and run small scripts for automation tasks
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    #[tool(
+        name = "automation_script",
+        description = "
+            Create and run Shell scripts for automation tasks.
+            Consider using shell script (bash) for most simple tasks first.
+            Examples:
+                - sort file.txt | uniq
+                - awk -F ',' '{ print $2}' file.csv
+                - grep pattern file.txt
+        "
+    )]
+    pub async fn automation_script(
+        &self,
+        params: Parameters<AutomationScriptParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        self.automation_script_impl(params).await
+    }
+
+    #[allow(clippy::too_many_lines)]
+    async fn automation_script_impl(
+        &self,
+        params: Parameters<AutomationScriptParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let params = params.0;
+        let language = params.language;
+        let script = &params.script;
+        let save_output = params.save_output;
 
         // Create a temporary directory for the script
         let script_dir = tempfile::tempdir().map_err(|e| {
-            ToolError::ExecutionError(format!("Failed to create temporary directory: {}", e))
+            ErrorData::new(
+                ErrorCode::INTERNAL_ERROR,
+                format!("Failed to create temporary directory: {}", e),
+                None,
+            )
         })?;
 
         let (shell, shell_arg) = self.system_automation.get_shell_command();
 
         let command = match language {
-            "shell" | "batch" => {
+            ScriptLanguage::Shell | ScriptLanguage::Batch => {
                 let script_path = script_dir.path().join(format!(
                     "script.{}",
                     if cfg!(windows) { "bat" } else { "sh" }
                 ));
                 fs::write(&script_path, script).map_err(|e| {
-                    ToolError::ExecutionError(format!("Failed to write script: {}", e))
+                    ErrorData::new(
+                        ErrorCode::INTERNAL_ERROR,
+                        format!("Failed to write script: {}", e),
+                        None,
+                    )
                 })?;
+
+                // Set execute permissions on Unix systems
+                #[cfg(unix)]
+                {
+                    let mut perms = fs::metadata(&script_path)
+                        .map_err(|e| {
+                            ErrorData::new(
+                                ErrorCode::INTERNAL_ERROR,
+                                format!("Failed to get file metadata: {}", e),
+                                None,
+                            )
+                        })?
+                        .permissions();
+                    perms.set_mode(0o755); // rwxr-xr-x
+                    fs::set_permissions(&script_path, perms).map_err(|e| {
+                        ErrorData::new(
+                            ErrorCode::INTERNAL_ERROR,
+                            format!("Failed to set execute permissions: {}", e),
+                            None,
+                        )
+                    })?;
+                }
 
                 script_path.display().to_string()
             }
-            "ruby" => {
+            ScriptLanguage::Ruby => {
                 let script_path = script_dir.path().join("script.rb");
                 fs::write(&script_path, script).map_err(|e| {
-                    ToolError::ExecutionError(format!("Failed to write script: {}", e))
+                    ErrorData::new(
+                        ErrorCode::INTERNAL_ERROR,
+                        format!("Failed to write script: {}", e),
+                        None,
+                    )
                 })?;
 
                 format!("ruby {}", script_path.display())
             }
-            "powershell" => {
+            ScriptLanguage::Powershell => {
                 let script_path = script_dir.path().join("script.ps1");
                 fs::write(&script_path, script).map_err(|e| {
-                    ToolError::ExecutionError(format!("Failed to write script: {}", e))
+                    ErrorData::new(
+                        ErrorCode::INTERNAL_ERROR,
+                        format!("Failed to write script: {}", e),
+                        None,
+                    )
                 })?;
 
-                format!(
-                    "powershell -NoProfile -NonInteractive -File {}",
-                    script_path.display()
-                )
-            }
-            _ => {
-                return Err( ToolError::InvalidParameters(
-                    format!("Invalid 'language' parameter: {}. Valid options are: 'shell', 'batch', 'ruby', 'powershell", language)
-                ));
+                script_path.display().to_string()
             }
         };
 
         // Run the script
-        let output = Command::new(shell)
-            .arg(shell_arg)
-            .arg(&command)
-            .output()
-            .await
-            .map_err(|e| ToolError::ExecutionError(format!("Failed to run script: {}", e)))?;
+        let output = match language {
+            ScriptLanguage::Powershell => {
+                // For PowerShell, we need to use -File instead of -Command
+                Command::new("powershell")
+                    .arg("-NoProfile")
+                    .arg("-NonInteractive")
+                    .arg("-File")
+                    .arg(&command)
+                    .env("GOOSE_TERMINAL", "1")
+                    .env("AGENT", "goose")
+                    .set_no_window()
+                    .output()
+                    .await
+                    .map_err(|e| {
+                        ErrorData::new(
+                            ErrorCode::INTERNAL_ERROR,
+                            format!("Failed to run script: {}", e),
+                            None,
+                        )
+                    })?
+            }
+            _ => Command::new(shell)
+                .arg(shell_arg)
+                .arg(&command)
+                .env("GOOSE_TERMINAL", "1")
+                .env("AGENT", "goose")
+                .set_no_window()
+                .output()
+                .await
+                .map_err(|e| {
+                    ErrorData::new(
+                        ErrorCode::INTERNAL_ERROR,
+                        format!("Failed to run script: {}", e),
+                        None,
+                    )
+                })?,
+        };
 
         let output_str = String::from_utf8_lossy(&output.stdout).into_owned();
         let error_str = String::from_utf8_lossy(&output.stderr).into_owned();
@@ -802,26 +882,120 @@ impl ComputerControllerRouter {
             self.register_as_resource(&cache_path, "text")?;
         }
 
-        Ok(vec![Content::text(result)])
+        Ok(CallToolResult::success(vec![Content::text(result)]))
     }
 
-    // Implement computer control functionality
-    async fn computer_control(&self, params: Value) -> Result<Vec<Content>, ToolError> {
-        let script = params
-            .get("script")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| ToolError::InvalidParameters("Missing 'script' parameter".into()))?;
+    /// Control the computer using system automation
+    #[cfg(target_os = "windows")]
+    #[tool(
+        name = "computer_control",
+        description = "
+            Control the computer using Windows system automation.
 
-        let save_output = params
-            .get("save_output")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false);
+            Features available:
+            - PowerShell automation for system control
+            - UI automation through PowerShell
+            - File and system management
+            - Windows-specific features and settings
+
+            Can be combined with screenshot tool for visual task assistance.
+        "
+    )]
+    pub async fn computer_control(
+        &self,
+        params: Parameters<ComputerControlParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        self.computer_control_impl(params).await
+    }
+
+    /// Control the computer using Peekaboo CLI for macOS GUI automation.
+    /// Auto-installs via Homebrew on first use.
+    #[cfg(target_os = "macos")]
+    #[tool(
+        name = "computer_control",
+        description = "
+            macOS UI automation via Peekaboo CLI. Pass a subcommand string as `command`.
+
+            Core workflow: see → click → type
+            1. see --app Safari --annotate  (get annotated screenshot with element IDs)
+            2. click --on B3               (click element by ID)
+            3. type \"hello\" --return       (type text, press enter)
+
+            Key commands: see, image, click, type, press, hotkey, paste, scroll, drag,
+            swipe, move, app, window, list, menu, menubar, dock, dialog, clipboard,
+            space, open, permissions.
+
+            Targeting: --app Name, --window-title, --window-id, --on ID, --coords x,y
+            Set capture_screenshot=true to verify UI state after actions.
+            See extension instructions for full command reference and examples.
+        "
+    )]
+    pub async fn computer_control(
+        &self,
+        params: Parameters<ComputerControlParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        self.peekaboo_impl(params).await
+    }
+
+    /// Control the computer using system automation
+    #[cfg(target_os = "linux")]
+    #[tool(
+        name = "computer_control",
+        description = "
+            Control the computer using Linux system automation.
+
+            Features available:
+            - Shell scripting for system control
+            - X11/Wayland window management
+            - D-Bus for system services
+            - File and system management
+            - Desktop environment control (GNOME, KDE, etc.)
+            - Process management and monitoring
+            - System settings and configurations
+
+            Can be combined with screenshot tool for visual task assistance.
+        "
+    )]
+    pub async fn computer_control(
+        &self,
+        params: Parameters<ComputerControlParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        self.computer_control_impl(params).await
+    }
+
+    /// Control the computer using system automation (fallback for other OS)
+    #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
+    #[tool(
+        name = "computer_control",
+        description = "Control the computer using system automation. Features available depend on your operating system. Can be combined with screenshot tool for visual task assistance."
+    )]
+    pub async fn computer_control(
+        &self,
+        params: Parameters<ComputerControlParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        self.computer_control_impl(params).await
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    async fn computer_control_impl(
+        &self,
+        params: Parameters<ComputerControlParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let params = params.0;
+        let script = &params.script;
+        let save_output = params.save_output;
 
         // Use platform-specific automation
         let output = self
             .system_automation
             .execute_system_script(script)
-            .map_err(|e| ToolError::ExecutionError(format!("Failed to execute script: {}", e)))?;
+            .map_err(|e| {
+                ErrorData::new(
+                    ErrorCode::INTERNAL_ERROR,
+                    format!("Failed to execute script: {}", e),
+                    None,
+                )
+            })?;
 
         let mut result = format!("Script completed successfully.\n\nOutput:\n{}", output);
 
@@ -836,248 +1010,535 @@ impl ComputerControllerRouter {
             self.register_as_resource(&cache_path, "text")?;
         }
 
-        Ok(vec![Content::text(result)])
+        Ok(CallToolResult::success(vec![Content::text(result)]))
     }
 
-    async fn xlsx_tool(&self, params: Value) -> Result<Vec<Content>, ToolError> {
-        let path = params
-            .get("path")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| ToolError::InvalidParameters("Missing 'path' parameter".into()))?;
-
-        let operation = params
-            .get("operation")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| ToolError::InvalidParameters("Missing 'operation' parameter".into()))?;
-
-        match operation {
-            "list_worksheets" => {
-                let xlsx = xlsx_tool::XlsxTool::new(path)
-                    .map_err(|e| ToolError::ExecutionError(e.to_string()))?;
-                let worksheets = xlsx
-                    .list_worksheets()
-                    .map_err(|e| ToolError::ExecutionError(e.to_string()))?;
-                Ok(vec![Content::text(format!("{:#?}", worksheets))])
+    #[cfg(target_os = "macos")]
+    fn ensure_peekaboo(&self) -> Result<(), ErrorData> {
+        if self.peekaboo_installed.load(Ordering::Relaxed) {
+            return Ok(());
+        }
+        if crate::peekaboo::is_peekaboo_installed() {
+            self.peekaboo_installed.store(true, Ordering::Relaxed);
+            return Ok(());
+        }
+        tracing::info!("Peekaboo not found, attempting auto-install via brew");
+        match crate::peekaboo::auto_install_peekaboo() {
+            Ok(()) => {
+                self.peekaboo_installed.store(true, Ordering::Relaxed);
+                tracing::info!("Peekaboo installed successfully");
+                Ok(())
             }
-            "get_columns" => {
-                let xlsx = xlsx_tool::XlsxTool::new(path)
-                    .map_err(|e| ToolError::ExecutionError(e.to_string()))?;
-                let worksheet = if let Some(name) = params.get("worksheet").and_then(|v| v.as_str())
-                {
-                    xlsx.get_worksheet_by_name(name)
-                        .map_err(|e| ToolError::ExecutionError(e.to_string()))?
-                } else {
-                    xlsx.get_worksheet_by_index(0)
-                        .map_err(|e| ToolError::ExecutionError(e.to_string()))?
-                };
-                let columns = xlsx
-                    .get_column_names(worksheet)
-                    .map_err(|e| ToolError::ExecutionError(e.to_string()))?;
-                Ok(vec![Content::text(format!("{:#?}", columns))])
-            }
-            "get_range" => {
-                let range = params
-                    .get("range")
-                    .and_then(|v| v.as_str())
-                    .ok_or_else(|| {
-                        ToolError::InvalidParameters("Missing 'range' parameter".into())
-                    })?;
-
-                let xlsx = xlsx_tool::XlsxTool::new(path)
-                    .map_err(|e| ToolError::ExecutionError(e.to_string()))?;
-                let worksheet = if let Some(name) = params.get("worksheet").and_then(|v| v.as_str())
-                {
-                    xlsx.get_worksheet_by_name(name)
-                        .map_err(|e| ToolError::ExecutionError(e.to_string()))?
-                } else {
-                    xlsx.get_worksheet_by_index(0)
-                        .map_err(|e| ToolError::ExecutionError(e.to_string()))?
-                };
-                let range_data = xlsx
-                    .get_range(worksheet, range)
-                    .map_err(|e| ToolError::ExecutionError(e.to_string()))?;
-                Ok(vec![Content::text(format!("{:#?}", range_data))])
-            }
-            "find_text" => {
-                let search_text = params
-                    .get("search_text")
-                    .and_then(|v| v.as_str())
-                    .ok_or_else(|| {
-                        ToolError::InvalidParameters("Missing 'search_text' parameter".into())
-                    })?;
-
-                let case_sensitive = params
-                    .get("case_sensitive")
-                    .and_then(|v| v.as_bool())
-                    .unwrap_or(false);
-
-                let xlsx = xlsx_tool::XlsxTool::new(path)
-                    .map_err(|e| ToolError::ExecutionError(e.to_string()))?;
-                let worksheet = if let Some(name) = params.get("worksheet").and_then(|v| v.as_str())
-                {
-                    xlsx.get_worksheet_by_name(name)
-                        .map_err(|e| ToolError::ExecutionError(e.to_string()))?
-                } else {
-                    xlsx.get_worksheet_by_index(0)
-                        .map_err(|e| ToolError::ExecutionError(e.to_string()))?
-                };
-                let matches = xlsx
-                    .find_in_worksheet(worksheet, search_text, case_sensitive)
-                    .map_err(|e| ToolError::ExecutionError(e.to_string()))?;
-                Ok(vec![Content::text(format!(
-                    "Found matches at: {:#?}",
-                    matches
-                ))])
-            }
-            "update_cell" => {
-                let row = params.get("row").and_then(|v| v.as_u64()).ok_or_else(|| {
-                    ToolError::InvalidParameters("Missing 'row' parameter".into())
-                })?;
-
-                let col = params.get("col").and_then(|v| v.as_u64()).ok_or_else(|| {
-                    ToolError::InvalidParameters("Missing 'col' parameter".into())
-                })?;
-
-                let value = params
-                    .get("value")
-                    .and_then(|v| v.as_str())
-                    .ok_or_else(|| {
-                        ToolError::InvalidParameters("Missing 'value' parameter".into())
-                    })?;
-
-                let worksheet_name = params
-                    .get("worksheet")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("Sheet1");
-
-                let mut xlsx = xlsx_tool::XlsxTool::new(path)
-                    .map_err(|e| ToolError::ExecutionError(e.to_string()))?;
-                xlsx.update_cell(worksheet_name, row as u32, col as u32, value)
-                    .map_err(|e| ToolError::ExecutionError(e.to_string()))?;
-                xlsx.save(path)
-                    .map_err(|e| ToolError::ExecutionError(e.to_string()))?;
-                Ok(vec![Content::text(format!(
-                    "Updated cell ({}, {}) to '{}' in worksheet '{}'",
-                    row, col, value, worksheet_name
-                ))])
-            }
-            "save" => {
-                let xlsx = xlsx_tool::XlsxTool::new(path)
-                    .map_err(|e| ToolError::ExecutionError(e.to_string()))?;
-                xlsx.save(path)
-                    .map_err(|e| ToolError::ExecutionError(e.to_string()))?;
-                Ok(vec![Content::text("File saved successfully.")])
-            }
-            "get_cell" => {
-                let row = params.get("row").and_then(|v| v.as_u64()).ok_or_else(|| {
-                    ToolError::InvalidParameters("Missing 'row' parameter".into())
-                })?;
-
-                let col = params.get("col").and_then(|v| v.as_u64()).ok_or_else(|| {
-                    ToolError::InvalidParameters("Missing 'col' parameter".into())
-                })?;
-
-                let xlsx = xlsx_tool::XlsxTool::new(path)
-                    .map_err(|e| ToolError::ExecutionError(e.to_string()))?;
-                let worksheet = if let Some(name) = params.get("worksheet").and_then(|v| v.as_str())
-                {
-                    xlsx.get_worksheet_by_name(name)
-                        .map_err(|e| ToolError::ExecutionError(e.to_string()))?
-                } else {
-                    xlsx.get_worksheet_by_index(0)
-                        .map_err(|e| ToolError::ExecutionError(e.to_string()))?
-                };
-                let cell_value = xlsx
-                    .get_cell_value(worksheet, row as u32, col as u32)
-                    .map_err(|e| ToolError::ExecutionError(e.to_string()))?;
-                Ok(vec![Content::text(format!("{:#?}", cell_value))])
-            }
-            _ => Err(ToolError::InvalidParameters(format!(
-                "Invalid operation: {}",
-                operation
-            ))),
+            Err(msg) => Err(ErrorData::new(
+                ErrorCode::INTERNAL_ERROR,
+                format!(
+                    "Peekaboo is not installed and auto-install failed: {}\n\
+                     Install manually with: brew install steipete/tap/peekaboo\n\
+                     Peekaboo requires macOS 15+ (Sequoia) with Screen Recording and Accessibility permissions.",
+                    msg
+                ),
+                None,
+            )),
         }
     }
 
-    // Implement cache tool functionality
-    async fn docx_tool(&self, params: Value) -> Result<Vec<Content>, ToolError> {
-        let path = params
-            .get("path")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| ToolError::InvalidParameters("Missing 'path' parameter".into()))?;
+    #[cfg(target_os = "macos")]
+    fn run_peekaboo_cmd(&self, args: &[&str]) -> Result<String, ErrorData> {
+        let output = std::process::Command::new("peekaboo")
+            .args(args)
+            .output()
+            .map_err(|e| {
+                ErrorData::new(
+                    ErrorCode::INTERNAL_ERROR,
+                    format!("Failed to run peekaboo: {}", e),
+                    None,
+                )
+            })?;
+        let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+        if !output.status.success() {
+            return Err(ErrorData::new(
+                ErrorCode::INTERNAL_ERROR,
+                format!(
+                    "peekaboo {} failed (exit {}):\n{}\n{}",
+                    args.first().unwrap_or(&""),
+                    output.status,
+                    stderr.trim(),
+                    stdout.trim()
+                ),
+                None,
+            ));
+        }
+        Ok(stdout)
+    }
 
-        let operation = params
-            .get("operation")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| ToolError::InvalidParameters("Missing 'operation' parameter".into()))?;
+    #[cfg(target_os = "macos")]
+    async fn peekaboo_impl(
+        &self,
+        params: Parameters<ComputerControlParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        self.ensure_peekaboo()?;
+        let params = params.0;
 
-        crate::computercontroller::docx_tool::docx_tool(
+        let args = shell_words::split(&params.command).map_err(|e| {
+            ErrorData::new(
+                ErrorCode::INVALID_PARAMS,
+                format!("Failed to parse command: {}", e),
+                None,
+            )
+        })?;
+        if args.is_empty() {
+            return Err(ErrorData::new(
+                ErrorCode::INVALID_PARAMS,
+                "Command cannot be empty".to_string(),
+                None,
+            ));
+        }
+
+        let is_see = args[0] == "see";
+        let is_image = args[0] == "image";
+        let screenshot_path = if is_see || is_image {
+            Some(self.get_cache_path(&args[0], "png"))
+        } else {
+            None
+        };
+
+        let mut full_args: Vec<String> = args.clone();
+
+        if let Some(ref path) = screenshot_path {
+            if !full_args.iter().any(|a| a == "--path") {
+                full_args.push("--path".to_string());
+                full_args.push(path.to_string_lossy().to_string());
+            }
+        }
+        if is_see && !full_args.iter().any(|a| a == "--json-output") {
+            full_args.push("--json-output".to_string());
+        }
+
+        let wants_json = matches!(
+            args[0].as_str(),
+            "list" | "window" | "menubar" | "permissions" | "clipboard"
+        );
+        if wants_json
+            && !full_args.iter().any(|a| a == "--json" || a == "-j")
+            && !full_args.iter().any(|a| a == "--json-output")
+        {
+            full_args.push("--json".to_string());
+        }
+
+        let arg_refs: Vec<&str> = full_args.iter().map(|s| s.as_str()).collect();
+        let stdout = self.run_peekaboo_cmd(&arg_refs)?;
+
+        let mut contents = Vec::new();
+
+        if let Some(ref path) = screenshot_path {
+            let annotated = path.to_string_lossy().replace(".png", "_annotated.png");
+            let image_path = if is_see && std::path::Path::new(&annotated).exists() {
+                PathBuf::from(&annotated)
+            } else {
+                path.clone()
+            };
+            if image_path.exists() {
+                if let Ok(bytes) = fs::read(&image_path) {
+                    let data = base64::prelude::BASE64_STANDARD.encode(&bytes);
+                    contents.push(Content::image(data, "image/png").with_priority(0.0));
+                }
+            }
+        }
+
+        if params.capture_screenshot && screenshot_path.is_none() {
+            let cap_path = self.get_cache_path("peekaboo_capture", "png");
+            let cap_path_str = cap_path.to_string_lossy().to_string();
+            if self
+                .run_peekaboo_cmd(&["image", "--mode", "frontmost", "--path", &cap_path_str])
+                .is_ok()
+                && cap_path.exists()
+            {
+                if let Ok(bytes) = fs::read(&cap_path) {
+                    let data = base64::prelude::BASE64_STANDARD.encode(&bytes);
+                    contents.push(Content::image(data, "image/png").with_priority(0.0));
+                }
+            }
+        }
+
+        let text = if stdout.len() > 12000 {
+            let truncated: String = stdout.chars().take(12000).collect();
+            format!(
+                "{}\n\n[Output truncated. {} total chars.]",
+                truncated,
+                stdout.len()
+            )
+        } else {
+            stdout
+        };
+
+        contents.insert(0, Content::text(&text).with_audience(vec![Role::Assistant]));
+
+        Ok(CallToolResult::success(contents))
+    }
+
+    /// Process Excel (XLSX) files to read and manipulate spreadsheet data
+    #[tool(
+        name = "xlsx_tool",
+        description = "
+            Process Excel (XLSX) files to read and manipulate spreadsheet data.
+            Supports operations:
+            - list_worksheets: List all worksheets in the workbook (returns name, index, column_count, row_count)
+            - get_columns: Get column names from a worksheet (returns values from the first row)
+            - get_range: Get values and formulas from a cell range (e.g., 'A1:C10') (returns a 2D array organized as [row][column])
+            - find_text: Search for text in a worksheet (returns a list of (row, column) coordinates)
+            - update_cell: Update a single cell's value (returns confirmation message)
+            - get_cell: Get value and formula from a specific cell (returns both value and formula if present)
+            - save: Save changes back to the file (returns confirmation message)
+
+            Use this when working with Excel spreadsheets to analyze or modify data.
+        "
+    )]
+    pub async fn xlsx_tool(
+        &self,
+        params: Parameters<XlsxToolParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let params = params.0;
+        let path = &params.path;
+        let operation = params.operation;
+
+        match operation {
+            XlsxOperation::ListWorksheets => {
+                let xlsx = xlsx_tool::XlsxTool::new(path)
+                    .map_err(|e| ErrorData::new(ErrorCode::INTERNAL_ERROR, e.to_string(), None))?;
+                let worksheets = xlsx
+                    .list_worksheets()
+                    .map_err(|e| ErrorData::new(ErrorCode::INTERNAL_ERROR, e.to_string(), None))?;
+                Ok(CallToolResult::success(vec![Content::text(format!(
+                    "{:#?}",
+                    worksheets
+                ))]))
+            }
+            XlsxOperation::GetColumns => {
+                let xlsx = xlsx_tool::XlsxTool::new(path)
+                    .map_err(|e| ErrorData::new(ErrorCode::INTERNAL_ERROR, e.to_string(), None))?;
+                let worksheet = if let Some(name) = &params.worksheet {
+                    xlsx.get_worksheet_by_name(name).map_err(|e| {
+                        ErrorData::new(ErrorCode::INTERNAL_ERROR, e.to_string(), None)
+                    })?
+                } else {
+                    xlsx.get_worksheet_by_index(0).map_err(|e| {
+                        ErrorData::new(ErrorCode::INTERNAL_ERROR, e.to_string(), None)
+                    })?
+                };
+                let columns = xlsx
+                    .get_column_names(worksheet)
+                    .map_err(|e| ErrorData::new(ErrorCode::INTERNAL_ERROR, e.to_string(), None))?;
+                Ok(CallToolResult::success(vec![Content::text(format!(
+                    "{:#?}",
+                    columns
+                ))]))
+            }
+            XlsxOperation::GetRange => {
+                let range = params.range.as_ref().ok_or_else(|| {
+                    ErrorData::new(
+                        ErrorCode::INVALID_PARAMS,
+                        "Missing 'range' parameter".to_string(),
+                        None,
+                    )
+                })?;
+
+                let xlsx = xlsx_tool::XlsxTool::new(path)
+                    .map_err(|e| ErrorData::new(ErrorCode::INTERNAL_ERROR, e.to_string(), None))?;
+                let worksheet = if let Some(name) = &params.worksheet {
+                    xlsx.get_worksheet_by_name(name).map_err(|e| {
+                        ErrorData::new(ErrorCode::INTERNAL_ERROR, e.to_string(), None)
+                    })?
+                } else {
+                    xlsx.get_worksheet_by_index(0).map_err(|e| {
+                        ErrorData::new(ErrorCode::INTERNAL_ERROR, e.to_string(), None)
+                    })?
+                };
+                let range_data = xlsx
+                    .get_range(worksheet, range)
+                    .map_err(|e| ErrorData::new(ErrorCode::INTERNAL_ERROR, e.to_string(), None))?;
+                Ok(CallToolResult::success(vec![Content::text(format!(
+                    "{:#?}",
+                    range_data
+                ))]))
+            }
+            XlsxOperation::FindText => {
+                let search_text = params.search_text.as_ref().ok_or_else(|| {
+                    ErrorData::new(
+                        ErrorCode::INVALID_PARAMS,
+                        "Missing 'search_text' parameter".to_string(),
+                        None,
+                    )
+                })?;
+
+                let case_sensitive = params.case_sensitive;
+
+                let xlsx = xlsx_tool::XlsxTool::new(path)
+                    .map_err(|e| ErrorData::new(ErrorCode::INTERNAL_ERROR, e.to_string(), None))?;
+                let worksheet = if let Some(name) = &params.worksheet {
+                    xlsx.get_worksheet_by_name(name).map_err(|e| {
+                        ErrorData::new(ErrorCode::INTERNAL_ERROR, e.to_string(), None)
+                    })?
+                } else {
+                    xlsx.get_worksheet_by_index(0).map_err(|e| {
+                        ErrorData::new(ErrorCode::INTERNAL_ERROR, e.to_string(), None)
+                    })?
+                };
+                let matches = xlsx
+                    .find_in_worksheet(worksheet, search_text, case_sensitive)
+                    .map_err(|e| ErrorData::new(ErrorCode::INTERNAL_ERROR, e.to_string(), None))?;
+                Ok(CallToolResult::success(vec![Content::text(format!(
+                    "Found matches at: {:#?}",
+                    matches
+                ))]))
+            }
+            XlsxOperation::UpdateCell => {
+                let row = params.row.ok_or_else(|| {
+                    ErrorData::new(
+                        ErrorCode::INVALID_PARAMS,
+                        "Missing 'row' parameter".to_string(),
+                        None,
+                    )
+                })?;
+                let col = params.col.ok_or_else(|| {
+                    ErrorData::new(
+                        ErrorCode::INVALID_PARAMS,
+                        "Missing 'col' parameter".to_string(),
+                        None,
+                    )
+                })?;
+                let value = params.value.as_ref().ok_or_else(|| {
+                    ErrorData::new(
+                        ErrorCode::INVALID_PARAMS,
+                        "Missing 'value' parameter".to_string(),
+                        None,
+                    )
+                })?;
+
+                let worksheet_name = params.worksheet.as_deref().unwrap_or("Sheet1");
+
+                let mut xlsx = xlsx_tool::XlsxTool::new(path)
+                    .map_err(|e| ErrorData::new(ErrorCode::INTERNAL_ERROR, e.to_string(), None))?;
+                xlsx.update_cell(worksheet_name, row as u32, col as u32, value)
+                    .map_err(|e| ErrorData::new(ErrorCode::INTERNAL_ERROR, e.to_string(), None))?;
+                xlsx.save(path)
+                    .map_err(|e| ErrorData::new(ErrorCode::INTERNAL_ERROR, e.to_string(), None))?;
+                Ok(CallToolResult::success(vec![Content::text(format!(
+                    "Updated cell ({}, {}) to '{}' in worksheet '{}'",
+                    row, col, value, worksheet_name
+                ))]))
+            }
+            XlsxOperation::Save => {
+                let xlsx = xlsx_tool::XlsxTool::new(path)
+                    .map_err(|e| ErrorData::new(ErrorCode::INTERNAL_ERROR, e.to_string(), None))?;
+                xlsx.save(path)
+                    .map_err(|e| ErrorData::new(ErrorCode::INTERNAL_ERROR, e.to_string(), None))?;
+                Ok(CallToolResult::success(vec![Content::text(
+                    "File saved successfully.",
+                )]))
+            }
+            XlsxOperation::GetCell => {
+                let row = params.row.ok_or_else(|| {
+                    ErrorData::new(
+                        ErrorCode::INVALID_PARAMS,
+                        "Missing 'row' parameter".to_string(),
+                        None,
+                    )
+                })?;
+
+                let col = params.col.ok_or_else(|| {
+                    ErrorData::new(
+                        ErrorCode::INVALID_PARAMS,
+                        "Missing 'col' parameter".to_string(),
+                        None,
+                    )
+                })?;
+
+                let xlsx = xlsx_tool::XlsxTool::new(path)
+                    .map_err(|e| ErrorData::new(ErrorCode::INTERNAL_ERROR, e.to_string(), None))?;
+                let worksheet = if let Some(name) = &params.worksheet {
+                    xlsx.get_worksheet_by_name(name).map_err(|e| {
+                        ErrorData::new(ErrorCode::INTERNAL_ERROR, e.to_string(), None)
+                    })?
+                } else {
+                    xlsx.get_worksheet_by_index(0).map_err(|e| {
+                        ErrorData::new(ErrorCode::INTERNAL_ERROR, e.to_string(), None)
+                    })?
+                };
+                let cell_value = xlsx
+                    .get_cell_value(worksheet, row as u32, col as u32)
+                    .map_err(|e| ErrorData::new(ErrorCode::INTERNAL_ERROR, e.to_string(), None))?;
+                Ok(CallToolResult::success(vec![Content::text(format!(
+                    "{:#?}",
+                    cell_value
+                ))]))
+            }
+        }
+    }
+
+    /// Process DOCX files to extract text and create/update documents
+    #[tool(
+        name = "docx_tool",
+        description = "
+            Process DOCX files to extract text and create/update documents.
+            Supports operations:
+            - extract_text: Extract all text content and structure (headings, TOC) from the DOCX
+            - update_doc: Create a new DOCX or update existing one with provided content
+              Modes:
+              - append: Add content to end of document (default)
+              - replace: Replace specific text with new content
+              - structured: Add content with specific heading level and styling
+              - add_image: Add an image to the document (with optional caption)
+
+            Use this when there is a .docx file that needs to be processed or created.
+        "
+    )]
+    pub async fn docx_tool(
+        &self,
+        params: Parameters<DocxToolParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let params = params.0;
+        let path = &params.path;
+        let operation = params.operation;
+
+        // Convert enum to string for the existing implementation
+        let operation_str = match operation {
+            DocxOperation::ExtractText => "extract_text",
+            DocxOperation::UpdateDoc => "update_doc",
+        };
+
+        // Convert typed params back to JSON for the internal docx_tool impl
+        let json_params = params
+            .params
+            .as_ref()
+            .map(|p| serde_json::to_value(p).unwrap_or(serde_json::Value::Null));
+
+        let result = crate::computercontroller::docx_tool::docx_tool(
             path,
-            operation,
-            params.get("content").and_then(|v| v.as_str()),
-            params.get("params"),
+            operation_str,
+            params.content.as_deref(),
+            json_params.as_ref(),
         )
         .await
+        .map_err(|e| ErrorData::new(e.code, e.message, e.data))?;
+
+        Ok(CallToolResult::success(result))
     }
 
-    async fn pdf_tool(&self, params: Value) -> Result<Vec<Content>, ToolError> {
-        let path = params
-            .get("path")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| ToolError::InvalidParameters("Missing 'path' parameter".into()))?;
+    /// Process PDF files to extract text and images
+    #[tool(
+        name = "pdf_tool",
+        description = "
+            Process PDF files to extract text and images.
+            Supports operations:
+            - extract_text: Extract all text content from the PDF
+            - extract_images: Extract and save embedded images to PNG files
 
-        let operation = params
-            .get("operation")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| ToolError::InvalidParameters("Missing 'operation' parameter".into()))?;
+            Use this when there is a .pdf file or files that need to be processed.
+        "
+    )]
+    pub async fn pdf_tool(
+        &self,
+        params: Parameters<PdfToolParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let params = params.0;
+        let path = &params.path;
+        let operation = params.operation;
 
-        crate::computercontroller::pdf_tool::pdf_tool(path, operation, &self.cache_dir).await
+        // Convert enum to string for the existing implementation
+        let operation_str = match operation {
+            PdfOperation::ExtractText => "extract_text",
+            PdfOperation::ExtractImages => "extract_images",
+        };
+
+        let result =
+            crate::computercontroller::pdf_tool::pdf_tool(path, operation_str, &self.cache_dir)
+                .await
+                .map_err(|e| ErrorData::new(e.code, e.message, e.data))?;
+
+        Ok(CallToolResult::success(result))
     }
 
-    async fn cache(&self, params: Value) -> Result<Vec<Content>, ToolError> {
-        let command = params
-            .get("command")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| ToolError::InvalidParameters("Missing 'command' parameter".into()))?;
+    /// Manage cached files and data
+    #[tool(
+        name = "cache",
+        description = "
+            Manage cached files and data:
+            - list: List all cached files
+            - view: View content of a cached file
+            - delete: Delete a cached file
+            - clear: Clear all cached files
+        "
+    )]
+    pub async fn cache(
+        &self,
+        params: Parameters<CacheParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let command = params.0.command;
+        let path = params.0.path.as_deref();
 
         match command {
-            "list" => {
+            CacheCommand::List => {
                 let mut files = Vec::new();
                 for entry in fs::read_dir(&self.cache_dir).map_err(|e| {
-                    ToolError::ExecutionError(format!("Failed to read cache directory: {}", e))
+                    ErrorData::new(
+                        ErrorCode::INTERNAL_ERROR,
+                        format!("Failed to read cache directory: {}", e),
+                        None,
+                    )
                 })? {
                     let entry = entry.map_err(|e| {
-                        ToolError::ExecutionError(format!("Failed to read directory entry: {}", e))
+                        ErrorData::new(
+                            ErrorCode::INTERNAL_ERROR,
+                            format!("Failed to read directory entry: {}", e),
+                            None,
+                        )
                     })?;
                     files.push(format!("{}", entry.path().display()));
                 }
                 files.sort();
-                Ok(vec![Content::text(format!(
+                Ok(CallToolResult::success(vec![Content::text(format!(
                     "Cached files:\n{}",
                     files.join("\n")
-                ))])
+                ))]))
             }
-            "view" => {
-                let path = params.get("path").and_then(|v| v.as_str()).ok_or_else(|| {
-                    ToolError::InvalidParameters("Missing 'path' parameter for view".into())
+            CacheCommand::View => {
+                let path = path.ok_or_else(|| {
+                    ErrorData::new(
+                        ErrorCode::INVALID_PARAMS,
+                        "Missing 'path' parameter for view".to_string(),
+                        None,
+                    )
                 })?;
 
                 let content = fs::read_to_string(path).map_err(|e| {
-                    ToolError::ExecutionError(format!("Failed to read file: {}", e))
+                    ErrorData::new(
+                        ErrorCode::INTERNAL_ERROR,
+                        format!("Failed to read file: {}", e),
+                        None,
+                    )
                 })?;
 
-                Ok(vec![Content::text(format!(
+                Ok(CallToolResult::success(vec![Content::text(format!(
                     "Content of {}:\n\n{}",
                     path, content
-                ))])
+                ))]))
             }
-            "delete" => {
-                let path = params.get("path").and_then(|v| v.as_str()).ok_or_else(|| {
-                    ToolError::InvalidParameters("Missing 'path' parameter for delete".into())
+            CacheCommand::Delete => {
+                let path = path.ok_or_else(|| {
+                    ErrorData::new(
+                        ErrorCode::INVALID_PARAMS,
+                        "Missing 'path' parameter for delete".to_string(),
+                        None,
+                    )
                 })?;
 
                 fs::remove_file(path).map_err(|e| {
-                    ToolError::ExecutionError(format!("Failed to delete file: {}", e))
+                    ErrorData::new(
+                        ErrorCode::INTERNAL_ERROR,
+                        format!("Failed to delete file: {}", e),
+                        None,
+                    )
                 })?;
 
                 // Remove from active resources if present
@@ -1088,154 +1549,99 @@ impl ComputerControllerRouter {
                         .remove(&url.to_string());
                 }
 
-                Ok(vec![Content::text(format!("Deleted file: {}", path))])
+                Ok(CallToolResult::success(vec![Content::text(format!(
+                    "Deleted file: {}",
+                    path
+                ))]))
             }
-            "clear" => {
+            CacheCommand::Clear => {
                 fs::remove_dir_all(&self.cache_dir).map_err(|e| {
-                    ToolError::ExecutionError(format!("Failed to clear cache directory: {}", e))
+                    ErrorData::new(
+                        ErrorCode::INTERNAL_ERROR,
+                        format!("Failed to clear cache directory: {}", e),
+                        None,
+                    )
                 })?;
                 fs::create_dir_all(&self.cache_dir).map_err(|e| {
-                    ToolError::ExecutionError(format!("Failed to recreate cache directory: {}", e))
+                    ErrorData::new(
+                        ErrorCode::INTERNAL_ERROR,
+                        format!("Failed to recreate cache directory: {}", e),
+                        None,
+                    )
                 })?;
 
                 // Clear active resources
                 self.active_resources.lock().unwrap().clear();
 
-                Ok(vec![Content::text("Cache cleared successfully.")])
+                Ok(CallToolResult::success(vec![Content::text(
+                    "Cache cleared successfully.",
+                )]))
             }
-            _ => Err(ToolError::InvalidParameters(format!(
-                "Invalid 'command' parameter: {}. Valid options are: 'list', 'view', 'delete', 'clear'",
-                command
-            )))
         }
     }
 }
 
-impl Router for ComputerControllerRouter {
-    fn name(&self) -> String {
-        "ComputerControllerExtension".to_string()
+#[tool_handler(router = self.tool_router)]
+impl ServerHandler for ComputerControllerServer {
+    fn get_info(&self) -> ServerInfo {
+        ServerInfo {
+            server_info: Implementation {
+                name: "goose-computercontroller".to_string(),
+                version: env!("CARGO_PKG_VERSION").to_owned(),
+                title: None,
+                description: None,
+                icons: None,
+                website_url: None,
+            },
+            capabilities: ServerCapabilities::builder()
+                .enable_tools()
+                .enable_resources()
+                .build(),
+            instructions: Some(self.instructions.clone()),
+            ..Default::default()
+        }
     }
 
-    fn instructions(&self) -> String {
-        self.instructions.clone()
-    }
-
-    fn capabilities(&self) -> ServerCapabilities {
-        CapabilitiesBuilder::new()
-            .with_tools(false)
-            .with_resources(false, false)
-            .build()
-    }
-
-    fn list_tools(&self) -> Vec<Tool> {
-        self.tools.clone()
-    }
-
-    fn call_tool(
+    async fn list_resources(
         &self,
-        tool_name: &str,
-        arguments: Value,
-    ) -> Pin<Box<dyn Future<Output = Result<Vec<Content>, ToolError>> + Send + 'static>> {
-        let this = self.clone();
-        let tool_name = tool_name.to_string();
-        Box::pin(async move {
-            match tool_name.as_str() {
-                "web_scrape" => this.web_scrape(arguments).await,
-                "automation_script" => this.quick_script(arguments).await,
-                "computer_control" => this.computer_control(arguments).await,
-                "cache" => this.cache(arguments).await,
-                "pdf_tool" => this.pdf_tool(arguments).await,
-                "docx_tool" => this.docx_tool(arguments).await,
-                "xlsx_tool" => this.xlsx_tool(arguments).await,
-                "make_presentation" => {
-                    let path = arguments
-                        .get("path")
-                        .and_then(|v| v.as_str())
-                        .ok_or_else(|| {
-                            ToolError::InvalidParameters("Missing 'path' parameter".into())
-                        })?;
-
-                    let operation = arguments
-                        .get("operation")
-                        .and_then(|v| v.as_str())
-                        .ok_or_else(|| {
-                            ToolError::InvalidParameters("Missing 'operation' parameter".into())
-                        })?;
-
-                    presentation_tool::make_presentation(path, operation, arguments.get("params"))
-                        .await
-                }
-                _ => Err(ToolError::NotFound(format!("Tool {} not found", tool_name))),
-            }
-        })
-    }
-
-    fn list_resources(&self) -> Vec<Resource> {
+        _pagination: Option<PaginatedRequestParams>,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<ListResourcesResult, ErrorData> {
         let active_resources = self.active_resources.lock().unwrap();
-        let resources = active_resources.values().cloned().collect();
-        tracing::info!("Listing resources: {:?}", resources);
-        resources
-    }
-
-    fn read_resource(
-        &self,
-        uri: &str,
-    ) -> Pin<Box<dyn Future<Output = Result<String, ResourceError>> + Send + 'static>> {
-        let uri = uri.to_string();
-        let this = self.clone();
-
-        Box::pin(async move {
-            let active_resources = this.active_resources.lock().unwrap();
-            let resource = active_resources
-                .get(&uri)
-                .ok_or_else(|| ResourceError::NotFound(format!("Resource not found: {}", uri)))?
-                .clone();
-
-            let url = Url::parse(&uri)
-                .map_err(|e| ResourceError::NotFound(format!("Invalid URI: {}", e)))?;
-
-            if url.scheme() != "file" {
-                return Err(ResourceError::NotFound(
-                    "Only file:// URIs are supported".into(),
-                ));
-            }
-
-            let path = url
-                .to_file_path()
-                .map_err(|_| ResourceError::NotFound("Invalid file path in URI".into()))?;
-
-            match resource.mime_type.as_str() {
-                "text" | "json" => fs::read_to_string(&path).map_err(|e| {
-                    ResourceError::ExecutionError(format!("Failed to read file: {}", e))
-                }),
-                "binary" => {
-                    let bytes = fs::read(&path).map_err(|e| {
-                        ResourceError::ExecutionError(format!("Failed to read file: {}", e))
-                    })?;
-                    Ok(base64::prelude::BASE64_STANDARD.encode(bytes))
-                }
-                mime_type => Err(ResourceError::NotFound(format!(
-                    "Unsupported mime type: {}",
-                    mime_type
-                ))),
-            }
+        let resources: Vec<Resource> = active_resources
+            .keys()
+            .map(|uri| {
+                RawResource::new(
+                    uri.clone(),
+                    uri.split('/').next_back().unwrap_or("").to_string(),
+                )
+                .no_annotation()
+            })
+            .collect();
+        Ok(ListResourcesResult {
+            resources,
+            next_cursor: None,
+            meta: None,
         })
     }
 
-    fn list_prompts(&self) -> Vec<Prompt> {
-        vec![]
-    }
-
-    fn get_prompt(
+    async fn read_resource(
         &self,
-        prompt_name: &str,
-    ) -> Pin<Box<dyn Future<Output = Result<String, PromptError>> + Send + 'static>> {
-        let prompt_name = prompt_name.to_string();
-        Box::pin(async move {
-            Err(PromptError::NotFound(format!(
-                "Prompt {} not found",
-                prompt_name
-            )))
+        params: ReadResourceRequestParams,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<ReadResourceResult, ErrorData> {
+        let active_resources = self.active_resources.lock().unwrap();
+        let resource = active_resources.get(&params.uri).ok_or_else(|| {
+            ErrorData::new(
+                ErrorCode::INVALID_REQUEST,
+                format!("Resource not found: {}", params.uri),
+                None,
+            )
+        })?;
+
+        // Clone the resource to return
+        Ok(ReadResourceResult {
+            contents: vec![resource.clone()],
         })
     }
 }

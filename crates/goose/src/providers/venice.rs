@@ -1,16 +1,22 @@
 use anyhow::Result;
 use async_trait::async_trait;
 use chrono::Utc;
-use reqwest::{Client, Response};
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use serde_json::{json, Value};
-use std::time::Duration;
 
-use super::base::{ConfigKey, Provider, ProviderMetadata, ProviderUsage, Usage};
+use super::api_client::{ApiClient, AuthMethod};
+use super::base::{
+    ConfigKey, MessageStream, Provider, ProviderDef, ProviderMetadata, ProviderUsage, Usage,
+};
 use super::errors::ProviderError;
-use crate::message::{Message, MessageContent};
+use super::openai_compatible::map_http_error_to_provider_error;
+use super::retry::ProviderRetry;
+use crate::conversation::message::{Message, MessageContent};
+
+use crate::mcp_utils::ToolResult;
 use crate::model::ModelConfig;
-use mcp_core::{tool::Tool, Role, ToolCall, ToolResult};
+use futures::future::BoxFuture;
+use rmcp::model::{object, CallToolRequestParams, Role, Tool};
 
 // ---------- Capability Flags ----------
 #[derive(Debug)]
@@ -55,6 +61,7 @@ fn strip_flags(model: &str) -> &str {
 }
 // ---------- END Helpers ----------
 
+const VENICE_PROVIDER_NAME: &str = "venice";
 pub const VENICE_DOC_URL: &str = "https://docs.venice.ai/";
 pub const VENICE_DEFAULT_MODEL: &str = "llama-3.3-70b";
 pub const VENICE_DEFAULT_HOST: &str = "https://api.venice.ai";
@@ -68,26 +75,19 @@ const FALLBACK_MODELS: [&str; 3] = [
     "mistral-31-24b", // Another model with function calling
 ];
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize)]
 pub struct VeniceProvider {
     #[serde(skip)]
-    client: Client,
-    host: String,
+    api_client: ApiClient,
     base_path: String,
     models_path: String,
-    api_key: String,
     model: ModelConfig,
-}
-
-impl Default for VeniceProvider {
-    fn default() -> Self {
-        let model = ModelConfig::new(VENICE_DEFAULT_MODEL.to_string());
-        VeniceProvider::from_env(model).expect("Failed to initialize Venice provider")
-    }
+    #[serde(skip)]
+    name: String,
 }
 
 impl VeniceProvider {
-    pub fn from_env(mut model: ModelConfig) -> Result<Self> {
+    pub async fn from_env(model: ModelConfig) -> Result<Self> {
         let config = crate::config::Config::global();
         let api_key: String = config.get_secret("VENICE_API_KEY")?;
         let host: String = config
@@ -100,49 +100,29 @@ impl VeniceProvider {
             .get_param("VENICE_MODELS_PATH")
             .unwrap_or_else(|_| VENICE_DEFAULT_MODELS_PATH.to_string());
 
-        // Ensure we only keep the bare model id internally
-        model.model_name = strip_flags(&model.model_name).to_string();
-
-        let client = Client::builder()
-            .timeout(Duration::from_secs(600))
-            .build()?;
+        let auth = AuthMethod::BearerToken(api_key);
+        let api_client = ApiClient::new(host, auth)?;
 
         let instance = Self {
-            client,
-            host,
+            api_client,
             base_path,
             models_path,
-            api_key,
             model,
+            name: VENICE_PROVIDER_NAME.to_string(),
         };
 
         Ok(instance)
     }
 
-    async fn post(&self, path: &str, body: &str) -> Result<Response, ProviderError> {
-        let base_url = url::Url::parse(&self.host)
-            .map_err(|e| ProviderError::RequestFailed(format!("Invalid base URL: {e}")))?;
-        let url = base_url
-            .join(path)
-            .map_err(|e| ProviderError::RequestFailed(format!("Failed to construct URL: {e}")))?;
-        // Choose GET for models endpoint, POST otherwise
-        let method = if path.contains("models") {
-            tracing::debug!("Using GET method for models endpoint");
-            self.client.get(url.clone())
-        } else {
-            tracing::debug!("Using POST method for completions endpoint");
-            self.client.post(url.clone())
-        };
-
-        // Log the request details
-        tracing::debug!("Venice request URL: {}", url);
-        tracing::debug!("Venice request body: {}", body);
-
-        let response = method
-            .header("Authorization", format!("Bearer {}", self.api_key))
-            .header("Content-Type", "application/json")
-            .body(body.to_string())
-            .send()
+    async fn post(
+        &self,
+        session_id: Option<&str>,
+        path: &str,
+        payload: &Value,
+    ) -> Result<Value, ProviderError> {
+        let response = self
+            .api_client
+            .response_post(session_id, path, payload)
             .await?;
 
         let status = response.status();
@@ -196,87 +176,80 @@ impl VeniceProvider {
                         }
                     }
                 }
-
-                // General error extraction
-                if let Some(error_msg) = json.get("error").and_then(|e| e.as_str()) {
-                    return Err(ProviderError::RequestFailed(format!(
-                        "Venice API error: {}",
-                        error_msg
-                    )));
-                }
             }
 
-            // Fallback for unparseable errors
-            return Err(ProviderError::RequestFailed(format!(
-                "Venice API request failed with status code {}",
-                status
-            )));
+            // Use the common error mapping function
+            let error_json = serde_json::from_str::<Value>(&error_body).ok();
+            return Err(map_http_error_to_provider_error(status, error_json));
         }
 
-        Ok(response)
+        let response_text = response.text().await?;
+        serde_json::from_str(&response_text).map_err(|e| {
+            ProviderError::RequestFailed(format!(
+                "Failed to parse JSON: {}\nResponse: {}",
+                e, response_text
+            ))
+        })
     }
 }
 
-#[async_trait]
-impl Provider for VeniceProvider {
+impl ProviderDef for VeniceProvider {
+    type Provider = Self;
+
     fn metadata() -> ProviderMetadata {
         ProviderMetadata::new(
-            "venice",
+            VENICE_PROVIDER_NAME,
             "Venice.ai",
             "Venice.ai models (Llama, DeepSeek, Mistral) with function calling",
             VENICE_DEFAULT_MODEL,
             FALLBACK_MODELS.to_vec(),
             VENICE_DOC_URL,
             vec![
-                ConfigKey::new("VENICE_API_KEY", true, true, None),
-                ConfigKey::new("VENICE_HOST", true, false, Some(VENICE_DEFAULT_HOST)),
+                ConfigKey::new("VENICE_API_KEY", true, true, None, true),
+                ConfigKey::new("VENICE_HOST", true, false, Some(VENICE_DEFAULT_HOST), false),
                 ConfigKey::new(
                     "VENICE_BASE_PATH",
                     true,
                     false,
                     Some(VENICE_DEFAULT_BASE_PATH),
+                    false,
                 ),
                 ConfigKey::new(
                     "VENICE_MODELS_PATH",
                     true,
                     false,
                     Some(VENICE_DEFAULT_MODELS_PATH),
+                    false,
                 ),
             ],
         )
+    }
+
+    fn from_env(
+        model: ModelConfig,
+        _extensions: Vec<crate::config::ExtensionConfig>,
+    ) -> BoxFuture<'static, Result<Self::Provider>> {
+        Box::pin(Self::from_env(model))
+    }
+}
+
+#[async_trait]
+impl Provider for VeniceProvider {
+    fn get_name(&self) -> &str {
+        &self.name
     }
 
     fn get_model_config(&self) -> ModelConfig {
         self.model.clone()
     }
 
-    async fn fetch_supported_models_async(&self) -> Result<Option<Vec<String>>, ProviderError> {
-        // Fetch supported models via Venice API
-        let base_url = url::Url::parse(&self.host)
-            .map_err(|e| ProviderError::RequestFailed(format!("Invalid base URL: {}", e)))?;
-        let models_url = base_url.join(&self.models_path).map_err(|e| {
-            ProviderError::RequestFailed(format!("Failed to construct models URL: {}", e))
-        })?;
+    async fn fetch_supported_models(&self) -> Result<Vec<String>, ProviderError> {
         let response = self
-            .client
-            .get(models_url)
-            .header("Authorization", format!("Bearer {}", self.api_key))
-            .send()
+            .api_client
+            .request(None, &self.models_path)
+            .response_get()
             .await?;
-        if !response.status().is_success() {
-            return Err(ProviderError::RequestFailed(format!(
-                "Venice API request failed with status {}",
-                response.status()
-            )));
-        }
-        let body = response.text().await?;
-        let json: serde_json::Value = serde_json::from_str(&body)
-            .map_err(|e| ProviderError::RequestFailed(format!("Failed to parse JSON: {}", e)))?;
-
-        // Print legend once so users know what flags mean
-        println!(
-            "Capabilities:\n  c=code\n  f=function calls (goose supported models)\n  s=schema\n  v=vision\n  w=web search\n  r=reasoning"
-        );
+        let json: serde_json::Value = response.json().await?;
 
         let mut models = json["data"]
             .as_array()
@@ -295,27 +268,34 @@ impl Provider for VeniceProvider {
             })
             .collect::<Vec<String>>();
         models.sort();
-        Ok(Some(models))
+        Ok(models)
     }
 
     #[tracing::instrument(
-        skip(_system, messages, tools),
+        skip(self, model_config, system, messages, tools),
         fields(model_config, input, output, input_tokens, output_tokens, total_tokens)
     )]
-    async fn complete(
+    async fn stream(
         &self,
-        _system: &str,
+        model_config: &ModelConfig,
+        session_id: &str,
+        system: &str,
         messages: &[Message],
         tools: &[Tool],
-    ) -> Result<(Message, ProviderUsage), ProviderError> {
+    ) -> Result<MessageStream, ProviderError> {
+        let session_id = if session_id.is_empty() {
+            None
+        } else {
+            Some(session_id)
+        };
         // Create properly formatted messages for Venice API
         let mut formatted_messages = Vec::new();
 
         // Add the system message if present
-        if !_system.is_empty() {
+        if !system.is_empty() {
             formatted_messages.push(json!({
                 "role": "system",
-                "content": _system
+                "content": system
             }));
         }
 
@@ -391,12 +371,19 @@ impl Provider for VeniceProvider {
                         .iter()
                         .filter_map(|tr| {
                             if let ToolResult::Ok(tool_call) = &tr.tool_call {
+                                // Safely convert arguments to a JSON string
+                                let args_str = tool_call
+                                    .arguments
+                                    .as_ref() // borrow the Option contents
+                                    .map(|map| serde_json::to_string(map).unwrap_or_default())
+                                    .unwrap_or_default();
+
                                 // Log tool call details for debugging
                                 tracing::debug!(
                                     "Tool call conversion: id={}, name={}, args_len={}",
                                     tr.id,
                                     tool_call.name,
-                                    tool_call.arguments.to_string().len()
+                                    args_str.len()
                                 );
 
                                 // Convert to Venice format
@@ -405,7 +392,7 @@ impl Provider for VeniceProvider {
                                     "type": "function",
                                     "function": {
                                         "name": tool_call.name,
-                                        "arguments": tool_call.arguments.to_string()
+                                        "arguments": args_str
                                     }
                                 }))
                             } else {
@@ -444,7 +431,7 @@ impl Provider for VeniceProvider {
 
         // Build Venice-specific payload
         let mut payload = json!({
-            "model": strip_flags(&self.model.model_name),
+            "model": strip_flags(&model_config.model_name),
             "messages": formatted_messages,
             "stream": false,
             "temperature": 0.7,
@@ -474,17 +461,13 @@ impl Provider for VeniceProvider {
         tracing::debug!("Sending request to Venice API");
         tracing::debug!("Venice request payload: {}", payload.to_string());
 
-        // Send request
-        let response = self.post(&self.base_path, &payload.to_string()).await?;
+        // Send request with retry
+        let response = self
+            .with_retry(|| self.post(session_id, &self.base_path, &payload))
+            .await?;
 
-        // Parse the response
-        let response_text = response.text().await?;
-        let response_json: Value = serde_json::from_str(&response_text).map_err(|e| {
-            ProviderError::RequestFailed(format!(
-                "Failed to parse JSON: {}\nResponse: {}",
-                e, response_text
-            ))
-        })?;
+        // Parse the response - response is already a Value from our post method
+        let response_json = response;
 
         // Handle tool calls from the response if present
         let tool_calls = response_json["choices"]
@@ -509,8 +492,12 @@ impl Provider for VeniceProvider {
                         function["arguments"].clone()
                     };
 
-                    // Create a ToolCall using the function name and arguments
-                    let tool_call = ToolCall { name, arguments };
+                    let tool_call = CallToolRequestParams {
+                        meta: None,
+                        task: None,
+                        name: name.into(),
+                        arguments: Some(object(arguments)),
+                    };
 
                     // Create a ToolRequest MessageContent
                     let tool_request = MessageContent::tool_request(id, ToolResult::Ok(tool_call));
@@ -524,12 +511,13 @@ impl Provider for VeniceProvider {
                     message = message.with_content(item);
                 }
 
-                return Ok((
+                let provider_usage = ProviderUsage::new(
+                    strip_flags(&model_config.model_name).to_string(),
+                    Usage::default(),
+                );
+                return Ok(super::base::stream_from_single_message(
                     message,
-                    ProviderUsage::new(
-                        strip_flags(&self.model.model_name).to_string(),
-                        Usage::default(),
-                    ),
+                    provider_usage,
                 ));
             }
         }
@@ -550,19 +538,18 @@ impl Provider for VeniceProvider {
 
         // Extract usage
         let usage_data = &response_json["usage"];
-        let usage = Usage {
-            input_tokens: usage_data["prompt_tokens"].as_i64().map(|v| v as i32),
-            output_tokens: usage_data["completion_tokens"].as_i64().map(|v| v as i32),
-            total_tokens: usage_data["total_tokens"].as_i64().map(|v| v as i32),
-        };
+        let usage = Usage::new(
+            usage_data["prompt_tokens"].as_i64().map(|v| v as i32),
+            usage_data["completion_tokens"].as_i64().map(|v| v as i32),
+            usage_data["total_tokens"].as_i64().map(|v| v as i32),
+        );
 
-        Ok((
-            Message {
-                role: Role::Assistant,
-                created: Utc::now().timestamp(),
-                content,
-            },
-            ProviderUsage::new(strip_flags(&self.model.model_name).to_string(), usage),
+        let message = Message::new(Role::Assistant, Utc::now().timestamp(), content);
+        let provider_usage =
+            ProviderUsage::new(strip_flags(&self.model.model_name).to_string(), usage);
+        Ok(super::base::stream_from_single_message(
+            message,
+            provider_usage,
         ))
     }
 }

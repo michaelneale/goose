@@ -1,8 +1,8 @@
-use crate::message::ToolRequest;
+use crate::config::paths::Paths;
+use crate::conversation::message::ToolRequest;
 use anyhow::Result;
 use blake3::Hasher;
 use chrono::Utc;
-use etcetera::{choose_app_strategy, AppStrategy};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::time::Duration;
@@ -14,7 +14,7 @@ pub struct ToolPermissionRecord {
     allowed: bool,
     context_hash: String, // Hash of the tool's arguments/context to differentiate similar calls
     #[serde(skip_serializing_if = "Option::is_none")] // Don't serialize if None
-    readable_context: Option<String>, // Add this field
+    readable_context: Option<String>,
     timestamp: i64,
     expiry: Option<i64>, // Optional expiry timestamp
 }
@@ -35,14 +35,10 @@ impl Default for ToolPermissionStore {
 
 impl ToolPermissionStore {
     pub fn new() -> Self {
-        let permissions_dir = choose_app_strategy(crate::config::APP_STRATEGY.clone())
-            .map(|strategy| strategy.config_dir())
-            .unwrap_or_else(|_| PathBuf::from(".config/goose"));
-
         Self {
             permissions: HashMap::new(),
             version: 1,
-            permissions_dir,
+            permissions_dir: Paths::config_dir().join("permissions"),
         }
     }
 
@@ -88,8 +84,7 @@ impl ToolPermissionStore {
         self.permissions.get(&key).and_then(|records| {
             records
                 .iter()
-                .filter(|record| record.expiry.is_none_or(|exp| exp > Utc::now().timestamp()))
-                .next_back()
+                .rfind(|record| record.expiry.is_none_or(|exp| exp > Utc::now().timestamp()))
                 .map(|record| record.allowed)
         })
     }
@@ -105,7 +100,7 @@ impl ToolPermissionStore {
         let key = format!("{}:{}", tool_call.name, context_hash);
 
         let record = ToolPermissionRecord {
-            tool_name: tool_call.name.clone(),
+            tool_name: tool_call.name.to_string().clone(),
             allowed,
             context_hash,
             readable_context: Some(tool_request.to_readable_string()),
